@@ -1,43 +1,33 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use roaring::RoaringBitmap;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::{
-    write::{Batch, BitmapClass, Operation, ValueClass, ValueOp},
-    BitmapKey, IndexKey, Key, LogKey, ValueKey,
+    write::{
+        key::DeserializeBigEndian, AssignedIds, Batch, BitmapClass, Operation, RandomAvailableId,
+        ValueOp,
+    }, BitmapKey, IndexKey, Key, LogKey, SUBSPACE_COUNTER, SUBSPACE_IN_MEMORY_COUNTER, SUBSPACE_QUOTA, U32_LEN
 };
 
-use super::SqliteStore;
+use super::{into_error, SqliteStore};
 
 impl SqliteStore {
-    pub(crate) async fn write(&self, batch: Batch) -> crate::Result<()> {
-        let mut conn = self.conn_pool.get()?;
+    pub(crate) async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
+        let mut conn = self.conn_pool.get().map_err(into_error)?;
         self.spawn_worker(move || {
             let mut account_id = u32::MAX;
             let mut collection = u8::MAX;
             let mut document_id = u32::MAX;
-            let trx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut change_id = u64::MAX;
+            let trx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(into_error)?;
+            let mut result = AssignedIds::default();
 
             for op in &batch.ops {
                 match op {
@@ -56,68 +46,73 @@ impl SqliteStore {
                     } => {
                         document_id = *document_id_;
                     }
-                    Operation::Value {
-                        class,
-                        op: ValueOp::Add(by),
+                    Operation::ChangeId {
+                        change_id: change_id_,
                     } => {
-                        let key = ValueKey {
-                            account_id,
-                            collection,
-                            document_id,
-                            class,
-                        }
-                        .serialize(0);
-
-                        if *by >= 0 {
-                            trx.prepare_cached(concat!(
-                                "INSERT INTO c (k, v) VALUES (?, ?) ",
-                                "ON CONFLICT(k) DO UPDATE SET v = v + excluded.v"
-                            ))?
-                            .execute(params![&key, *by])?;
-                        } else {
-                            trx.prepare_cached("UPDATE c SET v = v + ? WHERE k = ?")?
-                                .execute(params![*by, &key])?;
-                        }
+                        change_id = *change_id_;
                     }
                     Operation::Value { class, op } => {
-                        let key = ValueKey {
+                        let key = class.serialize(
                             account_id,
                             collection,
                             document_id,
-                            class,
-                        };
-                        let table = char::from(key.subspace());
-                        let key = key.serialize(0);
+                            0,
+                            (&result).into(),
+                        );
+                        let table = char::from(class.subspace(collection));
 
-                        if let ValueOp::Set(value) = op {
-                            trx.prepare_cached(&format!(
-                                "INSERT OR REPLACE INTO {} (k, v) VALUES (?, ?)",
-                                table
-                            ))?
-                            .execute([&key, value])?;
-
-                            if matches!(class, ValueClass::ReservedId) {
-                                // Make sure the reserved id is not already in use
-                                let key = BitmapKey {
-                                    account_id,
-                                    collection,
-                                    class: BitmapClass::DocumentIds,
-                                    block_num: document_id,
-                                }
-                                .serialize(0);
-                                if trx
-                                    .prepare_cached("SELECT 1 FROM b WHERE k = ?")?
-                                    .query_row([&key], |_| Ok(true))
-                                    .optional()?
-                                    .unwrap_or(false)
-                                {
-                                    trx.rollback()?;
-                                    return Err(crate::Error::AssertValueFailed);
+                        match op {
+                            ValueOp::Set(value) => {
+                                trx.prepare_cached(&format!(
+                                    "INSERT OR REPLACE INTO {} (k, v) VALUES (?, ?)",
+                                    table
+                                ))
+                                .map_err(into_error)?
+                                .execute([&key, value.resolve(&result)?.as_ref()])
+                                .map_err(into_error)?;
+                            }
+                            ValueOp::AtomicAdd(by) => {
+                                if *by >= 0 {
+                                    trx.prepare_cached(&format!(
+                                        concat!(
+                                            "INSERT INTO {} (k, v) VALUES (?, ?) ",
+                                            "ON CONFLICT(k) DO UPDATE SET v = v + excluded.v"
+                                        ),
+                                        table
+                                    ))
+                                    .map_err(into_error)?
+                                    .execute(params![&key, *by])
+                                    .map_err(into_error)?;
+                                } else {
+                                    trx.prepare_cached(&format!(
+                                        "UPDATE {table} SET v = v + ? WHERE k = ?"
+                                    ))
+                                    .map_err(into_error)?
+                                    .execute(params![*by, &key])
+                                    .map_err(into_error)?;
                                 }
                             }
-                        } else {
-                            trx.prepare_cached(&format!("DELETE FROM {} WHERE k = ?", table))?
-                                .execute([&key])?;
+                            ValueOp::AddAndGet(by) => {
+                                result.push_counter_id(
+                                    trx.prepare_cached(&format!(
+                                        concat!(
+                                            "INSERT INTO {} (k, v) VALUES (?, ?) ",
+                                            "ON CONFLICT(k) DO UPDATE SET v = v + ",
+                                            "excluded.v RETURNING v"
+                                        ),
+                                        table
+                                    ))
+                                    .map_err(into_error)?
+                                    .query_row(params![&key, &by], |row| row.get::<_, i64>(0))
+                                    .map_err(into_error)?,
+                                );
+                            }
+                            ValueOp::Clear => {
+                                trx.prepare_cached(&format!("DELETE FROM {} WHERE k = ?", table))
+                                    .map_err(into_error)?
+                                    .execute([&key])
+                                    .map_err(into_error)?;
+                            }
                         }
                     }
                     Operation::Index { field, key, set } => {
@@ -131,90 +126,160 @@ impl SqliteStore {
                         .serialize(0);
 
                         if *set {
-                            trx.prepare_cached("INSERT OR IGNORE INTO i (k) VALUES (?)")?
-                                .execute([&key])?;
+                            trx.prepare_cached("INSERT OR IGNORE INTO i (k) VALUES (?)")
+                                .map_err(into_error)?
+                                .execute([&key])
+                                .map_err(into_error)?;
                         } else {
-                            trx.prepare_cached("DELETE FROM i WHERE k = ?")?
-                                .execute([&key])?;
+                            trx.prepare_cached("DELETE FROM i WHERE k = ?")
+                                .map_err(into_error)?
+                                .execute([&key])
+                                .map_err(into_error)?;
                         }
                     }
                     Operation::Bitmap { class, set } => {
-                        let key = BitmapKey {
+                        // Find the next available document id
+                        let is_document_id = matches!(class, BitmapClass::DocumentIds);
+                        if *set && is_document_id && document_id == u32::MAX {
+                            let begin = BitmapKey {
+                                account_id,
+                                collection,
+                                class: BitmapClass::DocumentIds,
+                                document_id: 0,
+                            }
+                            .serialize(0);
+                            let end = BitmapKey {
+                                account_id,
+                                collection,
+                                class: BitmapClass::DocumentIds,
+                                document_id: u32::MAX,
+                            }
+                            .serialize(0);
+                            let key_len = begin.len();
+
+                            let mut query = trx
+                                .prepare_cached("SELECT k FROM b WHERE k >= ? AND k <= ?")
+                                .map_err(into_error)?;
+                            let mut rows = query.query([&begin, &end]).map_err(into_error)?;
+                            let mut found_ids = RoaringBitmap::new();
+                            while let Some(row) = rows.next().map_err(into_error)? {
+                                let key = row
+                                    .get_ref(0)
+                                    .map_err(into_error)?
+                                    .as_bytes()
+                                    .map_err(into_error)?;
+                                if key.len() == key_len {
+                                    found_ids.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
+                                }
+                            }
+
+                            document_id = found_ids.random_available_id();
+                            result.push_document_id(document_id);
+                        }
+                        let key = class.serialize(
                             account_id,
                             collection,
-                            class,
-                            block_num: document_id,
-                        }
-                        .serialize(0);
+                            document_id,
+                            0,
+                            (&result).into(),
+                        );
+                        let table = char::from(class.subspace());
 
                         if *set {
-                            trx.prepare_cached("INSERT OR IGNORE INTO b (k) VALUES (?)")?
-                                .execute(params![&key])?;
+                            if is_document_id {
+                                trx.prepare_cached("INSERT INTO b (k) VALUES (?)")
+                                    .map_err(into_error)?
+                                    .execute(params![&key])
+                                    .map_err(into_error)?;
+                            } else {
+                                trx.prepare_cached(&format!(
+                                    "INSERT OR IGNORE INTO {} (k) VALUES (?)",
+                                    table
+                                ))
+                                .map_err(into_error)?
+                                .execute(params![&key])
+                                .map_err(into_error)?;
+                            }
                         } else {
-                            trx.prepare_cached("DELETE FROM b WHERE k = ?")?
-                                .execute(params![&key])?;
+                            trx.prepare_cached(&format!("DELETE FROM {} WHERE k = ?", table))
+                                .map_err(into_error)?
+                                .execute(params![&key])
+                                .map_err(into_error)?;
                         };
                     }
-                    Operation::Log {
-                        collection,
-                        change_id,
-                        set,
-                    } => {
+                    Operation::Log { set } => {
                         let key = LogKey {
                             account_id,
-                            collection: *collection,
-                            change_id: *change_id,
+                            collection,
+                            change_id,
                         }
                         .serialize(0);
 
-                        trx.prepare_cached("INSERT OR REPLACE INTO l (k, v) VALUES (?, ?)")?
-                            .execute([&key, set])?;
+                        trx.prepare_cached("INSERT OR REPLACE INTO l (k, v) VALUES (?, ?)")
+                            .map_err(into_error)?
+                            .execute([&key, set.resolve(&result).map_err(into_error)?.as_ref()])
+                            .map_err(into_error)?;
                     }
                     Operation::AssertValue {
                         class,
                         assert_value,
                     } => {
-                        let key = ValueKey {
+                        let key = class.serialize(
                             account_id,
                             collection,
                             document_id,
-                            class,
-                        };
-                        let table = char::from(key.subspace());
-                        let key = key.serialize(0);
+                            0,
+                            (&result).into(),
+                        );
+                        let table = char::from(class.subspace(collection));
 
                         let matches = trx
-                            .prepare_cached(&format!("SELECT v FROM {} WHERE k = ?", table))?
+                            .prepare_cached(&format!("SELECT v FROM {} WHERE k = ?", table))
+                            .map_err(into_error)?
                             .query_row([&key], |row| {
                                 Ok(assert_value.matches(row.get_ref(0)?.as_bytes()?))
                             })
-                            .optional()?
+                            .optional()
+                            .map_err(into_error)?
                             .unwrap_or_else(|| assert_value.is_none());
                         if !matches {
-                            trx.rollback()?;
-                            return Err(crate::Error::AssertValueFailed);
+                            trx.rollback().map_err(into_error)?;
+                            return Err(trc::StoreEvent::AssertValueFailed.into());
                         }
                     }
                 }
             }
 
-            trx.commit().map_err(Into::into)
+            trx.commit().map(|_| result).map_err(into_error)
         })
         .await
     }
 
-    pub(crate) async fn purge_bitmaps(&self) -> crate::Result<()> {
-        Ok(())
+    pub(crate) async fn purge_store(&self) -> trc::Result<()> {
+        let conn = self.conn_pool.get().map_err(into_error)?;
+        self.spawn_worker(move || {
+            for subspace in [SUBSPACE_QUOTA, SUBSPACE_COUNTER, SUBSPACE_IN_MEMORY_COUNTER] {
+                conn.prepare_cached(&format!("DELETE FROM {} WHERE v = 0", char::from(subspace),))
+                    .map_err(into_error)?
+                    .execute([])
+                    .map_err(into_error)?;
+            }
+
+            Ok(())
+        })
+        .await
     }
 
-    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> crate::Result<()> {
-        let conn = self.conn_pool.get()?;
+    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> trc::Result<()> {
+        let conn = self.conn_pool.get().map_err(into_error)?;
         self.spawn_worker(move || {
             conn.prepare_cached(&format!(
                 "DELETE FROM {} WHERE k >= ? AND k < ?",
                 char::from(from.subspace()),
-            ))?
-            .execute([from.serialize(0), to.serialize(0)])?;
+            ))
+            .map_err(into_error)?
+            .execute([from.serialize(0), to.serialize(0)])
+            .map_err(into_error)?;
 
             Ok(())
         })

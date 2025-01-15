@@ -1,71 +1,63 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::{Duration, Instant};
 
+use common::Core;
 use mail_auth::{common::parse::TxtRecordParser, spf::Spf, SpfResult};
 
+use smtp::core::Session;
+use utils::config::Config;
+
 use crate::smtp::{
-    session::{TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig,
+    session::{TestSession, VerifyResponse}, DnsCache, TestSMTP
 };
-use smtp::{
-    config::{ConfigContext, IfBlock},
-    core::{Session, SMTP},
-};
+
+const CONFIG: &str = r#"
+[session.data.limits]
+size = [{if = "remote_ip = '10.0.0.1'", then = 1024},
+        {else = 2048}]
+
+[session.extensions]
+future-release = [{if = "remote_ip = '10.0.0.1'", then = '1h'},
+                  {else = false}]
+mt-priority = [{if = "remote_ip = '10.0.0.1'", then = 'nsep'},
+               {else = false}]
+
+[session.ehlo]
+reject-non-fqdn = true
+
+[auth.spf.verify]
+ehlo = [{if = "remote_ip = '10.0.0.2'", then = 'strict'},
+        {else = 'relaxed'}]
+"#;
 
 #[tokio::test]
 async fn ehlo() {
-    let mut core = SMTP::test();
-    core.resolvers.dns.txt_add(
+    // Enable logging
+    crate::enable_logging();
+
+    let mut config = Config::new(CONFIG).unwrap();
+    let core = Core::parse(&mut config, Default::default(), Default::default()).await;
+    let server = TestSMTP::from_core(core).server;
+    server.txt_add(
         "mx1.foobar.org",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.resolvers.dns.txt_add(
+    server.txt_add(
         "mx2.foobar.org",
         Spf::parse(b"v=spf1 ip4:10.0.0.2 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
 
-    let config = &mut core.session.config;
-    config.data.max_message_size = r"[{if = 'remote-ip', eq = '10.0.0.1', then = 1024},
-    {else = 2048}]"
-        .parse_if(&ConfigContext::new(&[]));
-    config.extensions.future_release = r"[{if = 'remote-ip', eq = '10.0.0.1', then = '1h'},
-    {else = false}]"
-        .parse_if(&ConfigContext::new(&[]));
-    config.extensions.mt_priority = r"[{if = 'remote-ip', eq = '10.0.0.1', then = 'nsep'},
-    {else = false}]"
-        .parse_if(&ConfigContext::new(&[]));
-    core.mail_auth.spf.verify_ehlo = r"[{if = 'remote-ip', eq = '10.0.0.2', then = 'strict'},
-    {else = 'relaxed'}]"
-        .parse_if(&ConfigContext::new(&[]));
-    config.ehlo.reject_non_fqdn = IfBlock::new(true);
-
     // Reject non-FQDN domains
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = Session::test(server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     session.stream.tls = false;
     session.eval_session_params().await;
     session.cmd("EHLO domain", "550 5.5.0").await;
@@ -87,7 +79,8 @@ async fn ehlo() {
 
     // Test SPF strict mode
     session.data.helo_domain = String::new();
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.2".to_string();
+    session.data.remote_ip = session.data.remote_ip_str.parse().unwrap();
     session.stream.tls = true;
     session.eval_session_params().await;
     session.ingest(b"EHLO mx1.foobar.org\r\n").await.unwrap();

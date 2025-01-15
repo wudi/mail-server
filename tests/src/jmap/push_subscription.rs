@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     sync::{
@@ -30,7 +13,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine};
-use directory::backend::internal::manage::ManageDirectory;
+use common::{config::server::Listeners, listener::SessionData, Caches, Core, Data, Inner};
 use ece::EcKeyComponents;
 use hyper::{body, header::CONTENT_ENCODING, server::conn::http1, service::service_fn, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -39,7 +22,6 @@ use jmap::{
         http::{fetch_body, ToHttpResponse},
         HtmlResponse, StateChangeResponse,
     },
-    auth::AccessToken,
     push::ece::ece_encrypt,
 };
 use jmap_client::{mailbox::Role, push_subscription::Keys};
@@ -47,53 +29,55 @@ use jmap_proto::types::{id::Id, type_state::DataType};
 use store::ahash::AHashSet;
 
 use tokio::sync::mpsc;
-use utils::listener::SessionData;
+use utils::config::Config;
 
 use crate::{
     add_test_certs,
+    directory::internal::TestInternalDirectory,
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, test_account_login},
+    AssertConfig,
 };
 
 use super::JMAPTest;
 
-const SERVER: &str = "
+const SERVER: &str = r#"
 [server]
-hostname = 'jmap-push.example.org'
+hostname = "'jmap-push.example.org'"
+http.url = "'https://127.0.0.1:9000'"
 
 [server.listener.jmap]
 bind = ['127.0.0.1:9000']
-url = 'https://127.0.0.1:9000'
-protocol = 'jmap'
+protocol = 'http'
+tls.implicit = true
 
 [server.socket]
 reuse-addr = true
 
-[server.tls]
-enable = true
-implicit = false
-certificate = 'default'
-
 [certificate.default]
-cert = 'file://{CERT}'
-private-key = 'file://{PK}'
-";
+cert = '%{file:{CERT}}%'
+private-key = '%{file:{PK}}%'
+default = true
+"#;
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running Push Subscription tests...");
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .core
+            .storage
+            .data
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     );
+
     params.client.set_default_account_id(account_id);
     let client = test_account_login("jdoe@example.com", "12345").await;
 
@@ -113,14 +97,31 @@ pub async fn test(params: &mut JMAPTest) {
     });
 
     // Start mock push server
-    let settings = utils::config::Config::new(&add_test_certs(SERVER)).unwrap();
-    let servers = settings.parse_servers().unwrap();
+    let mut settings = Config::new(add_test_certs(SERVER)).unwrap();
+    settings.resolve_all_macros().await;
+    let mock_inner = Arc::new(Inner {
+        shared_core: Core::parse(&mut settings, Default::default(), Default::default())
+            .await
+            .into_shared(),
+        data: Data::parse(&mut settings),
+        cache: Caches::parse(&mut settings),
+        ..Default::default()
+    });
+    settings.errors.clear();
+    settings.warnings.clear();
+    let mut servers = Listeners::parse(&mut settings);
+    servers.parse_tcp_acceptors(&mut settings, mock_inner.clone());
 
     // Start JMAP server
-    let manager = SessionManager::from(push_server.clone());
-    servers.bind(&settings);
-    let _shutdown_tx = servers.spawn(|server, shutdown_rx| {
-        server.spawn(manager.clone(), shutdown_rx);
+    servers.bind_and_drop_priv(&mut settings);
+    settings.assert_no_errors();
+    let _shutdown_tx = servers.spawn(|server, acceptor, shutdown_rx| {
+        server.spawn(
+            SessionManager::from(push_server.clone()),
+            mock_inner.clone(),
+            acceptor,
+            shutdown_rx,
+        );
     });
 
     // Register push notification (no encryption)
@@ -285,9 +286,9 @@ struct PushVerification {
     pub verification_code: String,
 }
 
-impl utils::listener::SessionManager for SessionManager {
+impl common::listener::SessionManager for SessionManager {
     #[allow(clippy::manual_async_fn)]
-    fn handle<T: utils::listener::SessionStream>(
+    fn handle<T: common::listener::SessionStream>(
         self,
         session: SessionData<T>,
     ) -> impl std::future::Future<Output = ()> + Send {
@@ -296,16 +297,7 @@ impl utils::listener::SessionManager for SessionManager {
             let _ = http1::Builder::new()
                 .keep_alive(false)
                 .serve_connection(
-                    TokioIo::new(
-                        session
-                            .instance
-                            .acceptor
-                            .accept(session.stream)
-                            .await
-                            .unwrap_tls()
-                            .await
-                            .unwrap(),
-                    ),
+                    TokioIo::new(session.stream),
                     service_fn(|mut req: hyper::Request<body::Incoming>| {
                         let push = push.clone();
 
@@ -315,17 +307,16 @@ impl utils::listener::SessionManager for SessionManager {
                                     StatusCode::TOO_MANY_REQUESTS,
                                     "too many requests".to_string(),
                                 )
-                                .into_http_response());
+                                .into_http_response()
+                                .build());
                             }
                             let is_encrypted = req
                                 .headers()
                                 .get(CONTENT_ENCODING)
-                                .map_or(false, |encoding| {
+                                .is_some_and(|encoding| {
                                     encoding.to_str().unwrap() == "aes128gcm"
                                 });
-                            let body = fetch_body(&mut req, 1024 * 1024, &AccessToken::default())
-                                .await
-                                .unwrap();
+                            let body = fetch_body(&mut req, 1024 * 1024, 0).await.unwrap();
                             let message = serde_json::from_slice::<PushMessage>(&if is_encrypted {
                                 ece::decrypt(
                                     &push.keypair,
@@ -343,7 +334,9 @@ impl utils::listener::SessionManager for SessionManager {
                             push.tx.send(message).await.unwrap();
 
                             Ok::<_, hyper::Error>(
-                                HtmlResponse::new("ok".to_string()).into_http_response(),
+                                HtmlResponse::new("ok".to_string())
+                                    .into_http_response()
+                                    .build(),
                             )
                         }
                     }),

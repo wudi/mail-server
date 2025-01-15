@@ -1,28 +1,15 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{
+    auth::{AccessToken, ResourceToken},
+    Server,
+};
 use jmap_proto::{
-    error::{method::MethodError, set::SetError},
+    error::set::SetError,
     method::{
         copy::{CopyRequest, CopyResponse, RequestArguments},
         set::{self, SetRequest},
@@ -48,33 +35,69 @@ use jmap_proto::{
 };
 use mail_parser::{parsers::fields::thread::thread_name, HeaderName, HeaderValue};
 use store::{
-    write::{BatchBuilder, ValueClass, F_BITMAP, F_VALUE},
+    write::{
+        log::{Changes, LogInsert},
+        BatchBuilder, Bincode, MaybeDynamicId, TagValue, TaskQueueClass, ValueClass, F_BITMAP,
+        F_VALUE,
+    },
     BlobClass,
 };
+use trc::AddContext;
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, mailbox::UidMailbox, services::housekeeper::Event, Bincode, JMAP};
+use crate::{
+    api::http::HttpSessionData,
+    auth::acl::AclMethods,
+    changes::{state::StateManager, write::ChangeLog},
+    mailbox::{set::MailboxSet, UidMailbox},
+    services::index::Indexer,
+    JmapMethods,
+};
+use std::future::Future;
 
 use super::{
     index::{EmailIndexBuilder, TrimTextValue, VisitValues, MAX_ID_LENGTH, MAX_SORT_FIELD_LENGTH},
-    ingest::IngestedEmail,
+    ingest::{EmailIngest, IngestedEmail, LogEmailInsert},
     metadata::MessageMetadata,
 };
 
-impl JMAP {
-    pub async fn email_copy(
+pub trait EmailCopy: Sync + Send {
+    fn email_copy(
         &self,
         request: CopyRequest<RequestArguments>,
         access_token: &AccessToken,
         next_call: &mut Option<Call<RequestMethod>>,
-    ) -> Result<CopyResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<CopyResponse>> + Send;
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_message(
+        &self,
+        from_account_id: u32,
+        from_message_id: u32,
+        resource_token: &ResourceToken,
+        mailboxes: Vec<u32>,
+        keywords: Vec<Keyword>,
+        received_at: Option<UTCDate>,
+        session_id: u64,
+    ) -> impl Future<Output = trc::Result<Result<IngestedEmail, SetError>>> + Send;
+}
+
+impl EmailCopy for Server {
+    async fn email_copy(
+        &self,
+        request: CopyRequest<RequestArguments>,
+        access_token: &AccessToken,
+        next_call: &mut Option<Call<RequestMethod>>,
+        session: &HttpSessionData,
+    ) -> trc::Result<CopyResponse> {
         let account_id = request.account_id.document_id();
         let from_account_id = request.from_account_id.document_id();
 
         if account_id == from_account_id {
-            return Err(MethodError::InvalidArguments(
-                "From accountId is equal to fromAccountId".to_string(),
-            ));
+            return Err(trc::JmapEvent::InvalidArguments
+                .into_err()
+                .details("From accountId is equal to fromAccountId"));
         }
         let old_state = self
             .assert_state(account_id, Collection::Email, &request.if_in_state)
@@ -104,7 +127,7 @@ impl JMAP {
         let mut destroy_ids = Vec::new();
 
         // Obtain quota
-        let account_quota = self.get_quota(access_token, account_id).await?;
+        let resource_token = self.get_resource_token(access_token, account_id).await?;
 
         'create: for (id, create) in request.create {
             let id = id.unwrap();
@@ -226,11 +249,11 @@ impl JMAP {
                 .copy_message(
                     from_account_id,
                     from_message_id,
-                    account_id,
-                    account_quota,
+                    &resource_token,
                     mailboxes,
                     keywords,
                     received_at,
+                    session.session_id,
                 )
                 .await?
             {
@@ -281,17 +304,18 @@ impl JMAP {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn copy_message(
+    async fn copy_message(
         &self,
         from_account_id: u32,
         from_message_id: u32,
-        account_id: u32,
-        account_quota: i64,
+        resource_token: &ResourceToken,
         mailboxes: Vec<u32>,
         keywords: Vec<Keyword>,
         received_at: Option<UTCDate>,
-    ) -> Result<Result<IngestedEmail, SetError>, MethodError> {
+        session_id: u64,
+    ) -> trc::Result<Result<IngestedEmail, SetError>> {
         // Obtain metadata
+        let account_id = resource_token.account_id;
         let mut metadata = if let Some(metadata) = self
             .get_property::<Bincode<MessageMetadata>>(
                 from_account_id,
@@ -310,10 +334,21 @@ impl JMAP {
         };
 
         // Check quota
-        if account_quota > 0
-            && metadata.size as i64 + self.get_used_quota(account_id).await? > account_quota
+        match self
+            .has_available_quota(resource_token, metadata.size as u64)
+            .await
         {
-            return Ok(Err(SetError::over_quota()));
+            Ok(_) => (),
+            Err(err) => {
+                if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
+                    || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota))
+                {
+                    trc::error!(err.account_id(account_id).span_id(session_id));
+                    return Ok(Err(SetError::over_quota()));
+                } else {
+                    return Err(err);
+                }
+            }
         }
 
         // Set receivedAt
@@ -353,87 +388,99 @@ impl JMAP {
         let thread_id = if !references.is_empty() {
             self.find_or_merge_thread(account_id, subject, &references)
                 .await
-                .map_err(|_| MethodError::ServerPartialFail)?
+                .caused_by(trc::location!())?
         } else {
             None
         };
 
         // Assign id
-        let message_id = self
-            .assign_document_id(account_id, Collection::Email)
-            .await?;
         let mut email = IngestedEmail {
-            blob_id: BlobId::new(
-                metadata.blob_hash.clone(),
-                BlobClass::Linked {
-                    account_id,
-                    collection: Collection::Email.into(),
-                    document_id: message_id,
-                },
-            ),
             size: metadata.size,
             ..Default::default()
         };
+        let blob_hash = metadata.blob_hash.clone();
 
-        // Prepare batch
-        let mut batch = BatchBuilder::new();
-        batch.with_account_id(account_id);
-
-        // Build change log
-        let mut changes = self.begin_changes(account_id).await?;
-        let thread_id = if let Some(thread_id) = thread_id {
-            changes.log_child_update(Collection::Thread, thread_id);
-            thread_id
-        } else {
-            let thread_id = self
-                .assign_document_id(account_id, Collection::Thread)
-                .await?;
-            batch
-                .with_collection(Collection::Thread)
-                .create_document(thread_id);
-            changes.log_insert(Collection::Thread, thread_id);
-            thread_id
-        };
-        email.id = Id::from_parts(thread_id, message_id);
-        email.change_id = changes.change_id;
-        changes.log_insert(Collection::Email, email.id);
+        // Assign IMAP UIDs
+        let mut mailbox_ids = Vec::with_capacity(mailboxes.len());
+        email.imap_uids = Vec::with_capacity(mailboxes.len());
         for mailbox_id in &mailboxes {
-            changes.log_child_update(Collection::Mailbox, *mailbox_id);
+            let uid = self
+                .assign_imap_uid(account_id, *mailbox_id)
+                .await
+                .caused_by(trc::location!())?;
+            mailbox_ids.push(UidMailbox::new(*mailbox_id, uid));
+            email.imap_uids.push(uid);
         }
 
-        // Build batch
+        // Prepare batch
+        let change_id = self.assign_change_id(account_id).await?;
+        let mut batch = BatchBuilder::new();
         batch
-            .with_collection(Collection::Email)
-            .create_document(message_id)
-            .value(Property::ThreadId, thread_id, F_VALUE | F_BITMAP)
-            .value(
-                Property::MailboxIds,
-                mailboxes
-                    .into_iter()
-                    .map(UidMailbox::from)
-                    .collect::<Vec<_>>(),
-                F_VALUE | F_BITMAP,
-            )
-            .value(Property::Keywords, keywords, F_VALUE | F_BITMAP)
-            .value(Property::Cid, changes.change_id, F_VALUE)
-            .set(
-                ValueClass::IndexEmail(self.generate_snowflake_id()?),
-                metadata.blob_hash.clone(),
-            )
-            .custom(EmailIndexBuilder::set(metadata))
-            .custom(changes);
+            .with_account_id(account_id)
+            .with_change_id(change_id)
+            .with_collection(Collection::Thread);
+        if let Some(thread_id) = thread_id {
+            batch.log(Changes::update([thread_id]));
+        } else {
+            batch.create_document().log(LogInsert());
+        };
 
-        self.store.write(batch.build()).await.map_err(|err| {
-            tracing::error!(
-                    event = "error",
-                    context = "email_copy",
-                    error = ?err,
-                    "Failed to write message to database.");
-            MethodError::ServerPartialFail
-        })?;
+        // Build batch
+        let maybe_thread_id = thread_id
+            .map(MaybeDynamicId::Static)
+            .unwrap_or(MaybeDynamicId::Dynamic(0));
+        batch
+            .with_collection(Collection::Mailbox)
+            .log(Changes::child_update(mailboxes.iter().copied()))
+            .with_collection(Collection::Email)
+            .create_document()
+            .log(LogEmailInsert::new(thread_id))
+            .set(Property::ThreadId, maybe_thread_id)
+            .tag(Property::ThreadId, TagValue::Id(maybe_thread_id), 0)
+            .value(Property::MailboxIds, mailbox_ids, F_VALUE | F_BITMAP)
+            .value(Property::Keywords, keywords, F_VALUE | F_BITMAP)
+            .value(Property::Cid, change_id, F_VALUE)
+            .set(
+                ValueClass::TaskQueue(TaskQueueClass::IndexEmail {
+                    seq: self.generate_snowflake_id()?,
+                    hash: metadata.blob_hash.clone(),
+                }),
+                vec![],
+            );
+        EmailIndexBuilder::set(metadata).build(
+            &mut batch,
+            account_id,
+            resource_token.tenant.map(|t| t.id),
+        );
+
+        // Insert and obtain ids
+        let ids = self
+            .core
+            .storage
+            .data
+            .write(batch.build())
+            .await
+            .caused_by(trc::location!())?;
+        let thread_id = match thread_id {
+            Some(thread_id) => thread_id,
+            None => ids.first_document_id().caused_by(trc::location!())?,
+        };
+        let document_id = ids.last_document_id().caused_by(trc::location!())?;
 
         // Request FTS index
-        let _ = self.housekeeper_tx.send(Event::IndexStart).await;
+        self.notify_task_queue();
+
+        // Update response
+        email.id = Id::from_parts(thread_id, document_id);
+        email.change_id = change_id;
+        email.blob_id = BlobId::new(
+            blob_hash,
+            BlobClass::Linked {
+                account_id,
+                collection: Collection::Email.into(),
+                document_id,
+            },
+        );
 
         Ok(Ok(email))
     }

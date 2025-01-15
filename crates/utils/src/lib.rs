@@ -1,53 +1,195 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 
-use config::Config;
-
-pub mod acme;
+pub mod cache;
 pub mod codec;
 pub mod config;
-pub mod ipc;
-pub mod listener;
+pub mod glob;
 pub mod map;
 pub mod snowflake;
-pub mod suffixlist;
+pub mod url_params;
 
-use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{
-    trace::{self, Sampler},
-    Resource,
-};
-use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
+use futures::StreamExt;
+use reqwest::Response;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     ClientConfig, RootCertStore, SignatureScheme,
 };
 use rustls_pki_types::TrustAnchor;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
+
+pub const BLOB_HASH_LEN: usize = 32;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BlobHash([u8; BLOB_HASH_LEN]);
+
+impl BlobHash {
+    pub fn new_max() -> Self {
+        BlobHash([u8::MAX; BLOB_HASH_LEN])
+    }
+
+    pub fn try_from_hash_slice(value: &[u8]) -> Result<BlobHash, std::array::TryFromSliceError> {
+        value.try_into().map(BlobHash)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    pub fn to_hex(&self) -> String {
+        let mut hex = String::with_capacity(BLOB_HASH_LEN * 2);
+        for byte in self.0.iter() {
+            hex.push_str(&format!("{:02x}", byte));
+        }
+        hex
+    }
+}
+
+impl From<&[u8]> for BlobHash {
+    fn from(value: &[u8]) -> Self {
+        BlobHash(blake3::hash(value).into())
+    }
+}
+
+impl From<Vec<u8>> for BlobHash {
+    fn from(value: Vec<u8>) -> Self {
+        value.as_slice().into()
+    }
+}
+
+impl From<&Vec<u8>> for BlobHash {
+    fn from(value: &Vec<u8>) -> Self {
+        value.as_slice().into()
+    }
+}
+
+impl AsRef<BlobHash> for BlobHash {
+    fn as_ref(&self) -> &BlobHash {
+        self
+    }
+}
+
+impl From<BlobHash> for Vec<u8> {
+    fn from(value: BlobHash) -> Self {
+        value.0.to_vec()
+    }
+}
+
+impl AsRef<[u8]> for BlobHash {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl AsMut<[u8]> for BlobHash {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.as_mut()
+    }
+}
+
+pub trait HttpLimitResponse: Sync + Send {
+    fn bytes_with_limit(
+        self,
+        limit: usize,
+    ) -> impl std::future::Future<Output = reqwest::Result<Option<Vec<u8>>>> + Send;
+}
+
+impl HttpLimitResponse for Response {
+    async fn bytes_with_limit(self, limit: usize) -> reqwest::Result<Option<Vec<u8>>> {
+        if self
+            .content_length()
+            .is_some_and(|len| len as usize > limit)
+        {
+            return Ok(None);
+        }
+
+        let mut bytes = Vec::with_capacity(std::cmp::min(limit, 1024));
+        let mut stream = self.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len() + chunk.len() > limit {
+                return Ok(None);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        Ok(Some(bytes))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Semver(u64);
+
+impl Semver {
+    pub fn new(major: u16, minor: u16, patch: u16) -> Self {
+        let mut version: u64 = 0;
+        version |= (major as u64) << 32;
+        version |= (minor as u64) << 16;
+        version |= patch as u64;
+        Semver(version)
+    }
+
+    pub fn unpack(&self) -> (u16, u16, u16) {
+        let version = self.0;
+        let major = ((version >> 32) & 0xFFFF) as u16;
+        let minor = ((version >> 16) & 0xFFFF) as u16;
+        let patch = (version & 0xFFFF) as u16;
+        (major, minor, patch)
+    }
+
+    pub fn major(&self) -> u16 {
+        (self.0 >> 32) as u16
+    }
+
+    pub fn minor(&self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    pub fn patch(&self) -> u16 {
+        self.0 as u16
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl AsRef<u64> for Semver {
+    fn as_ref(&self) -> &u64 {
+        &self.0
+    }
+}
+
+impl From<u64> for Semver {
+    fn from(value: u64) -> Self {
+        Semver(value)
+    }
+}
+
+impl TryFrom<&str> for Semver {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let mut parts = value.splitn(3, '.');
+        let major = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        let minor = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        let patch = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+        Ok(Semver::new(major, minor, patch))
+    }
+}
+
+impl Display for Semver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (major, minor, patch) = self.unpack();
+        write!(f, "{major}.{minor}.{patch}")
+    }
+}
 
 pub trait UnwrapFailure<T> {
     fn failed(self, action: &str) -> T;
@@ -58,7 +200,10 @@ impl<T> UnwrapFailure<T> for Option<T> {
         match self {
             Some(result) => result,
             None => {
-                tracing::error!("{message}");
+                trc::event!(
+                    Server(trc::ServerEvent::StartupError),
+                    Details = message.to_string()
+                );
                 eprintln!("{message}");
                 std::process::exit(1);
             }
@@ -71,7 +216,11 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
         match self {
             Ok(result) => result,
             Err(err) => {
-                tracing::error!("{message}: {err}");
+                trc::event!(
+                    Server(trc::ServerEvent::StartupError),
+                    Details = message.to_string(),
+                    Reason = err.to_string()
+                );
 
                 #[cfg(feature = "test_mode")]
                 panic!("{message}: {err}");
@@ -87,154 +236,44 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
 }
 
 pub fn failed(message: &str) -> ! {
-    tracing::error!("{message}");
+    trc::event!(
+        Server(trc::ServerEvent::StartupError),
+        Details = message.to_string(),
+    );
     eprintln!("{message}");
     std::process::exit(1);
 }
 
-pub fn enable_tracing(config: &Config, message: &str) -> config::Result<Option<WorkerGuard>> {
-    let level = config.value("global.tracing.level").unwrap_or("info");
-    let env_filter = EnvFilter::builder()
-        .parse(format!(
-            "smtp={level},imap={level},jmap={level},store={level},utils={level},directory={level}"
-        ))
-        .failed("Failed to log level");
-    let result = match config.value("global.tracing.method").unwrap_or_default() {
-        "log" => {
-            let path = config.value_require("global.tracing.path")?;
-            let prefix = config.value_require("global.tracing.prefix")?;
-            let file_appender = match config.value("global.tracing.rotate").unwrap_or("daily") {
-                "daily" => tracing_appender::rolling::daily(path, prefix),
-                "hourly" => tracing_appender::rolling::hourly(path, prefix),
-                "minutely" => tracing_appender::rolling::minutely(path, prefix),
-                "never" => tracing_appender::rolling::never(path, prefix),
-                rotate => {
-                    return Err(format!("Unsupported log rotation strategy {rotate:?}"));
-                }
-            };
-
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::FmtSubscriber::builder()
-                    .with_env_filter(env_filter)
-                    .with_writer(non_blocking)
-                    .with_ansi(config.property_or_static("global.tracing.ansi", "true")?)
-                    .finish(),
-            )
-            .failed("Failed to set subscriber");
-            Ok(guard.into())
-        }
-        "stdout" => {
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::FmtSubscriber::builder()
-                    .with_env_filter(env_filter)
-                    .with_ansi(config.property_or_static("global.tracing.ansi", "true")?)
-                    .finish(),
-            )
-            .failed("Failed to set subscriber");
-
-            Ok(None)
-        }
-        "otel" | "open-telemetry" => {
-            let tracer = match config.value_require("global.tracing.transport")? {
-                "grpc" => {
-                    let mut exporter = opentelemetry_otlp::new_exporter().tonic();
-                    if let Some(endpoint) = config.value("global.tracing.endpoint") {
-                        exporter = exporter.with_endpoint(endpoint);
-                    }
-                    opentelemetry_otlp::new_pipeline()
-                        .tracing()
-                        .with_exporter(exporter)
-                }
-                "http" => {
-                    let mut headers = HashMap::new();
-                    for (_, value) in config.values("global.tracing.headers") {
-                        if let Some((key, value)) = value.split_once(':') {
-                            headers.insert(key.trim().to_string(), value.trim().to_string());
-                        } else {
-                            return Err(format!("Invalid open-telemetry header {value:?}"));
-                        }
-                    }
-                    let mut exporter = opentelemetry_otlp::new_exporter()
-                        .http()
-                        .with_endpoint(config.value_require("global.tracing.endpoint")?);
-                    if !headers.is_empty() {
-                        exporter = exporter.with_headers(headers);
-                    }
-                    opentelemetry_otlp::new_pipeline()
-                        .tracing()
-                        .with_exporter(exporter)
-                }
-                transport => {
-                    return Err(format!(
-                        "Unsupported open-telemetry transport {transport:?}"
-                    ));
-                }
-            }
-            .with_trace_config(
-                trace::config()
-                    .with_resource(Resource::new(vec![
-                        KeyValue::new(SERVICE_NAME, "stalwart-smtp".to_string()),
-                        KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION").to_string()),
-                    ]))
-                    .with_sampler(Sampler::AlwaysOn),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)
-            .failed("Failed to create tracer");
-
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::Registry::default()
-                    .with(tracing_opentelemetry::layer().with_tracer(tracer))
-                    .with(env_filter),
-            )
-            .failed("Failed to set subscriber");
-
-            Ok(None)
-        }
-        #[cfg(unix)]
-        "journal" => {
-            tracing::subscriber::set_global_default(
-                tracing_subscriber::Registry::default()
-                    .with(tracing_journald::layer().failed("Failed to configure journal"))
-                    .with(env_filter),
-            )
-            .failed("Failed to set subscriber");
-
-            Ok(None)
-        }
-        _ => Ok(None),
-    };
-
-    tracing::info!(message);
-
-    result
-}
-
-pub async fn wait_for_shutdown(message: &str) {
+pub async fn wait_for_shutdown() {
     #[cfg(not(target_env = "msvc"))]
-    {
+    let signal = {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut h_term = signal(SignalKind::terminate()).failed("start signal handler");
         let mut h_int = signal(SignalKind::interrupt()).failed("start signal handler");
 
         tokio::select! {
-            _ = h_term.recv() => tracing::debug!("Received SIGTERM."),
-            _ = h_int.recv() => tracing::debug!("Received SIGINT."),
-        };
-    }
+            _ = h_term.recv() => "SIGTERM",
+            _ = h_int.recv() => "SIGINT",
+        }
+    };
 
     #[cfg(target_env = "msvc")]
-    {
+    let signal = {
         match tokio::signal::ctrl_c().await {
-            Ok(()) => {}
+            Ok(()) => "SIGINT",
             Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
+                trc::event!(
+                    Server(trc::ServerEvent::ThreadError),
+                    Details = "Unable to listen for shutdown signal",
+                    Reason = err.to_string(),
+                );
+                "Error"
             }
         }
-    }
+    };
 
-    tracing::info!(message);
+    trc::event!(Server(trc::ServerEvent::Shutdown), CausedBy = signal);
 }
 
 pub fn rustls_client_config(allow_invalid_certs: bool) -> ClientConfig {
@@ -309,5 +348,41 @@ impl ServerCertVerifier for DummyVerifier {
             SignatureScheme::ED25519,
             SignatureScheme::ED448,
         ]
+    }
+}
+
+// Basic email sanitizer
+pub fn sanitize_email(email: &str) -> Option<String> {
+    let mut result = String::with_capacity(email.len());
+    let mut found_local = false;
+    let mut found_domain = false;
+    let mut last_ch = char::from(0);
+
+    for ch in email.chars() {
+        if !ch.is_whitespace() {
+            if ch == '@' {
+                if !result.is_empty() && !found_local {
+                    found_local = true;
+                } else {
+                    return None;
+                }
+            } else if ch == '.' {
+                if !(last_ch.is_alphanumeric() || last_ch == '-' || last_ch == '_') {
+                    return None;
+                } else if found_local {
+                    found_domain = true;
+                }
+            }
+            last_ch = ch;
+            for ch in ch.to_lowercase() {
+                result.push(ch);
+            }
+        }
+    }
+
+    if found_domain && last_ch != '.' && psl::domain(result.as_bytes()).is_some() {
+        Some(result)
+    } else {
+        None
     }
 }

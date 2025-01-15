@@ -1,51 +1,29 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use crate::smtp::{inbound::sign::TextConfigContext, session::TestSession, TestConfig};
-use directory::core::config::ConfigDirectory;
-use smtp::{
-    config::{if_block::ConfigIf, scripts::ConfigSieve, ConfigContext, EnvelopeKey, IfBlock},
-    core::{Session, SMTP},
-};
-use store::{Store, Stores};
-use utils::config::{Config, DynValue, Servers};
+use common::Core;
+
+use smtp::core::Session;
+use utils::config::Config;
+
+use crate::smtp::{session::TestSession, TestSMTP};
 
 const CONFIG: &str = r#"
 [session.mail]
-rewrite = [ { all-of = [ { if = "sender-domain", ends-with = ".foobar.net" },
-                         { if = "sender", matches = "^([^.]+)@([^.]+)\.(.+)$"}, 
-                       ], then = "${1}+${2}@${3}" }, 
+rewrite = [ { if = "ends_with(sender_domain, '.foobar.net') & matches('^([^.]+)@([^.]+)\.(.+)$', sender)", then = "$1 + '+' + $2 + '@' + $3"},
             { else = false } ]
-script = [ { if = "sender-domain", eq = "foobar.org", then = "mail" }, 
+script = [ { if = "sender_domain = 'foobar.org'", then = "'mail'" }, 
             { else = false } ]
 
 [session.rcpt]
-rewrite = [ { all-of = [ { if = "rcpt-domain", eq = "foobar.net" },
-                         { if = "rcpt", matches = "^([^.]+)\.([^.]+)@(.+)$"}, 
-                       ], then = "${1}+${2}@${3}" }, 
+rewrite = [ { if = "rcpt_domain = 'foobar.net' & matches('^([^.]+)\\.([^.]+)@(.+)$', rcpt)", then = "$1 + '+' + $2 + '@' + $3"},
             { else = false } ]
-script = [ { if = "rcpt-domain", eq = "foobar.org", then = "rcpt" }, 
+script = [ { if = "rcpt_domain = 'foobar.org'", then = "'rcpt'" }, 
             { else = false } ]
+relay = true
 
 [sieve.trusted]
 from-name = "Sieve Daemon"
@@ -61,8 +39,8 @@ cpu = 10000
 nested-includes = 5
 duplicate-expiry = "7d"
 
-[sieve.trusted.scripts]
-mail = '''
+[sieve.trusted.scripts."mail"]
+contents = '''
 require ["variables", "envelope"];
 
 if allof( envelope :domain :is "from" "foobar.org", 
@@ -72,7 +50,8 @@ if allof( envelope :domain :is "from" "foobar.org",
 
 '''
 
-rcpt = '''
+[sieve.trusted.scripts."rcpt"]
+contents = '''
 require ["variables", "envelope", "regex"];
 
 if allof( envelope :localpart :contains "to" ".",
@@ -87,62 +66,16 @@ if allof( envelope :localpart :contains "to" ".",
 
 #[tokio::test]
 async fn address_rewrite() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Prepare config
-    let available_keys = [
-        EnvelopeKey::Sender,
-        EnvelopeKey::SenderDomain,
-        EnvelopeKey::Recipient,
-        EnvelopeKey::RecipientDomain,
-    ];
-    let mut core = SMTP::test();
-    let mut ctx = ConfigContext::new(&[]).parse_signatures();
-    let settings = Config::new(CONFIG).unwrap();
-    ctx.directory = settings
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    core.sieve = settings.parse_sieve(&mut ctx).unwrap();
-    let config = &mut core.session.config;
-    config.mail.script = settings
-        .parse_if_block::<Option<String>>("session.mail.script", &ctx, &available_keys)
-        .unwrap()
-        .unwrap_or_default()
-        .map_if_block(&ctx.scripts, "session.mail.script", "script")
-        .unwrap();
-    config.mail.rewrite = settings
-        .parse_if_block::<Option<DynValue<EnvelopeKey>>>(
-            "session.mail.rewrite",
-            &ctx,
-            &available_keys,
-        )
-        .unwrap()
-        .unwrap_or_default();
-    config.rcpt.script = settings
-        .parse_if_block::<Option<String>>("session.rcpt.script", &ctx, &available_keys)
-        .unwrap()
-        .unwrap_or_default()
-        .map_if_block(&ctx.scripts, "session.rcpt.script", "script")
-        .unwrap();
-    config.rcpt.rewrite = settings
-        .parse_if_block::<Option<DynValue<EnvelopeKey>>>(
-            "session.rcpt.rewrite",
-            &ctx,
-            &available_keys,
-        )
-        .unwrap()
-        .unwrap_or_default();
-    config.rcpt.relay = IfBlock::new(true);
+    let mut config = Config::new(CONFIG).unwrap();
+    let core = Core::parse(&mut config, Default::default(), Default::default()).await;
 
     // Init session
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("mx.doe.org").await;
 

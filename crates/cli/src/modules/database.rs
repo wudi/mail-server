@@ -1,50 +1,56 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
+use std::collections::HashMap;
 
 use prettytable::{Attr, Cell, Row, Table};
 use reqwest::Method;
 use serde_json::Value;
 
+use crate::modules::Response;
+
 use super::cli::{Client, ServerCommands};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateSettings {
+    Delete {
+        keys: Vec<String>,
+    },
+    Clear {
+        prefix: String,
+        #[serde(default)]
+        filter: Option<String>,
+    },
+    Insert {
+        prefix: Option<String>,
+        values: Vec<(String, String)>,
+        assert_empty: bool,
+    },
+}
 
 impl ServerCommands {
     pub async fn exec(self, client: Client) {
         match self {
             ServerCommands::DatabaseMaintenance {} => {
                 client
-                    .http_request::<Value, String>(Method::GET, "/admin/store/maintenance", None)
+                    .http_request::<Value, String>(Method::GET, "/api/store/maintenance", None)
                     .await;
                 eprintln!("Success.");
             }
             ServerCommands::ReloadCertificates {} => {
                 client
-                    .http_request::<Value, String>(Method::GET, "/admin/reload/certificates", None)
+                    .http_request::<Value, String>(Method::GET, "/api/reload/certificate", None)
                     .await;
                 eprintln!("Success.");
             }
             ServerCommands::ReloadConfig {} => {
                 client
-                    .http_request::<Value, String>(Method::GET, "/admin/reload/config", None)
+                    .http_request::<Value, String>(Method::GET, "/api/reload", None)
                     .await;
                 eprintln!("Success.");
             }
@@ -52,30 +58,37 @@ impl ServerCommands {
                 client
                     .http_request::<Value, _>(
                         Method::POST,
-                        "/admin/config",
-                        Some(vec![(key.clone(), value.unwrap_or_default())]),
+                        "/api/settings",
+                        Some(vec![UpdateSettings::Insert {
+                            prefix: None,
+                            values: vec![(key.clone(), value.unwrap_or_default())],
+                            assert_empty: false,
+                        }]),
                     )
                     .await;
                 eprintln!("Successfully added key {key}.");
             }
             ServerCommands::DeleteConfig { key } => {
                 client
-                    .http_request::<Value, String>(
-                        Method::DELETE,
-                        &format!("/admin/config/{key}"),
-                        None,
+                    .http_request::<Value, _>(
+                        Method::POST,
+                        "/api/settings",
+                        Some(vec![UpdateSettings::Delete {
+                            keys: vec![key.clone()],
+                        }]),
                     )
                     .await;
                 eprintln!("Successfully deleted key {key}.");
             }
             ServerCommands::ListConfig { prefix } => {
                 let results = client
-                    .http_request::<Vec<(String, String)>, String>(
+                    .http_request::<Response<HashMap<String, String>>, String>(
                         Method::GET,
-                        &format!("/admin/config/{}", prefix.unwrap_or_default()),
+                        &format!("/api/settings/list?prefix={}", prefix.unwrap_or_default()),
                         None,
                     )
-                    .await;
+                    .await
+                    .items;
 
                 if !results.is_empty() {
                     let mut table = Table::new();

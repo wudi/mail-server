@@ -1,3 +1,197 @@
+Upgrading from `v0.10.x` to `v0.11.0`
+------------------------------------
+
+Version `0.11.0` introduces breaking changes to the spam filter configuration. Although no data migration is required, if changes were made to the previous spam filter, the configuration of the new spam filter should be reviewed. In particular:
+
+- `lookup.spam-*` settings are no longer used, these have been replaced by `spam-filter.*` settings. Review the [updated documentation](http://stalw.art/docs/spamfilter/overview).
+- Previous `spam-filter` and `track-replies` Sieve scripts cannot be used with the new version. They have been replaced by a built-in spam filter written in Rust.
+- Cache settings have changed, see the [documentation](https://stalw.art/docs/server/cache) for details.
+- Support for Pipes was removed in favor of MTA hooks and Milter.
+- `config.resource.spam-filter` is now `spam-filter.resource`.
+- `config.resource.webadmin` is now `webadmin.resource`.
+- `authentication.rate-limit` was removed as security is handled by fail2ban.
+
+Upgrading from `v0.9.x` to `v0.10.0`
+-----------------------------------
+
+## Important Notes
+
+- In version `0.10.0` accounts are associated with roles and permissions, which define what resources they can access. The concept of administrator or super user accounts no longer exists, now there is a single account type (the `individual` principal) which can be assigned the `admin` role or custom permissions to have administrator access.
+- Due to the changes in the database layout in order to support roles and permissions, the database must be migrated to the new layout. The migration is automatic and should not require any manual intervention.
+- While the database migration is automatic, it's recommended to **back up your data** before upgrading.
+- The webadmin must be upgraded **before** the mail server to maintain access post-upgrade. This is true even if you run Stalwart in Docker.
+
+## Step-by-Step Upgrade Process
+
+- Upgrade the webadmin by clicking on `Manage` > `Maintenance` > `Update Webadmin`.
+- Stop Stalwart and backup your data:
+
+  ```bash
+  $ sudo systemctl stop stalwart-mail
+  $ sudo /opt/stalwart-mail/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --export /opt/stalwart-mail/export
+  $ sudo chown -R stalwart-mail:stalwart-mail /opt/stalwart-mail/export
+  ```
+
+  or, if you are using the Docker image:
+
+  ```bash
+  $ docker stop stalwart-mail
+  $ docker run --rm -v <STALWART_DIR>:/opt/stalwart-mail -it stalwart-mail /usr/local/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --export /opt/stalwart-mail/export
+  ```
+- Download the `v0.10.0` mail-server for your platform from the [releases page](https://github.com/stalwartlabs/mail-server/releases/latest/) and replace the binary in `/opt/stalwart-mail/bin`. If you are using the Docker image, pull the latest image.
+- Start the service:
+  ```bash
+  $ sudo systemctl start stalwart-mail
+  ```
+
+  Or, if you are using the Docker image:
+  ```bash
+  $ docker start stalwart-mail
+  ```
+
+Upgrading from `v0.8.x` to `v0.9.0`
+-----------------------------------
+
+Version `0.9.0` introduces significant internal improvements while maintaining compatibility with existing database layouts and configuration file formats from version `0.8.0`. As a result, no data or configuration migration is necessary. This release focuses on enhancing performance and functionality, particularly in logging and tracing capabilities.
+
+To upgrade to Stalwart Mail Server version `0.9.0` from `0.8.x`, begin by downloading the latest version of the `stalwart-mail` binary. Once downloaded, replace the existing binary with the new version. Additionally, it's important to update the WebAdmin interface to the latest version to ensure compatibility and to access new features introduced in this release.
+
+In terms of breaking changes, this release brings significant updates to webhooks. All webhook event names have been modified, requiring a thorough review and adjustment of existing webhook configurations. Furthermore, the update introduces hundreds of new event types, enhancing the granularity and specificity of event handling capabilities. Users should familiarize themselves with these changes to effectively integrate them into their systems.
+
+The reason for this release being classified as a major version, despite the absence of changes to the database or configuration formats, is the complete rewrite of the logging and tracing layer. This overhaul substantially improves the efficiency and speed of generating detailed tracing and logging events, making the system more robust and facilitating easier debugging and monitoring.
+
+Upgrading from `v0.7.3` to `v0.8.0`
+-----------------------------------
+
+Version `0.8.0` includes both performance and security enhancements that require your data to be migrated to a new database layout. Luckily version `0.7.3` includes a migration tool which should make this process much easier than previous upgrades. In addition to the new layout, you will have to change the systemd service file to use the `CAP_NET_BIND_SERVICE` capability.
+
+## Preparation
+- Upgrade to version `0.7.3` if you haven't already. If you are on a version previous to `0.7.0`, you will have to do a manual migration of your data using the Command-line Interface.
+- Create a directory where your data will be exported to, for example `/opt/stalwart-mail/export`.
+
+## Systemd service upgrade (Linux only)
+- Stop the `v0.7.3` installation:
+  ```bash
+  $ sudo systemctl stop stalwart-mail
+  ```
+- Update your systemd file to include the `CAP_NET_BIND_SERVICE` capability. Open the file `/etc/systemd/system/stalwart-mail.service` in a text editor and add the following lines under the `[Service]` section:
+  ```
+  User=stalwart-mail
+  Group=stalwart-mail
+  AmbientCapabilities=CAP_NET_BIND_SERVICE
+  ```
+- Reload the daemon:
+  ```bash
+  $ systemctl daemon-reload
+  ```
+- Do not start the service yet.
+
+## Data migration
+- Stop Stalwart and export your data:
+
+  ```bash
+  $ sudo systemctl stop stalwart-mail
+  $ sudo /opt/stalwart-mail/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --export /opt/stalwart-mail/export
+  $ sudo chown -R stalwart-mail:stalwart-mail /opt/stalwart-mail/export
+  ```
+
+  or, if you are using the Docker image:
+
+  ```bash
+  $ docker stop stalwart-mail
+  $ docker run --rm -v <STALWART_DIR>:/opt/stalwart-mail -it stalwart-mail /opt/stalwart-mail/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --export /opt/stalwart-mail/export
+  ```
+- Backup your `v0.7.3` installation:
+  - If you are using RocksDB or SQLite, simply rename the `data` directory to `data-backup`, for example:
+    ```bash
+    $ mv /opt/stalwart-mail/data /opt/stalwart-mail/data-backup
+    $ mkdir /opt/stalwart-mail/data
+    $ chown stalwart-mail:stalwart-mail /opt/stalwart-mail/data
+    ```
+  - If you are using PostgreSQL, rename the database and create a blank database with the same name, for example:
+    ```sql
+    ALTER DATABASE stalwart RENAME TO stalwart_old; 
+    CREATE database stalwart;
+    ```
+  - If you are using MySQL, rename the database and create a blank database with the same name, for example:
+    ```sql
+    CREATE DATABASE stalwart_old;
+    RENAME TABLE stalwart.b TO stalwart_old.b;
+    RENAME TABLE stalwart.v TO stalwart_old.v;
+    RENAME TABLE stalwart.l TO stalwart_old.l;
+    RENAME TABLE stalwart.i TO stalwart_old.i;
+    RENAME TABLE stalwart.t TO stalwart_old.t;
+    RENAME TABLE stalwart.c TO stalwart_old.c;
+    DROP DATABASE stalwart;
+    CREATE database stalwart;
+    ```
+  - If you are using FoundationDB, backup your database and clean the entire key range.
+- Download the `v0.8.0` mail-server for your platform from the [releases page](https://github.com/stalwartlabs/mail-server/releases/latest/) and replace the binary in `/opt/stalwart-mail/bin`. If you are using the Docker image, pull the latest image.
+- Import your data:
+
+  ```bash
+  $ sudo -u stalwart-mail /opt/stalwart-mail/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --import /opt/stalwart-mail/export
+  ```
+
+  or, if you are using the Docker image:
+  
+  ```bash
+  $ docker run --rm -v <STALWART_DIR>:/opt/stalwart-mail -it stalwart-mail /opt/stalwart-mail/bin/stalwart-mail --config /opt/stalwart-mail/etc/config.toml --import /opt/stalwart-mail/export
+  ```
+- Start the service:
+  ```bash
+  $ sudo systemctl start stalwart-mail
+  ```
+
+  Or, if you are using the Docker image:
+  ```bash
+  $ docker start stalwart-mail
+  ```
+
+Upgrading from `v0.6.0` to `v0.7.0`
+-----------------------------------
+
+Version `0.7.0` of Stalwart Mail Server introduces significant improvements and features that enhance performance and functionality. However, it also comes with multiple breaking changes in the configuration files and a revamped database layout optimized for accessing large mailboxes. Additionally, Stalwart now supports compression for binaries stored in the blob store, further increasing efficiency.
+Due to these extensive changes, the recommended approach for upgrading is to perform a clean reinstallation of Stalwart and manually migrate your accounts to the new version.
+
+## Pre-Upgrade Steps
+- Download the `v0.7.0` mail-server and CLI binaries for your platform from the [releases page](https://github.com/stalwartlabs/mail-server/releases/latest/).
+- Initialize the setup on a distinct directory using the command `sudo ./stalwart-mail --init /path/to/new-install`. This command will print the administrator password required to access the web-admin.
+- Create the `bin` directory using `mkdir /path/to/new-install/bin`.
+- Move the downloaded binaries to the `bin` directory using the command `mv stalwart-mail stalwart-cli /path/to/new-install/bin`.
+- Open `/path/to/new-install/etc/config.toml` in a text editor and comment out all listeners except the HTTP listener for port `8080`.
+- Start the new installation from the terminal using the command `sudo /path/to/new-install/bin/stalwart-mail --config /path/to/new-install/etc/config.toml`.
+- Point your browser to the web-admin at `http://yourserver.org:8080` and login using the auto-generated administrator password. 
+- Configure the new installation with your domain, hostname, certificates, and other settings following the instructions at [stalw.art/docs/get-started](https://stalw.art/docs/get-started). Ignore the part about using the installation script, we are performing a manual installation.
+- Add your user accounts.
+- Configure Stalwart to run as the `stalwart-mail` user and `stalwart-mail` group from `Settings` > `Server` > `System`. This is not necessary if you are using Docker.
+- Stop the new installation by pressing `Ctrl+C` in the terminal.
+
+## Upgrade Steps
+- On your `v0.6.0` installation, open in a text editor the `smtp/listener.toml`, `imap/listener.toml` files and comment out all listeners except the JMAP/HTTP listener (we are going to need it to export the user accounts) and then restart the service.
+- If you are using an external store, backup the database using the appropriate method for your database system.
+- Create the `~/exports` directory, here we will store the exported accounts.
+- Using the existing CLI tool (not the one you just downloaded as it is not compatible), export each user account using the command `./stalwart-cli -u https://your-old-server.org -c <ADMIN_PASSWORD> export account <ACCOUNT_NAME> ~/exports`.
+- Stop the `v0.6.0` installation using the command `sudo systemctl stop stalwart-mail`.
+- Move the old `v0.6.0` installation to a backup directory, for example `mv /opt/stalwart-mail /opt/stalwart-mail-backup`.
+- Move the new `v0.7.0` installation to the old installation directory, for example `mv /path/to/new-install /opt/stalwart-mail`.
+- Set the right permissions for the new installation using the command `sudo chown -R stalwart-mail:stalwart-mail /opt/stalwart-mail`.
+- Start the new installation using the command `sudo systemctl start stalwart-mail`.
+- Import the accounts using the new CLI tool with the command `./stalwart-cli -u http://yourserver.org:8080 -c <ADMIN_PASSWORD> import account <ACCOUNT> ~/exports/<ACCOUNT>`.
+- Using the admin tool, reactivate all the necessary listener (SMTP, IMAP, etc.)
+- Restart the service using the command `sudo systemctl restart stalwart-mail`.
+
+We apologize for the complexity of the upgrade process associated with this version of Stalwart. We understand the challenges and inconveniences that the requirement for a clean reinstallation and manual account migration poses. Moving forward, an automated migration tool will be included in any future releases that necessitate changes to the database layout, aiming to streamline the upgrade process for you. Furthermore, as we approach the milestone of version 1.0.0, we anticipate that such foundational changes will become increasingly infrequent, leading to more straightforward updates. We appreciate your patience and commitment to Stalwart during this upgrade.
+
+Upgrading from `v0.5.3` to `v0.6.0`
+-----------------------------------
+
+- In order to support [expressions](https://stalw.art/docs/configuration/expressions/overview), version `0.6.0` introduces multiple breaking changes in the SMTP server configuration file. It is recommended to download the new SMTP configuration files from the [repository](https://github.com/stalwartlabs/mail-server/tree/main/resources/config/smtp), make any necessary changes and replace the old files under `INSTALL_DIR/etc/smtp` with the new ones.
+- If you are using custom subaddressing of catch-all rules, you'll need to replace these rules with expressions. Check out the updated [syntax](https://stalw.art/docs/directory/addresses).
+- Message queues are now distributed and stored in the backend specified by the `storage.data` and `storage.blob` settings. Make sure to flush your SMTP message queue before upgrading to `0.6.0` to avoid losing any outgoing messages pending delivery.
+- Replace the binary with the new version.
+- Restart the service.
+
 Upgrading from `v0.5.2` to `v0.5.3`
 -----------------------------------
 

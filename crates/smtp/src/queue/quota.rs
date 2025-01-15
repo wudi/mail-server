@@ -1,127 +1,172 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::sync::{atomic::Ordering, Arc};
+use std::future::Future;
 
-use dashmap::mapref::entry::Entry;
-use utils::config::KeyLookup;
-
-use crate::{
-    config::{EnvelopeKey, QueueQuota},
-    core::QueueCore,
+use common::{config::smtp::queue::QueueQuota, expr::functions::ResolveVariable, Server};
+use store::{
+    write::{BatchBuilder, QueueClass, ValueClass},
+    ValueKey,
 };
+use trc::QueueEvent;
 
-use super::{Message, QuotaLimiter, SimpleEnvelope, Status, UsedQuota};
+use crate::core::throttle::NewKey;
 
-impl QueueCore {
-    pub async fn has_quota(&self, message: &mut Message) -> bool {
-        let mut queue_refs = Vec::new();
+use super::{Message, QueueEnvelope, QuotaKey, Status};
 
-        if !self.config.quota.sender.is_empty() {
-            for quota in &self.config.quota.sender {
+pub trait HasQueueQuota: Sync + Send {
+    fn has_quota(&self, message: &mut Message) -> impl Future<Output = bool> + Send;
+    fn check_quota<'x>(
+        &'x self,
+        quota: &'x QueueQuota,
+        envelope: &impl ResolveVariable,
+        size: usize,
+        id: u64,
+        refs: &mut Vec<QuotaKey>,
+        session_id: u64,
+    ) -> impl Future<Output = bool> + Send;
+}
+
+impl HasQueueQuota for Server {
+    async fn has_quota(&self, message: &mut Message) -> bool {
+        let mut quota_keys = Vec::new();
+
+        if !self.core.smtp.queue.quota.sender.is_empty() {
+            for quota in &self.core.smtp.queue.quota.sender {
                 if !self
-                    .reserve_quota(quota, message, message.size, 0, &mut queue_refs)
-                    .await
-                {
-                    return false;
-                }
-            }
-        }
-
-        for quota in &self.config.quota.rcpt_domain {
-            for (pos, domain) in message.domains.iter().enumerate() {
-                if !self
-                    .reserve_quota(
+                    .check_quota(
                         quota,
-                        &SimpleEnvelope::new(message, &domain.domain),
+                        message,
                         message.size,
-                        ((pos + 1) << 32) as u64,
-                        &mut queue_refs,
+                        0,
+                        &mut quota_keys,
+                        message.span_id,
                     )
                     .await
                 {
+                    trc::event!(
+                        Queue(QueueEvent::QuotaExceeded),
+                        SpanId = message.span_id,
+                        Id = quota.id.clone(),
+                        Type = "Sender"
+                    );
+
                     return false;
                 }
             }
         }
 
-        for quota in &self.config.quota.rcpt {
-            for (pos, rcpt) in message.recipients.iter().enumerate() {
+        for quota in &self.core.smtp.queue.quota.rcpt_domain {
+            for domain_idx in 0..message.domains.len() {
                 if !self
-                    .reserve_quota(
+                    .check_quota(
                         quota,
-                        &SimpleEnvelope::new_rcpt(
-                            message,
-                            &message.domains[rcpt.domain_idx].domain,
-                            &rcpt.address_lcase,
-                        ),
+                        &QueueEnvelope::new(message, domain_idx),
                         message.size,
-                        (pos + 1) as u64,
-                        &mut queue_refs,
+                        ((domain_idx + 1) << 32) as u64,
+                        &mut quota_keys,
+                        message.span_id,
                     )
                     .await
                 {
+                    trc::event!(
+                        Queue(QueueEvent::QuotaExceeded),
+                        SpanId = message.span_id,
+                        Id = quota.id.clone(),
+                        Type = "Domain"
+                    );
+
                     return false;
                 }
             }
         }
 
-        message.queue_refs = queue_refs;
+        for quota in &self.core.smtp.queue.quota.rcpt {
+            for (rcpt_idx, rcpt) in message.recipients.iter().enumerate() {
+                if !self
+                    .check_quota(
+                        quota,
+                        &QueueEnvelope::new_rcpt(message, rcpt.domain_idx, rcpt_idx),
+                        message.size,
+                        (rcpt_idx + 1) as u64,
+                        &mut quota_keys,
+                        message.span_id,
+                    )
+                    .await
+                {
+                    trc::event!(
+                        Queue(QueueEvent::QuotaExceeded),
+                        SpanId = message.span_id,
+                        Id = quota.id.clone(),
+                        Type = "Recipient"
+                    );
+
+                    return false;
+                }
+            }
+        }
+
+        message.quota_keys = quota_keys;
 
         true
     }
 
-    async fn reserve_quota(
-        &self,
-        quota: &QueueQuota,
-        envelope: &impl KeyLookup<Key = EnvelopeKey>,
+    async fn check_quota<'x>(
+        &'x self,
+        quota: &'x QueueQuota,
+        envelope: &impl ResolveVariable,
         size: usize,
         id: u64,
-        refs: &mut Vec<UsedQuota>,
+        refs: &mut Vec<QuotaKey>,
+        session_id: u64,
     ) -> bool {
-        if !quota.conditions.conditions.is_empty() && quota.conditions.eval(envelope).await {
-            match self.quota.entry(quota.new_key(envelope)) {
-                Entry::Occupied(e) => {
-                    if let Some(qref) = e.get().is_allowed(id, size) {
-                        refs.push(qref);
-                    } else {
-                        return false;
-                    }
-                }
-                Entry::Vacant(e) => {
-                    let limiter = Arc::new(QuotaLimiter {
-                        max_size: quota.size.unwrap_or(0),
-                        max_messages: quota.messages.unwrap_or(0),
-                        size: 0.into(),
-                        messages: 0.into(),
+        if !quota.expr.is_empty()
+            && self
+                .eval_expr(&quota.expr, envelope, "check_quota", session_id)
+                .await
+                .unwrap_or(false)
+        {
+            let key = quota.new_key(envelope);
+            if let Some(max_size) = quota.size {
+                let used_size = self
+                    .core
+                    .storage
+                    .data
+                    .get_counter(ValueKey::from(ValueClass::Queue(QueueClass::QuotaSize(
+                        key.as_ref().to_vec(),
+                    ))))
+                    .await
+                    .unwrap_or(0) as usize;
+                if used_size + size > max_size {
+                    return false;
+                } else {
+                    refs.push(QuotaKey::Size {
+                        key: key.as_ref().to_vec(),
+                        id,
                     });
+                }
+            }
 
-                    if let Some(qref) = limiter.is_allowed(id, size) {
-                        refs.push(qref);
-                        e.insert(limiter);
-                    } else {
-                        return false;
-                    }
+            if let Some(max_messages) = quota.messages {
+                let total_messages = self
+                    .core
+                    .storage
+                    .data
+                    .get_counter(ValueKey::from(ValueClass::Queue(QueueClass::QuotaCount(
+                        key.as_ref().to_vec(),
+                    ))))
+                    .await
+                    .unwrap_or(0) as usize;
+                if total_messages + 1 > max_messages {
+                    return false;
+                } else {
+                    refs.push(QuotaKey::Count {
+                        key: key.as_ref().to_vec(),
+                        id,
+                    });
                 }
             }
         }
@@ -130,7 +175,10 @@ impl QueueCore {
 }
 
 impl Message {
-    pub fn release_quota(&mut self) {
+    pub fn release_quota(&mut self, batch: &mut BatchBuilder) {
+        if self.quota_keys.is_empty() {
+            return;
+        }
         let mut quota_ids = Vec::with_capacity(self.domains.len() + self.recipients.len());
         for (pos, domain) in self.domains.iter().enumerate() {
             if matches!(
@@ -148,49 +196,26 @@ impl Message {
                 quota_ids.push((pos + 1) as u64);
             }
         }
+
         if !quota_ids.is_empty() {
-            self.queue_refs.retain(|q| !quota_ids.contains(&q.id));
-        }
-    }
-}
-
-trait QuotaLimiterAllowed {
-    fn is_allowed(&self, id: u64, size: usize) -> Option<UsedQuota>;
-}
-
-impl QuotaLimiterAllowed for Arc<QuotaLimiter> {
-    fn is_allowed(&self, id: u64, size: usize) -> Option<UsedQuota> {
-        if self.max_messages > 0 {
-            if self.messages.load(Ordering::Relaxed) < self.max_messages {
-                self.messages.fetch_add(1, Ordering::Relaxed);
-            } else {
-                return None;
+            let mut quota_keys = Vec::new();
+            for quota_key in std::mem::take(&mut self.quota_keys) {
+                match quota_key {
+                    QuotaKey::Count { id, key } if quota_ids.contains(&id) => {
+                        batch.add(ValueClass::Queue(QueueClass::QuotaCount(key)), -1);
+                    }
+                    QuotaKey::Size { id, key } if quota_ids.contains(&id) => {
+                        batch.add(
+                            ValueClass::Queue(QueueClass::QuotaSize(key)),
+                            -(self.size as i64),
+                        );
+                    }
+                    _ => {
+                        quota_keys.push(quota_key);
+                    }
+                }
             }
-        }
-
-        if self.max_size > 0 {
-            if self.size.load(Ordering::Relaxed) + size < self.max_size {
-                self.size.fetch_add(size, Ordering::Relaxed);
-            } else {
-                return None;
-            }
-        }
-
-        Some(UsedQuota {
-            id,
-            size,
-            limiter: self.clone(),
-        })
-    }
-}
-
-impl Drop for UsedQuota {
-    fn drop(&mut self) {
-        if self.limiter.max_messages > 0 {
-            self.limiter.messages.fetch_sub(1, Ordering::Relaxed);
-        }
-        if self.limiter.max_size > 0 {
-            self.limiter.size.fetch_sub(self.size, Ordering::Relaxed);
+            self.quota_keys = quota_keys;
         }
     }
 }

@@ -1,49 +1,46 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+use ahash::AHashSet;
+use common::{
+    config::smtp::session::{Milter, MilterVersion, Stage},
+    expr::if_block::IfBlock,
+    manager::webadmin::Resource,
+    Core,
+};
+use hyper::{body, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioIo;
+use jmap::api::http::{fetch_body, ToHttpResponse};
 use mail_auth::AuthenticatedMessage;
 use mail_parser::MessageParser;
 use serde::Deserialize;
 use smtp::{
-    config::{ConfigContext, IfBlock, Milter},
-    core::{Session, SessionData, SMTP},
-    inbound::milter::{
-        receiver::{FrameResult, Receiver},
-        Action, Command, Macros, MilterClient, Modification, Options, Response, Version,
+    core::{Session, SessionData},
+    inbound::{
+        hooks::{self, Request, SmtpResponse},
+        milter::{
+            receiver::{FrameResult, Receiver},
+            Action, Command, Macros, MilterClient, Modification, Options, Response,
+        },
     },
 };
+use store::Stores;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+use utils::config::Config;
 
 use crate::smtp::{
-    inbound::{TestMessage, TestQueueEvent},
+    inbound::TestMessage,
     session::{load_test_message, TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig, TestSMTP,
+    TempDir, TestSMTP,
 };
 
 #[derive(Debug, Deserialize)]
@@ -52,38 +49,70 @@ struct HeaderTest {
     result: String,
 }
 
+const CONFIG_MILTER: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/queue.db"
+
+[session.rcpt]
+relay = true
+
+[[session.milter]]
+hostname = "127.0.0.1"
+port = 9332
+#port = 11332
+#port = 7357
+enable = true
+options.version = 6
+tls = false
+stages = ["data"]
+
+"#;
+
+const CONFIG_JMILTER: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/queue.db"
+
+[session.rcpt]
+relay = true
+
+[[session.hook]]
+url = "http://127.0.0.1:9333"
+enable = true
+stages = ["data"]
+"#;
+
 #[tokio::test]
 async fn milter_session() {
     // Enable logging
-    /*let disable = "true";
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    crate::enable_logging();
 
     // Configure tests
+    let tmp_dir = TempDir::new("smtp_milter_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG_MILTER)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
     let _rx = spawn_mock_milter_server();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut core = SMTP::test();
-    let mut qr = core.init_test_queue("smtp_milter_test");
-    let config = &mut core.session.config;
-    config.rcpt.relay = IfBlock::new(true);
-    config.data.milters = r#"[[session.data.milter]]
-    hostname = "127.0.0.1"
-    port = 9332
-    #port = 11332
-    #port = 7357
-    enable = true
-    options.version = 6
-    tls = false
-    "#
-    .parse_milters(&ConfigContext::new(&[]));
 
     // Build session
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("mx.doe.org").await;
 
@@ -96,7 +125,7 @@ async fn milter_session() {
             "503 5.5.3",
         )
         .await;
-    qr.assert_empty_queue();
+    qr.assert_no_events();
 
     // Test discard
     session
@@ -107,7 +136,7 @@ async fn milter_session() {
             "250 2.0.0",
         )
         .await;
-    qr.assert_empty_queue();
+    qr.assert_no_events();
 
     // Test temp fail
     session
@@ -118,7 +147,7 @@ async fn milter_session() {
             "451 4.3.5",
         )
         .await;
-    qr.assert_empty_queue();
+    qr.assert_no_events();
 
     // Test shutdown
     session
@@ -129,7 +158,7 @@ async fn milter_session() {
             "421 4.3.0",
         )
         .await;
-    qr.assert_empty_queue();
+    qr.assert_no_events();
 
     // Test reply code
     session
@@ -140,7 +169,7 @@ async fn milter_session() {
             "321",
         )
         .await;
-    qr.assert_empty_queue();
+    qr.assert_no_events();
 
     // Test accept with header addition
     session
@@ -151,10 +180,10 @@ async fn milter_session() {
             "250 2.0.0",
         )
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
         .assert_contains("X-Hello: World")
         .assert_contains("Subject: Is dinner ready?")
         .assert_contains("Are you hungry yet?");
@@ -168,10 +197,10 @@ async fn milter_session() {
             "250 2.0.0",
         )
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
         .assert_contains("Subject: [SPAM] Saying Hello")
         .assert_count("References: ", 1)
         .assert_contains("Are you hungry yet?");
@@ -185,10 +214,143 @@ async fn milter_session() {
             "250 2.0.0",
         )
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
+        .assert_contains("X-Spam: Yes")
+        .assert_contains("123456");
+}
+
+#[tokio::test]
+async fn mta_hook_session() {
+    // Enable logging
+    /*let disable = "true";
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    )
+    .unwrap();*/
+
+    // Configure tests
+    let tmp_dir = TempDir::new("smtp_mta_hook_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG_JMILTER)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
+    let _rx = spawn_mock_mta_hook_server();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Build session
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
+    session.eval_session_params().await;
+    session.ehlo("mx.doe.org").await;
+
+    // Test reject
+    session
+        .send_message(
+            "reject@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "503 5.5.3",
+        )
+        .await;
+    qr.assert_no_events();
+
+    // Test discard
+    session
+        .send_message(
+            "discard@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "250 2.0.0",
+        )
+        .await;
+    qr.assert_no_events();
+
+    // Test temp fail
+    session
+        .send_message(
+            "temp_fail@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "451 4.3.5",
+        )
+        .await;
+    qr.assert_no_events();
+
+    // Test shutdown
+    session
+        .send_message(
+            "shutdown@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "421 4.3.0",
+        )
+        .await;
+    qr.assert_no_events();
+
+    // Test reply code
+    session
+        .send_message(
+            "reply_code@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "321",
+        )
+        .await;
+    qr.assert_no_events();
+
+    // Test accept with header addition
+    session
+        .send_message(
+            "0@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "250 2.0.0",
+        )
+        .await;
+    qr.expect_message()
+        .await
+        .read_lines(&qr)
+        .await
+        .assert_contains("X-Hello: World")
+        .assert_contains("Subject: Is dinner ready?")
+        .assert_contains("Are you hungry yet?");
+
+    // Test accept with header replacement
+    session
+        .send_message(
+            "3@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "250 2.0.0",
+        )
+        .await;
+    qr.expect_message()
+        .await
+        .read_lines(&qr)
+        .await
+        .assert_contains("Subject: [SPAM] Saying Hello")
+        .assert_count("References: ", 1)
+        .assert_contains("Are you hungry yet?");
+
+    // Test accept with body replacement
+    session
+        .send_message(
+            "2@doe.org",
+            &["bill@foobar.org"],
+            "test:no_dkim",
+            "250 2.0.0",
+        )
+        .await;
+    qr.expect_message()
+        .await
+        .read_lines(&qr)
+        .await
         .assert_contains("X-Spam: Yes")
         .assert_contains("123456");
 }
@@ -207,7 +369,10 @@ fn milter_address_modifications() {
 
     let mut data = SessionData::new(
         "127.0.0.1".parse().unwrap(),
+        0,
         "127.0.0.1".parse().unwrap(),
+        0,
+        Default::default(),
         0,
     );
 
@@ -311,7 +476,10 @@ fn milter_message_modifications() {
     let parsed_test_message = AuthenticatedMessage::parse(test_message.as_bytes()).unwrap();
     let mut session_data = SessionData::new(
         "127.0.0.1".parse().unwrap(),
+        0,
         "127.0.0.1".parse().unwrap(),
+        0,
+        Default::default(),
         0,
     );
 
@@ -379,7 +547,8 @@ async fn milter_client_test() {
     const PORT: u16 = 7357;
     let mut client = MilterClient::connect(
         &Milter {
-            enable: IfBlock::default(),
+            enable: IfBlock::empty(""),
+            id: "test".to_string().into(),
             addrs: vec![SocketAddr::from(([127, 0, 0, 1], PORT))],
             hostname: "localhost".to_string(),
             port: PORT,
@@ -390,11 +559,12 @@ async fn milter_client_test() {
             tls_allow_invalid_certs: false,
             tempfail_on_error: false,
             max_frame_len: 5000000,
-            protocol_version: Version::V6,
+            protocol_version: MilterVersion::V6,
             flags_actions: None,
             flags_protocol: None,
+            run_on_stage: AHashSet::from([Stage::Data]),
         },
-        tracing::span!(tracing::Level::TRACE, "hi"),
+        0,
     )
     .await
     .unwrap();
@@ -492,7 +662,7 @@ async fn accept_milter(
     let mut buf = vec![0u8; 1024];
     let mut receiver = Receiver::with_max_frame_len(5000000);
     let mut action = None;
-    let mut modidications = None;
+    let mut modifications = None;
 
     'outer: loop {
         let br = tokio::select! {
@@ -556,7 +726,7 @@ async fn accept_milter(
                                     text: "test".to_string(),
                                 },
                                 test_num => {
-                                    modidications = tests[test_num.parse::<usize>().unwrap()]
+                                    modifications = tests[test_num.parse::<usize>().unwrap()]
                                         .modifications
                                         .clone()
                                         .into();
@@ -568,7 +738,7 @@ async fn accept_milter(
                         }
                         Command::Quit => break 'outer,
                         Command::EndOfBody => {
-                            if let Some(modifications) = modidications.take() {
+                            if let Some(modifications) = modifications.take() {
                                 for modification in modifications {
                                     // Write modifications
                                     stream
@@ -593,5 +763,205 @@ async fn accept_milter(
                 }
             }
         }
+    }
+}
+
+pub fn spawn_mock_mta_hook_server() -> watch::Sender<bool> {
+    let (tx, rx) = watch::channel(true);
+    let tests = Arc::new(
+        serde_json::from_str::<Vec<HeaderTest>>(
+            &fs::read_to_string(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources")
+                    .join("smtp")
+                    .join("milter")
+                    .join("message.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+
+    tokio::spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:9333")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Failed to bind mock Milter server to 127.0.0.1:9333: {e}");
+            });
+        let mut rx_ = rx.clone();
+        //println!("Mock jMilter server listening on port 9333");
+        loop {
+            tokio::select! {
+                stream = listener.accept() => {
+                    match stream {
+                        Ok((stream, _)) => {
+
+                            let _ = http1::Builder::new()
+                            .keep_alive(false)
+                            .serve_connection(
+                                TokioIo::new(stream),
+                                service_fn(|mut req: hyper::Request<body::Incoming>| {
+                                    let tests = tests.clone();
+
+                                    async move {
+
+                                        let request = serde_json::from_slice::<Request>(&fetch_body(&mut req, 1024 * 1024,0).await.unwrap())
+                                        .unwrap();
+                                        let response = handle_mta_hook(request, tests);
+
+                                        Ok::<_, hyper::Error>(
+                                            Resource::new("application/json", serde_json::to_string(&response).unwrap().into_bytes())
+                                            .into_http_response().build(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            panic!("Something went wrong: {err}" );
+                        }
+                    }
+                },
+                _ = rx_.changed() => {
+                    //println!("Mock jMilter server stopping");
+                    break;
+                }
+            };
+        }
+    });
+
+    tx
+}
+
+fn handle_mta_hook(request: Request, tests: Arc<Vec<HeaderTest>>) -> hooks::Response {
+    match request
+        .envelope
+        .unwrap()
+        .from
+        .address
+        .split_once('@')
+        .unwrap()
+        .0
+    {
+        "accept" => hooks::Response {
+            action: hooks::Action::Accept,
+            response: None,
+            modifications: vec![],
+        },
+        "reject" => hooks::Response {
+            action: hooks::Action::Reject,
+            response: None,
+            modifications: vec![],
+        },
+        "discard" => hooks::Response {
+            action: hooks::Action::Discard,
+            response: None,
+            modifications: vec![],
+        },
+        "temp_fail" => hooks::Response {
+            action: hooks::Action::Reject,
+            response: SmtpResponse {
+                status: 451.into(),
+                enhanced_status: "4.3.5".to_string().into(),
+                message: "Unable to accept message at this time.".to_string().into(),
+                disconnect: false,
+            }
+            .into(),
+            modifications: vec![],
+        },
+        "shutdown" => hooks::Response {
+            action: hooks::Action::Reject,
+            response: SmtpResponse {
+                status: 421.into(),
+                enhanced_status: "4.3.0".to_string().into(),
+                message: "Server shutting down".to_string().into(),
+                disconnect: false,
+            }
+            .into(),
+            modifications: vec![],
+        },
+        "conn_fail" => hooks::Response {
+            action: hooks::Action::Accept,
+            response: SmtpResponse {
+                disconnect: true,
+                ..Default::default()
+            }
+            .into(),
+            modifications: vec![],
+        },
+        "reply_code" => hooks::Response {
+            action: hooks::Action::Reject,
+            response: SmtpResponse {
+                status: 321.into(),
+                enhanced_status: "3.1.1".to_string().into(),
+                message: "Test".to_string().into(),
+                disconnect: false,
+            }
+            .into(),
+            modifications: vec![],
+        },
+        test_num => hooks::Response {
+            action: hooks::Action::Accept,
+            response: None,
+            modifications: tests[test_num.parse::<usize>().unwrap()]
+                .modifications
+                .iter()
+                .map(|m| match m {
+                    Modification::ChangeFrom { sender, args } => hooks::Modification::ChangeFrom {
+                        value: sender.clone(),
+                        parameters: args
+                            .split_whitespace()
+                            .map(|arg| {
+                                let (key, value) = arg.split_once('=').unwrap();
+                                (key.to_string(), Some(value.to_string()))
+                            })
+                            .collect(),
+                    },
+                    Modification::AddRcpt { recipient, args } => {
+                        hooks::Modification::AddRecipient {
+                            value: recipient.clone(),
+                            parameters: args
+                                .split_whitespace()
+                                .map(|arg| {
+                                    let (key, value) = arg.split_once('=').unwrap();
+                                    (key.to_string(), Some(value.to_string()))
+                                })
+                                .collect(),
+                        }
+                    }
+                    Modification::DeleteRcpt { recipient } => {
+                        hooks::Modification::DeleteRecipient {
+                            value: recipient.clone(),
+                        }
+                    }
+                    Modification::ReplaceBody { value } => hooks::Modification::ReplaceContents {
+                        value: String::from_utf8(value.clone()).unwrap(),
+                    },
+                    Modification::AddHeader { name, value } => hooks::Modification::AddHeader {
+                        name: name.clone(),
+                        value: value.clone(),
+                    },
+                    Modification::InsertHeader { index, name, value } => {
+                        hooks::Modification::InsertHeader {
+                            index: *index,
+                            name: name.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                    Modification::ChangeHeader { index, name, value } => {
+                        hooks::Modification::ChangeHeader {
+                            index: *index,
+                            name: name.clone(),
+                            value: value.clone(),
+                        }
+                    }
+                    Modification::Quarantine { reason } => hooks::Modification::AddHeader {
+                        name: "X-Quarantine".to_string(),
+                        value: reason.to_string(),
+                    },
+                })
+                .collect(),
+        },
     }
 }

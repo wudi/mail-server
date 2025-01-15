@@ -1,49 +1,28 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::{Duration, Instant};
 
-use directory::core::config::ConfigDirectory;
+use common::Core;
+
 use mail_auth::{
     common::{parse::TxtRecordParser, verify::DomainKey},
     spf::Spf,
 };
-use store::{Store, Stores};
-use utils::config::{Config, DynValue, Servers};
+use store::Stores;
+use utils::config::Config;
 
 use crate::smtp::{
-    inbound::{TestMessage, TestQueueEvent},
+    inbound::TestMessage,
     session::{TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig, TestSMTP,
+    DnsCache, TempDir, TestSMTP,
 };
-use smtp::{
-    config::{
-        auth::ConfigAuth, ConfigContext, EnvelopeKey, IfBlock, MaybeDynValue, VerifyStrategy,
-    },
-    core::{Session, SMTP},
-};
+use smtp::core::Session;
 
-const SIGNATURES: &str = "
+pub const SIGNATURES: &str = "
 [signature.rsa]
 private-key = '''
 -----BEGIN RSA PRIVATE KEY-----
@@ -83,9 +62,8 @@ set-body-length = true
 report = true
 
 [signature.ed]
-public-key = '11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo='
 private-key = '-----BEGIN PRIVATE KEY-----
-nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=
+MC4CAQAwBQYDK2VwBCIEIAO3hAf144lTAVjTkht3ZwBTK0CMCCd1bI0alggneN3B
 -----END PRIVATE KEY-----'
 domain = 'example.com'
 selector = 'ed'
@@ -95,7 +73,17 @@ canonicalization = 'relaxed/simple'
 set-body-length = false
 ";
 
-const DIRECTORY: &str = r#"
+const CONFIG: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/queue.db"
+
 [directory."local"]
 type = "memory"
 
@@ -104,27 +92,58 @@ name = "john"
 description = "John Doe"
 secret = "secret"
 email = ["jdoe@example.com"]
+
+[session.rcpt]
+directory = "'local'"
+
+[session.data.add-headers]
+received = true
+received-spf = true
+auth-results = true
+message-id = true
+date = true
+return-path = false
+
+[auth.spf.verify]
+ehlo = "relaxed"
+mail-from = "relaxed"
+
+[auth.dkim]
+verify = "relaxed"
+sign = "['rsa']"
+
+[auth.arc]
+verify = "relaxed"
+seal = "'ed'"
+
+[auth.dmarc]
+verify = "relaxed"
+
 "#;
 
 #[tokio::test]
 async fn sign_and_seal() {
-    let mut core = SMTP::test();
+    // Enable logging
+    crate::enable_logging();
 
-    // Create temp dir for queue
-    let mut qr = core.init_test_queue("smtp_sign_test");
+    let tmp_dir = TempDir::new("smtp_sign_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG.to_string() + SIGNATURES)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
+    let test = TestSMTP::from_core(core);
 
     // Add SPF, DKIM and DMARC records
-    core.resolvers.dns.txt_add(
+    test.server.txt_add(
         "mx.example.com",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 ip4:10.0.0.2 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.resolvers.dns.txt_add(
+    test.server.txt_add(
         "example.com",
         Spf::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.resolvers.dns.txt_add(
+    test.server.txt_add(
         "ed._domainkey.scamorza.org",
         DomainKey::parse(
             concat!(
@@ -136,7 +155,7 @@ async fn sign_and_seal() {
         .unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
-    core.resolvers.dns.txt_add(
+    test.server.txt_add(
         "rsa._domainkey.manchego.org",
         DomainKey::parse(
             concat!(
@@ -152,43 +171,10 @@ async fn sign_and_seal() {
         Instant::now() + Duration::from_secs(5),
     );
 
-    let directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    let config = &mut core.session.config.rcpt;
-    config.directory = IfBlock::new(Some(MaybeDynValue::Static(
-        directory.directories.get("local").unwrap().clone(),
-    )));
-
-    let config = &mut core.session.config;
-    config.data.add_auth_results = IfBlock::new(true);
-    config.data.add_date = IfBlock::new(true);
-    config.data.add_message_id = IfBlock::new(true);
-    config.data.add_received = IfBlock::new(true);
-    config.data.add_return_path = IfBlock::new(true);
-    config.data.add_received_spf = IfBlock::new(true);
-
-    let config = &mut core.mail_auth;
-    let ctx = ConfigContext::new(&[]).parse_signatures();
-    config.spf.verify_ehlo = IfBlock::new(VerifyStrategy::Relaxed);
-    config.spf.verify_mail_from = config.spf.verify_ehlo.clone();
-    config.dkim.verify = config.spf.verify_ehlo.clone();
-    config.arc.verify = config.spf.verify_ehlo.clone();
-    config.dmarc.verify = config.spf.verify_ehlo.clone();
-    config.dkim.sign = "['rsa']"
-        .parse_if::<Vec<DynValue<EnvelopeKey>>>(&ctx)
-        .map_if_block(&ctx.signers, "", "")
-        .unwrap();
-    config.arc.seal = "'ed'"
-        .parse_if::<Option<DynValue<EnvelopeKey>>>(&ctx)
-        .map_if_block(&ctx.sealers, "", "")
-        .unwrap();
-
     // Test DKIM signing
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server);
+    session.data.remote_ip_str = "10.0.0.2".to_string();
     session.eval_session_params().await;
     session.ehlo("mx.example.com").await;
     session
@@ -199,10 +185,10 @@ async fn sign_and_seal() {
             "250",
         )
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
         .assert_contains(
             "DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=example.com; c=simple/relaxed;",
         );
@@ -211,26 +197,25 @@ async fn sign_and_seal() {
     session
         .send_message("bill@foobar.org", &["jdoe@example.com"], "test:arc", "250")
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
         .assert_contains("ARC-Seal: i=3; a=ed25519-sha256; s=ed; d=example.com; cv=pass;")
         .assert_contains(
             "ARC-Message-Signature: i=3; a=ed25519-sha256; s=ed; d=example.com; c=relaxed/simple;",
         );
-}
 
-pub trait TextConfigContext<'x> {
-    fn parse_signatures(self) -> ConfigContext<'x>;
-}
-
-impl<'x> TextConfigContext<'x> for ConfigContext<'x> {
-    fn parse_signatures(mut self) -> Self {
-        Config::new(SIGNATURES)
-            .unwrap()
-            .parse_signatures(&mut self)
-            .unwrap();
-        self
-    }
+    // Test ARC sealing of a DKIM signed message
+    session
+        .send_message("bill@foobar.org", &["jdoe@example.com"], "test:dkim", "250")
+        .await;
+    qr.expect_message()
+        .await
+        .read_lines(&qr)
+        .await
+        .assert_contains("ARC-Seal: i=1; a=ed25519-sha256; s=ed; d=example.com; cv=none;")
+        .assert_contains(
+            "ARC-Message-Signature: i=1; a=ed25519-sha256; s=ed; d=example.com; c=relaxed/simple;",
+        );
 }

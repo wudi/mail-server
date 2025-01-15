@@ -1,162 +1,130 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{net::IpAddr, sync::Arc};
 
-use jmap_proto::error::request::{RequestError, RequestLimitError};
-use utils::listener::limiter::{ConcurrencyLimiter, InFlight, RateLimiter};
+use common::{
+    ip_to_bytes,
+    listener::limiter::{ConcurrencyLimiter, InFlight},
+    ConcurrencyLimiters, Server, KV_RATE_LIMIT_HTTP_ANONYMOUS, KV_RATE_LIMIT_HTTP_AUTHENTICATED,
+};
+use directory::Permission;
+use trc::AddContext;
 
-use crate::JMAP;
+use common::auth::AccessToken;
+use std::future::Future;
 
-use super::AccessToken;
-
-pub struct AuthenticatedLimiter {
-    pub request_limiter: RateLimiter,
-    pub concurrent_requests: ConcurrencyLimiter,
-    pub concurrent_uploads: ConcurrencyLimiter,
+pub trait RateLimiter: Sync + Send {
+    fn get_concurrency_limiter(&self, account_id: u32) -> Arc<ConcurrencyLimiters>;
+    fn is_http_authenticated_request_allowed(
+        &self,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<InFlight>> + Send;
+    fn is_http_anonymous_request_allowed(
+        &self,
+        addr: &IpAddr,
+    ) -> impl Future<Output = trc::Result<()>> + Send;
+    fn is_upload_allowed(&self, access_token: &AccessToken) -> trc::Result<InFlight>;
 }
 
-#[derive(Debug)]
-pub struct AnonymousLimiter {
-    request_limiter: RateLimiter,
-    auth_limiter: RateLimiter,
-}
-
-impl JMAP {
-    pub fn get_authenticated_limiter(&self, account_id: u32) -> Arc<AuthenticatedLimiter> {
-        self.rate_limit_auth
+impl RateLimiter for Server {
+    fn get_concurrency_limiter(&self, account_id: u32) -> Arc<ConcurrencyLimiters> {
+        self.inner
+            .data
+            .jmap_limiter
             .get(&account_id)
             .map(|limiter| limiter.clone())
             .unwrap_or_else(|| {
-                let limiter = Arc::new(AuthenticatedLimiter {
-                    request_limiter: RateLimiter::new(&self.config.rate_authenticated),
+                let limiter = Arc::new(ConcurrencyLimiters {
                     concurrent_requests: ConcurrencyLimiter::new(
-                        self.config.request_max_concurrent,
+                        self.core.jmap.request_max_concurrent,
                     ),
-                    concurrent_uploads: ConcurrencyLimiter::new(self.config.upload_max_concurrent),
+                    concurrent_uploads: ConcurrencyLimiter::new(
+                        self.core.jmap.upload_max_concurrent,
+                    ),
                 });
-                self.rate_limit_auth.insert(account_id, limiter.clone());
+                self.inner
+                    .data
+                    .jmap_limiter
+                    .insert(account_id, limiter.clone());
                 limiter
             })
     }
 
-    pub fn get_anonymous_limiter(&self, addr: &IpAddr) -> Arc<AnonymousLimiter> {
-        self.rate_limit_unauth
-            .get(addr)
-            .map(|limiter| limiter.clone())
-            .unwrap_or_else(|| {
-                let limiter = Arc::new(AnonymousLimiter {
-                    request_limiter: RateLimiter::new(&self.config.rate_anonymous),
-                    auth_limiter: RateLimiter::new(&self.config.rate_authenticate_req),
-                });
-                self.rate_limit_unauth.insert(*addr, limiter.clone());
-                limiter
-            })
-    }
+    async fn is_http_authenticated_request_allowed(
+        &self,
+        access_token: &AccessToken,
+    ) -> trc::Result<InFlight> {
+        let limiter = self.get_concurrency_limiter(access_token.primary_id());
+        let is_rate_allowed = if let Some(rate) = &self.core.jmap.rate_authenticated {
+            self.core
+                .storage
+                .lookup
+                .is_rate_allowed(
+                    KV_RATE_LIMIT_HTTP_AUTHENTICATED,
+                    &access_token.primary_id.to_be_bytes(),
+                    rate,
+                    false,
+                )
+                .await
+                .caused_by(trc::location!())?
+                .is_none()
+        } else {
+            true
+        };
 
-    pub fn is_account_allowed(&self, access_token: &AccessToken) -> Result<InFlight, RequestError> {
-        let limiter = self.get_authenticated_limiter(access_token.primary_id());
-
-        if limiter
-            .request_limiter
-            .is_allowed(&self.config.rate_authenticated)
-        {
+        if is_rate_allowed {
             if let Some(in_flight_request) = limiter.concurrent_requests.is_allowed() {
                 Ok(in_flight_request)
-            } else if access_token.is_super_user() {
+            } else if access_token.has_permission(Permission::UnlimitedRequests) {
                 Ok(InFlight::default())
             } else {
-                Err(RequestError::limit(RequestLimitError::ConcurrentRequest))
+                Err(trc::LimitEvent::ConcurrentRequest.into_err())
             }
-        } else if access_token.is_super_user() {
+        } else if access_token.has_permission(Permission::UnlimitedRequests) {
             Ok(InFlight::default())
         } else {
-            Err(RequestError::too_many_requests())
+            Err(trc::LimitEvent::TooManyRequests.into_err())
         }
     }
 
-    pub fn is_anonymous_allowed(&self, addr: &IpAddr) -> Result<(), RequestError> {
-        if self
-            .get_anonymous_limiter(addr)
-            .request_limiter
-            .is_allowed(&self.config.rate_anonymous)
-        {
-            Ok(())
-        } else {
-            Err(RequestError::too_many_requests())
+    async fn is_http_anonymous_request_allowed(&self, addr: &IpAddr) -> trc::Result<()> {
+        if let Some(rate) = &self.core.jmap.rate_anonymous {
+            if !self.is_ip_allowed(addr)
+                && self
+                    .core
+                    .storage
+                    .lookup
+                    .is_rate_allowed(
+                        KV_RATE_LIMIT_HTTP_ANONYMOUS,
+                        &ip_to_bytes(addr),
+                        rate,
+                        false,
+                    )
+                    .await
+                    .caused_by(trc::location!())?
+                    .is_some()
+            {
+                return Err(trc::LimitEvent::TooManyRequests.into_err());
+            }
         }
+        Ok(())
     }
 
-    pub fn is_upload_allowed(&self, access_token: &AccessToken) -> Result<InFlight, RequestError> {
+    fn is_upload_allowed(&self, access_token: &AccessToken) -> trc::Result<InFlight> {
         if let Some(in_flight_request) = self
-            .get_authenticated_limiter(access_token.primary_id())
+            .get_concurrency_limiter(access_token.primary_id())
             .concurrent_uploads
             .is_allowed()
         {
             Ok(in_flight_request)
-        } else if access_token.is_super_user() {
+        } else if access_token.has_permission(Permission::UnlimitedRequests) {
             Ok(InFlight::default())
         } else {
-            Err(RequestError::limit(RequestLimitError::ConcurrentUpload))
+            Err(trc::LimitEvent::ConcurrentUpload.into_err())
         }
-    }
-
-    pub fn is_auth_allowed_soft(&self, addr: &IpAddr) -> Result<(), RequestError> {
-        match self.rate_limit_unauth.get(addr) {
-            Some(limiter)
-                if !limiter
-                    .auth_limiter
-                    .is_allowed_soft(&self.config.rate_authenticate_req) =>
-            {
-                Err(RequestError::too_many_auth_attempts())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    pub fn is_auth_allowed_hard(&self, addr: &IpAddr) -> Result<(), RequestError> {
-        if self
-            .get_anonymous_limiter(addr)
-            .auth_limiter
-            .is_allowed(&self.config.rate_authenticate_req)
-        {
-            Ok(())
-        } else {
-            Err(RequestError::too_many_auth_attempts())
-        }
-    }
-}
-
-impl AuthenticatedLimiter {
-    pub fn is_active(&self) -> bool {
-        self.request_limiter.is_active()
-            || self.concurrent_requests.is_active()
-            || self.concurrent_uploads.is_active()
-    }
-}
-
-impl AnonymousLimiter {
-    pub fn is_active(&self) -> bool {
-        self.request_limiter.is_active() || self.auth_limiter.is_active()
     }
 }

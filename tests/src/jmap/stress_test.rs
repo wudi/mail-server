@@ -1,32 +1,16 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{sync::Arc, time::Duration};
 
 use crate::jmap::{mailbox::destroy_all_mailboxes_no_wait, wait_for_index};
+use common::Server;
 use directory::backend::internal::manage::ManageDirectory;
 use futures::future::join_all;
-use jmap::{mailbox::UidMailbox, JMAP};
+use jmap::{mailbox::UidMailbox, JmapMethods};
 use jmap_client::{
     client::Client,
     core::set::{SetErrorType, SetObject},
@@ -40,16 +24,22 @@ use super::assert_is_empty;
 const TEST_USER_ID: u32 = 1;
 const NUM_PASSES: usize = 1;
 
-pub async fn test(server: Arc<JMAP>, mut client: Client) {
+pub async fn test(server: Server, mut client: Client) {
     println!("Running concurrency stress tests...");
-    server.store.get_or_create_account_id("john").await.unwrap();
+    server
+        .core
+        .storage
+        .data
+        .get_or_create_principal_id("john", directory::Type::Individual)
+        .await
+        .unwrap();
     client.set_default_account_id(Id::from(TEST_USER_ID).to_string());
     let client = Arc::new(client);
     email_tests(server.clone(), client.clone()).await;
     mailbox_tests(server.clone(), client.clone()).await;
 }
 
-async fn email_tests(server: Arc<JMAP>, client: Arc<Client>) {
+async fn email_tests(server: Server, client: Arc<Client>) {
     for pass in 0..NUM_PASSES {
         println!(
             "----------------- EMAIL STRESS TEST {} -----------------",
@@ -256,6 +246,7 @@ async fn email_tests(server: Arc<JMAP>, client: Arc<Client>) {
                     );
                     }
                     let mailbox_tag = mailbox_tags[0];
+                    assert!(mailbox_tag.uid != 0);
                     if mailbox_tag.mailbox_id != mailbox_id {
                         panic!(
                             concat!(
@@ -280,7 +271,7 @@ async fn email_tests(server: Arc<JMAP>, client: Arc<Client>) {
     }
 }
 
-async fn mailbox_tests(server: Arc<JMAP>, client: Arc<Client>) {
+async fn mailbox_tests(server: Server, client: Arc<Client>) {
     let mailboxes = Arc::new(vec![
         "test/test1/test2/test3".to_string(),
         "test1/test2/test3".to_string(),

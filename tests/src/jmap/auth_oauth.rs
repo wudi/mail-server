@@ -1,108 +1,121 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose, Engine};
+use biscuit::{jwk::JWKSet, SingleOrMultiple, JWT};
 use bytes::Bytes;
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::auth::oauth::{DeviceAuthResponse, ErrorType, OAuthMetadata, TokenResponse};
+use common::auth::oauth::{
+    introspect::OAuthIntrospect,
+    oidc::StandardClaims,
+    registration::{ClientRegistrationRequest, ClientRegistrationResponse},
+};
+use imap_proto::ResponseType;
+use jmap::auth::oauth::{
+    auth::OAuthMetadata, openid::OpenIdMetadata, DeviceAuthResponse, ErrorType, OAuthCodeRequest,
+    TokenResponse,
+};
 use jmap_client::{
     client::{Client, Credentials},
     mailbox::query::Filter,
 };
 use jmap_proto::types::id::Id;
-use reqwest::{header, redirect::Policy};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 use store::ahash::AHashMap;
 
-use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes};
+use crate::{
+    directory::internal::TestInternalDirectory,
+    imap::{
+        pop::{self, Pop3Connection},
+        ImapConnection, Type,
+    },
+    jmap::{
+        assert_is_empty, delivery::SmtpConnection, mailbox::destroy_all_mailboxes, ManagementApi,
+    },
+};
 
 use super::JMAPTest;
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct OAuthCodeResponse {
+    pub code: String,
+    #[serde(rename = "isEnterprise")]
+    pub is_enterprise: bool,
+}
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running OAuth tests...");
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
+    let john_int_id = server
+        .core
+        .storage
+        .data
+        .create_test_user(
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+            &["jdoe@example.com"],
+        )
         .await;
-    let john_id = Id::from(
-        server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
+    let john_id = Id::from(john_int_id).to_string();
+
+    // Build API
+    let api = ManagementApi::new(8899, "jdoe@example.com", "12345");
 
     // Obtain OAuth metadata
     let metadata: OAuthMetadata =
         get("https://127.0.0.1:8899/.well-known/oauth-authorization-server").await;
-    //println!("OAuth metadata: {:#?}", metadata);
+    let oidc_metadata: OpenIdMetadata =
+        get("https://127.0.0.1:8899/.well-known/openid-configuration").await;
+    let jwk_set: JWKSet<()> = get(&oidc_metadata.jwks_uri).await;
+
+    // Register client
+    let registration: ClientRegistrationResponse = post_json(
+        &metadata.registration_endpoint,
+        None,
+        &ClientRegistrationRequest {
+            redirect_uris: vec!["https://localhost".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let client_id = registration.client_id;
+
+    /*println!("OAuth metadata: {:#?}", metadata);
+    println!("OpenID metadata: {:#?}", oidc_metadata);
+    println!("JWKSet: {:#?}", jwk_set);*/
 
     // ------------------------
     // Authorization code flow
     // ------------------------
 
-    // Build authorization request
-    let auth_endpoint = format!(
-        "{}?response_type=token&client_id=OAuthyMcOAuthFace&state=xyz&redirect_uri=https://localhost",
-        metadata.authorization_endpoint
-    );
-    let mut auth_request = AHashMap::from_iter([
-        ("email".to_string(), "jdoe@example.com".to_string()),
-        ("password".to_string(), "wrong_pass".to_string()),
-        (
-            "code".to_string(),
-            parse_code_input(get_bytes(&auth_endpoint).await),
-        ),
-    ]);
-
-    // Exceeding the max failed attempts should redirect with an access_denied code
-    assert_eq!(
-        post_expect_redirect(&metadata.authorization_endpoint, &auth_request).await,
-        "https://localhost?error=access_denied&state=xyz"
-    );
-
     // Authenticate with the correct password
-    auth_request.insert("password".to_string(), "12345".to_string());
-    auth_request.insert(
-        "code".to_string(),
-        parse_code_input(get_bytes(&auth_endpoint).await),
-    );
-    let code = parse_code_redirect(
-        post_expect_redirect(&metadata.authorization_endpoint, &auth_request).await,
-        "xyz",
-    );
+    let response = api
+        .post::<OAuthCodeResponse>(
+            "/api/oauth",
+            &OAuthCodeRequest::Code {
+                client_id: client_id.to_string(),
+                redirect_uri: "https://localhost".to_string().into(),
+                nonce: "abc1234".to_string().into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_data();
 
     // Both client_id and redirect_uri have to match
     let mut token_params = AHashMap::from_iter([
         ("client_id".to_string(), "invalid_client".to_string()),
         ("redirect_uri".to_string(), "https://localhost".to_string()),
         ("grant_type".to_string(), "authorization_code".to_string()),
-        ("code".to_string(), code),
+        ("code".to_string(), response.code),
     ]);
     assert_eq!(
         post::<TokenResponse>(&metadata.token_endpoint, &token_params).await,
@@ -110,7 +123,7 @@ pub async fn test(params: &mut JMAPTest) {
             error: ErrorType::InvalidClient
         }
     );
-    token_params.insert("client_id".to_string(), "OAuthyMcOAuthFace".to_string());
+    token_params.insert("client_id".to_string(), client_id.to_string());
     token_params.insert(
         "redirect_uri".to_string(),
         "https://some-other.url".to_string(),
@@ -124,7 +137,8 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Obtain token
     token_params.insert("redirect_uri".to_string(), "https://localhost".to_string());
-    let (token, _, _) = unwrap_token_response(post(&metadata.token_endpoint, &token_params).await);
+    let (token, refresh_token, id_token) =
+        unwrap_oidc_token_response(post(&metadata.token_endpoint, &token_params).await);
 
     // Connect to account using token and attempt to search
     let john_client = Client::new()
@@ -141,19 +155,96 @@ pub async fn test(params: &mut JMAPTest) {
         .ids()
         .is_empty());
 
+    // Verify ID token using the JWK set
+    let id_token = JWT::<StandardClaims, biscuit::Empty>::new_encoded(&id_token)
+        .decode_with_jwks(&jwk_set, None)
+        .unwrap();
+    let claims = id_token.payload().unwrap();
+    let registered_claims = &claims.registered;
+    let private_claims = &claims.private;
+    assert_eq!(registered_claims.issuer, Some(oidc_metadata.issuer));
+    assert_eq!(registered_claims.subject, Some(john_int_id.to_string()));
+    assert_eq!(
+        registered_claims.audience,
+        Some(SingleOrMultiple::Single(client_id.to_string()))
+    );
+    assert_eq!(private_claims.nonce, Some("abc1234".to_string()));
+    assert_eq!(
+        private_claims.preferred_username,
+        Some("jdoe@example.com".to_string())
+    );
+    assert_eq!(private_claims.email, Some("jdoe@example.com".to_string()));
+
+    // Introspect token
+    let access_introspect: OAuthIntrospect = post_with_auth::<OAuthIntrospect>(
+        &metadata.introspection_endpoint,
+        token.as_str().into(),
+        &AHashMap::from_iter([("token".to_string(), token.to_string())]),
+    )
+    .await;
+    assert_eq!(access_introspect.username.unwrap(), "jdoe@example.com");
+    assert_eq!(access_introspect.token_type.unwrap(), "bearer");
+    assert_eq!(access_introspect.client_id.unwrap(), client_id);
+    assert!(access_introspect.active);
+    let refresh_introspect = post_with_auth::<OAuthIntrospect>(
+        &metadata.introspection_endpoint,
+        token.as_str().into(),
+        &AHashMap::from_iter([("token".to_string(), refresh_token.unwrap())]),
+    )
+    .await;
+    assert_eq!(refresh_introspect.username.unwrap(), "jdoe@example.com");
+    assert_eq!(refresh_introspect.client_id.unwrap(), client_id);
+    assert!(refresh_introspect.active);
+    assert_eq!(
+        refresh_introspect.iat.unwrap(),
+        access_introspect.iat.unwrap()
+    );
+
+    // Try SMTP OAUTHBEARER auth
+    let oauth_bearer_invalid_sasl = general_purpose::STANDARD.encode(format!(
+        "n,a={},\u{1}auth=Bearer {}\u{1}\u{1}",
+        "user@domain", "invalid_token"
+    ));
+    let oauth_bearer_sasl = general_purpose::STANDARD.encode(format!(
+        "n,a={},\u{1}auth=Bearer {}\u{1}\u{1}",
+        "user@domain", token
+    ));
+    let mut smtp = SmtpConnection::connect().await;
+    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_invalid_sasl}",))
+        .await;
+    smtp.read(1, 4).await;
+    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}",))
+        .await;
+    smtp.read(1, 2).await;
+
+    // Try IMAP OAUTHBEARER auth
+    let mut imap = ImapConnection::connect(b"_x ").await;
+    imap.assert_read(Type::Untagged, ResponseType::Ok).await;
+    imap.send(&format!("AUTHENTICATE OAUTHBEARER {oauth_bearer_sasl}"))
+        .await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+
+    // Try POP3 OAUTHBEARER auth
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.assert_read(pop::ResponseType::Ok).await;
+    pop3.send(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}"))
+        .await;
+    pop3.assert_read(pop::ResponseType::Ok).await;
+
     // ------------------------
     // Device code flow
     // ------------------------
 
     // Request a device code
-    let device_code_params = AHashMap::from_iter([("client_id".to_string(), "1234".to_string())]);
+    let device_code_params =
+        AHashMap::from_iter([("client_id".to_string(), client_id.to_string())]);
     let device_response: DeviceAuthResponse =
         post(&metadata.device_authorization_endpoint, &device_code_params).await;
     //println!("Device response: {:#?}", device_response);
 
     // Status should be pending
     let mut token_params = AHashMap::from_iter([
-        ("client_id".to_string(), "1234".to_string()),
+        ("client_id".to_string(), client_id.to_string()),
         (
             "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
@@ -170,45 +261,20 @@ pub async fn test(params: &mut JMAPTest) {
         }
     );
 
-    // Invalidate the code by having too many unsuccessful attempts
-    assert_client_auth(
-        "jdoe@example.com",
-        "wrongpass",
-        &device_response,
-        "Incorrect",
-    )
-    .await;
-    assert_client_auth(
-        "jdoe@example.com",
-        "wrongpass",
-        &device_response,
-        "Invalid or expired authentication code.",
-    )
-    .await;
-    assert_eq!(
-        post::<TokenResponse>(&metadata.token_endpoint, &token_params).await,
-        TokenResponse::Error {
-            error: ErrorType::AccessDenied
-        }
-    );
-
-    // Request a new device code
-    let device_response: DeviceAuthResponse =
-        post(&metadata.device_authorization_endpoint, &device_code_params).await;
-    token_params.insert(
-        "device_code".to_string(),
-        device_response.device_code.to_string(),
-    );
-
     // Let the code expire and make sure it's invalidated
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_client_auth(
-        "jdoe@example.com",
-        "12345",
-        &device_response,
-        "Invalid or expired authentication code.",
-    )
-    .await;
+    assert!(
+        !api.post::<bool>(
+            "/api/oauth",
+            &OAuthCodeRequest::Device {
+                code: device_response.user_code.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_data(),
+        "Code should be expired"
+    );
     assert_eq!(
         post::<TokenResponse>(&metadata.token_endpoint, &token_params).await,
         TokenResponse::Error {
@@ -223,7 +289,18 @@ pub async fn test(params: &mut JMAPTest) {
         "device_code".to_string(),
         device_response.device_code.to_string(),
     );
-    assert_client_auth("jdoe@example.com", "12345", &device_response, "successful").await;
+    assert!(
+        api.post::<bool>(
+            "/api/oauth",
+            &OAuthCodeRequest::Device {
+                code: device_response.user_code.clone(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap_data(),
+        "Code is invalid"
+    );
 
     // Obtain token
     let time_first_token = Instant::now();
@@ -262,7 +339,7 @@ pub async fn test(params: &mut JMAPTest) {
         post::<TokenResponse>(
             &metadata.token_endpoint,
             &AHashMap::from_iter([
-                ("client_id".to_string(), "1234".to_string()),
+                ("client_id".to_string(), client_id.to_string()),
                 ("grant_type".to_string(), "refresh_token".to_string()),
                 ("refresh_token".to_string(), token),
             ]),
@@ -275,7 +352,7 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Refreshing the access token before expiration should not include a new refresh token
     let refresh_params = AHashMap::from_iter([
-        ("client_id".to_string(), "1234".to_string()),
+        ("client_id".to_string(), client_id.to_string()),
         ("grant_type".to_string(), "refresh_token".to_string()),
         ("refresh_token".to_string(), refresh_token),
     ]);
@@ -312,18 +389,35 @@ pub async fn test(params: &mut JMAPTest) {
     );
 
     // Destroy test accounts
+    server
+        .core
+        .storage
+        .lookup
+        .purge_in_memory_store()
+        .await
+        .unwrap();
     params.client.set_default_account_id(john_id);
     destroy_all_mailboxes(params).await;
     assert_is_empty(server).await;
 }
 
-async fn post_bytes(url: &str, params: &AHashMap<String, String>) -> Bytes {
-    reqwest::Client::builder()
+async fn post_bytes(
+    url: &str,
+    auth_token: Option<&str>,
+    params: &AHashMap<String, String>,
+) -> Bytes {
+    let mut client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_default()
-        .post(url)
+        .post(url);
+
+    if let Some(auth_token) = auth_token {
+        client = client.bearer_auth(auth_token);
+    }
+
+    client
         .form(params)
         .send()
         .await
@@ -333,29 +427,44 @@ async fn post_bytes(url: &str, params: &AHashMap<String, String>) -> Bytes {
         .unwrap()
 }
 
-async fn post<T: DeserializeOwned>(url: &str, params: &AHashMap<String, String>) -> T {
-    serde_json::from_slice(&post_bytes(url, params).await).unwrap()
-}
-
-async fn post_expect_redirect(url: &str, params: &AHashMap<String, String>) -> String {
-    let response = reqwest::Client::builder()
+async fn post_json<D: DeserializeOwned>(
+    url: &str,
+    auth_token: Option<&str>,
+    body: &impl Serialize,
+) -> D {
+    let mut client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .danger_accept_invalid_certs(true)
-        .redirect(Policy::none())
         .build()
         .unwrap_or_default()
-        .post(url)
-        .form(params)
-        .send()
-        .await
-        .unwrap();
-    response
-        .headers()
-        .get(header::LOCATION)
-        .expect("no Location header found in response")
-        .to_str()
-        .unwrap()
-        .to_string()
+        .post(url);
+
+    if let Some(auth_token) = auth_token {
+        client = client.bearer_auth(auth_token);
+    }
+
+    serde_json::from_slice(
+        &client
+            .body(serde_json::to_string(body).unwrap().into_bytes())
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+async fn post<T: DeserializeOwned>(url: &str, params: &AHashMap<String, String>) -> T {
+    post_with_auth(url, None, params).await
+}
+async fn post_with_auth<T: DeserializeOwned>(
+    url: &str,
+    auth_token: Option<&str>,
+    params: &AHashMap<String, String>,
+) -> T {
+    serde_json::from_slice(&post_bytes(url, auth_token, params).await).unwrap()
 }
 
 async fn get_bytes(url: &str) -> Bytes {
@@ -377,27 +486,6 @@ async fn get<T: DeserializeOwned>(url: &str) -> T {
     serde_json::from_slice(&get_bytes(url).await).unwrap()
 }
 
-async fn assert_client_auth(
-    email: &str,
-    pass: &str,
-    device_response: &DeviceAuthResponse,
-    expect: &str,
-) {
-    let html_response = String::from_utf8_lossy(
-        &post_bytes(
-            &device_response.verification_uri,
-            &AHashMap::from_iter([
-                ("email".to_string(), email.to_string()),
-                ("password".to_string(), pass.to_string()),
-                ("code".to_string(), device_response.user_code.to_string()),
-            ]),
-        )
-        .await,
-    )
-    .into_owned();
-    assert!(html_response.contains(expect), "{:#?}", html_response);
-}
-
 async fn assert_unauthorized(base_url: &str, token: &str) {
     match Client::new()
         .credentials(Credentials::bearer(token))
@@ -413,36 +501,29 @@ async fn assert_unauthorized(base_url: &str, token: &str) {
     }
 }
 
-fn parse_code_input(bytes: Bytes) -> String {
-    let html = String::from_utf8_lossy(&bytes).into_owned();
-    if let Some((_, code)) = html.split_once("name=\"code\" value=\"") {
-        if let Some((code, _)) = code.split_once('\"') {
-            return code.to_string();
-        }
-    }
-    panic!("Could not parse code input: {}", html);
-}
-
-fn parse_code_redirect(uri: String, state: &str) -> String {
-    if let Some(code) = uri.strip_prefix("https://localhost?code=") {
-        if let Some(code) = code.strip_suffix(&format!("&state={}", state)) {
-            return code.to_string();
-        }
-    }
-    panic!("Invalid redirect URI: {}", uri);
-}
-
 fn unwrap_token_response(response: TokenResponse) -> (String, Option<String>, u64) {
     match response {
-        TokenResponse::Granted {
-            access_token,
-            token_type,
-            expires_in,
-            refresh_token,
-            ..
-        } => {
-            assert_eq!(token_type, "bearer");
-            (access_token, refresh_token, expires_in)
+        TokenResponse::Granted(granted) => {
+            assert_eq!(granted.token_type, "bearer");
+            (
+                granted.access_token,
+                granted.refresh_token,
+                granted.expires_in,
+            )
+        }
+        TokenResponse::Error { error } => panic!("Expected granted, got {:?}", error),
+    }
+}
+
+fn unwrap_oidc_token_response(response: TokenResponse) -> (String, Option<String>, String) {
+    match response {
+        TokenResponse::Granted(granted) => {
+            assert_eq!(granted.token_type, "bearer");
+            (
+                granted.access_token,
+                granted.refresh_token,
+                granted.id_token.unwrap(),
+            )
         }
         TokenResponse::Error { error } => panic!("Expected granted, got {:?}", error),
     }

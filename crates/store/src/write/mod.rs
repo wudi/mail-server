@@ -1,51 +1,64 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
+    borrow::Cow,
     collections::HashSet,
+    fmt::{self, Formatter},
     hash::Hash,
     slice::Iter,
     time::{Duration, SystemTime},
 };
 
 use nlp::tokenizers::word::WordTokenizer;
-use utils::codec::leb128::{Leb128Iterator, Leb128Vec};
-
-use crate::{
-    backend::MAX_TOKEN_LENGTH, BlobClass, BlobHash, Deserialize, Serialize, BLOB_HASH_LEN,
+use rand::Rng;
+use roaring::RoaringBitmap;
+use utils::{
+    codec::leb128::{Leb128Iterator, Leb128Vec},
+    BlobHash,
 };
+
+use crate::{backend::MAX_TOKEN_LENGTH, BlobClass, Deserialize, Serialize, Value};
 
 use self::assert::AssertValue;
 
 pub mod assert;
-pub mod assign_id;
 pub mod batch;
-pub mod bitmap;
 pub mod blob;
 pub mod hash;
 pub mod key;
 pub mod log;
-pub mod purge;
+
+pub trait SerializeWithId: Send + Sync {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>>;
+}
+
+pub trait ResolveId {
+    fn resolve_id(&self, ids: Option<&AssignedIds>) -> u32;
+}
+
+pub enum MaybeDynamicValue {
+    Static(Vec<u8>),
+    Dynamic(Box<dyn SerializeWithId>),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
+pub enum MaybeDynamicId {
+    Static(u32),
+    Dynamic(usize),
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct DynamicDocumentId(pub usize);
+
+#[derive(Debug, Default)]
+pub struct AssignedIds {
+    pub document_ids: Vec<u32>,
+    pub counter_ids: Vec<i64>,
+}
 
 #[cfg(not(feature = "test_mode"))]
 pub(crate) const MAX_COMMIT_ATTEMPTS: u32 = 10;
@@ -83,12 +96,15 @@ pub enum Operation {
     DocumentId {
         document_id: u32,
     },
+    ChangeId {
+        change_id: u64,
+    },
     AssertValue {
-        class: ValueClass,
+        class: ValueClass<MaybeDynamicId>,
         assert_value: AssertValue,
     },
     Value {
-        class: ValueClass,
+        class: ValueClass<MaybeDynamicId>,
         op: ValueOp,
     },
     Index {
@@ -97,20 +113,18 @@ pub enum Operation {
         set: bool,
     },
     Bitmap {
-        class: BitmapClass,
+        class: BitmapClass<MaybeDynamicId>,
         set: bool,
     },
     Log {
-        change_id: u64,
-        collection: u8,
-        set: Vec<u8>,
+        set: MaybeDynamicValue,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BitmapClass {
+pub enum BitmapClass<T> {
     DocumentIds,
-    Tag { field: u8, value: TagValue },
+    Tag { field: u8, value: TagValue<T> },
     Text { field: u8, token: BitmapHash },
 }
 
@@ -121,40 +135,116 @@ pub struct BitmapHash {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TagValue {
-    Id(u32),
+pub enum TagValue<T> {
+    Id(T),
     Text(Vec<u8>),
-    Static(u8),
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
-pub enum ValueClass {
+pub enum ValueClass<T> {
     Property(u8),
     Acl(u32),
-    Key(Vec<u8>),
-    TermIndex,
-    ReservedId,
-    Directory(DirectoryClass),
+    InMemory(InMemoryClass),
+    FtsIndex(BitmapHash),
+    TaskQueue(TaskQueueClass),
+    Directory(DirectoryClass<T>),
     Blob(BlobOp),
-    IndexEmail(u64),
     Config(Vec<u8>),
+    Queue(QueueClass),
+    Report(ReportClass),
+    Telemetry(TelemetryClass),
+    Any(AnyClass),
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
-pub enum DirectoryClass {
+pub enum TaskQueueClass {
+    IndexEmail {
+        seq: u64,
+        hash: BlobHash,
+    },
+    BayesTrain {
+        seq: u64,
+        hash: BlobHash,
+        learn_spam: bool,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct AnyClass {
+    pub subspace: u8,
+    pub key: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum InMemoryClass {
+    Key(Vec<u8>),
+    Counter(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum DirectoryClass<T> {
     NameToId(Vec<u8>),
     EmailToId(Vec<u8>),
-    MemberOf { principal_id: u32, member_of: u32 },
-    Members { principal_id: u32, has_member: u32 },
-    Domain(Vec<u8>),
-    Principal(u32),
+    MemberOf { principal_id: T, member_of: T },
+    Members { principal_id: T, has_member: T },
+    Principal(T),
     UsedQuota(u32),
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum QueueClass {
+    Message(u64),
+    MessageEvent(QueueEvent),
+    DmarcReportHeader(ReportEvent),
+    DmarcReportEvent(ReportEvent),
+    TlsReportHeader(ReportEvent),
+    TlsReportEvent(ReportEvent),
+    QuotaCount(Vec<u8>),
+    QuotaSize(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum ReportClass {
+    Tls { id: u64, expires: u64 },
+    Dmarc { id: u64, expires: u64 },
+    Arf { id: u64, expires: u64 },
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub enum TelemetryClass {
+    Span {
+        span_id: u64,
+    },
+    Metric {
+        timestamp: u64,
+        metric_id: u64,
+        node_id: u64,
+    },
+    Index {
+        span_id: u64,
+        value: Vec<u8>,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct QueueEvent {
+    pub due: u64,
+    pub queue_id: u64,
+}
+
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+pub struct ReportEvent {
+    pub due: u64,
+    pub policy_hash: u64,
+    pub seq_id: u64,
+    pub domain: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Default)]
 pub enum ValueOp {
-    Set(Vec<u8>),
-    Add(i64),
+    Set(MaybeDynamicValue),
+    AtomicAdd(i64),
+    AddAndGet(i64),
     #[default]
     Clear,
 }
@@ -164,6 +254,7 @@ pub enum BlobOp {
     Reserve { hash: BlobHash, until: u64 },
     Commit { hash: BlobHash },
     Link { hash: BlobHash },
+    LinkId { hash: BlobHash, id: u64 },
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
@@ -172,31 +263,43 @@ pub struct AnyKey<T: AsRef<[u8]>> {
     pub key: T,
 }
 
-impl From<u32> for TagValue {
+impl From<u32> for TagValue<MaybeDynamicId> {
+    fn from(value: u32) -> Self {
+        TagValue::Id(MaybeDynamicId::Static(value))
+    }
+}
+
+impl From<u32> for TagValue<u32> {
     fn from(value: u32) -> Self {
         TagValue::Id(value)
     }
 }
 
-impl From<Vec<u8>> for TagValue {
+impl<T> From<Vec<u8>> for TagValue<T> {
     fn from(value: Vec<u8>) -> Self {
         TagValue::Text(value)
     }
 }
 
-impl From<String> for TagValue {
+impl<T> From<String> for TagValue<T> {
     fn from(value: String) -> Self {
         TagValue::Text(value.into_bytes())
     }
 }
 
-impl From<u8> for TagValue {
+impl From<u8> for TagValue<u32> {
     fn from(value: u8) -> Self {
-        TagValue::Static(value)
+        TagValue::Id(value as u32)
     }
 }
 
-impl From<()> for TagValue {
+impl From<u8> for TagValue<MaybeDynamicId> {
+    fn from(value: u8) -> Self {
+        TagValue::Id(MaybeDynamicId::Static(value as u32))
+    }
+}
+
+impl<T> From<()> for TagValue<T> {
     fn from(_: ()) -> Self {
         TagValue::Text(vec![])
     }
@@ -209,6 +312,12 @@ impl Serialize for u32 {
 }
 
 impl Serialize for u64 {
+    fn serialize(self) -> Vec<u8> {
+        self.to_be_bytes().to_vec()
+    }
+}
+
+impl Serialize for i64 {
     fn serialize(self) -> Vec<u8> {
         self.to_be_bytes().to_vec()
     }
@@ -251,23 +360,31 @@ impl Serialize for Vec<u8> {
 }
 
 impl Deserialize for String {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
 impl Deserialize for u64 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(u64::from_be_bytes(bytes.try_into().map_err(|_| {
-            crate::Error::InternalError("Failed to deserialize u64".to_string())
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
+        })?))
+    }
+}
+
+impl Deserialize for i64 {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        Ok(i64::from_be_bytes(bytes.try_into().map_err(|_| {
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
         })?))
     }
 }
 
 impl Deserialize for u32 {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         Ok(u32::from_be_bytes(bytes.try_into().map_err(|_| {
-            crate::Error::InternalError("Failed to deserialize u32".to_string())
+            trc::StoreEvent::DataCorruption.caused_by(trc::location!())
         })?))
     }
 }
@@ -357,16 +474,17 @@ impl DeserializeFrom for Vec<u8> {
 }
 
 impl<T: DeserializeFrom + Sync + Send> Deserialize for Vec<T> {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
         let mut bytes = bytes.iter();
         let len: usize = bytes
             .next_leb128()
-            .ok_or_else(|| crate::Error::InternalError("Failed to deserialize Vec".to_string()))?;
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))?;
         let mut list = Vec::with_capacity(len);
         for _ in 0..len {
-            list.push(T::deserialize_from(&mut bytes).ok_or_else(|| {
-                crate::Error::InternalError("Failed to deserialize Vec".to_string())
-            })?);
+            list.push(
+                T::deserialize_from(&mut bytes)
+                    .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))?,
+            );
         }
         Ok(list)
     }
@@ -435,7 +553,7 @@ impl ToBitmaps for u32 {
         ops.push(Operation::Bitmap {
             class: BitmapClass::Tag {
                 field,
-                value: TagValue::Id(*self),
+                value: TagValue::Id(MaybeDynamicId::Static(*self)),
             },
             set,
         });
@@ -447,7 +565,7 @@ impl ToBitmaps for u64 {
         ops.push(Operation::Bitmap {
             class: BitmapClass::Tag {
                 field,
-                value: TagValue::Id(*self as u32),
+                value: TagValue::Id(MaybeDynamicId::Static(*self as u32)),
             },
             set,
         });
@@ -481,7 +599,7 @@ impl ToBitmaps for () {
 }
 
 impl Deserialize for () {
-    fn deserialize(_bytes: &[u8]) -> crate::Result<Self> {
+    fn deserialize(_bytes: &[u8]) -> trc::Result<Self> {
         Ok(())
     }
 }
@@ -494,7 +612,9 @@ impl Operation {
     pub fn acl(grant_account_id: u32, set: Option<Vec<u8>>) -> Self {
         Operation::Value {
             class: ValueClass::Acl(grant_account_id),
-            op: set.map(ValueOp::Set).unwrap_or(ValueOp::Clear),
+            op: set
+                .map(|op| ValueOp::Set(op.into()))
+                .unwrap_or(ValueOp::Clear),
         }
     }
 }
@@ -506,86 +626,33 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-impl AsRef<ValueClass> for ValueClass {
-    fn as_ref(&self) -> &ValueClass {
+impl<T> AsRef<ValueClass<T>> for ValueClass<T> {
+    fn as_ref(&self) -> &ValueClass<T> {
         self
     }
 }
 
-impl AsRef<BitmapClass> for BitmapClass {
-    fn as_ref(&self) -> &BitmapClass {
+impl<T> AsRef<BitmapClass<T>> for BitmapClass<T> {
+    fn as_ref(&self) -> &BitmapClass<T> {
         self
     }
 }
 
-impl BitmapClass {
-    pub fn tag_id(property: impl Into<u8>, id: u32) -> Self {
+impl<T> BitmapClass<T> {
+    pub fn tag_id(property: impl Into<u8>, id: u32) -> Self
+    where
+        TagValue<T>: From<u32>,
+    {
         BitmapClass::Tag {
             field: property.into(),
-            value: TagValue::Id(id),
+            value: id.into(),
         }
-    }
-}
-
-impl BlobHash {
-    pub fn new_max() -> Self {
-        BlobHash([u8::MAX; BLOB_HASH_LEN])
-    }
-
-    pub fn try_from_hash_slice(value: &[u8]) -> Result<BlobHash, std::array::TryFromSliceError> {
-        value.try_into().map(BlobHash)
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl From<&[u8]> for BlobHash {
-    fn from(value: &[u8]) -> Self {
-        BlobHash(blake3::hash(value).into())
-    }
-}
-
-impl From<Vec<u8>> for BlobHash {
-    fn from(value: Vec<u8>) -> Self {
-        value.as_slice().into()
-    }
-}
-
-impl From<&Vec<u8>> for BlobHash {
-    fn from(value: &Vec<u8>) -> Self {
-        value.as_slice().into()
-    }
-}
-
-impl AsRef<BlobHash> for BlobHash {
-    fn as_ref(&self) -> &BlobHash {
-        self
-    }
-}
-
-impl AsRef<[u8]> for BlobHash {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl AsMut<[u8]> for BlobHash {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.0.as_mut()
     }
 }
 
 impl AsRef<BlobClass> for BlobClass {
     fn as_ref(&self) -> &BlobClass {
         self
-    }
-}
-
-impl From<BlobHash> for Vec<u8> {
-    fn from(value: BlobHash) -> Self {
-        value.0.to_vec()
     }
 }
 
@@ -602,6 +669,243 @@ impl BlobClass {
         match self {
             BlobClass::Reserved { expires, .. } => *expires > now(),
             BlobClass::Linked { .. } => true,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Bincode<T: serde::Serialize + serde::de::DeserializeOwned> {
+    pub inner: T,
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> Bincode<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> From<Value<'static>> for Bincode<T> {
+    fn from(_: Value<'static>) -> Self {
+        unreachable!("From Value called on Bincode<T>")
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> Serialize for &Bincode<T> {
+    fn serialize(self) -> Vec<u8> {
+        lz4_flex::compress_prepend_size(&bincode::serialize(&self.inner).unwrap_or_default())
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> Serialize for Bincode<T> {
+    fn serialize(self) -> Vec<u8> {
+        lz4_flex::compress_prepend_size(&bincode::serialize(&self.inner).unwrap_or_default())
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned + Sized + Sync + Send> Deserialize
+    for Bincode<T>
+{
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        lz4_flex::decompress_size_prepended(bytes)
+            .map_err(|err| {
+                trc::StoreEvent::DecompressError
+                    .ctx(trc::Key::Value, bytes)
+                    .caused_by(trc::location!())
+                    .reason(err)
+            })
+            .and_then(|result| {
+                bincode::deserialize(&result).map_err(|err| {
+                    trc::StoreEvent::DataCorruption
+                        .ctx(trc::Key::Value, bytes)
+                        .caused_by(trc::location!())
+                        .reason(err)
+                })
+            })
+            .map(|inner| Self { inner })
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> ToBitmaps for Bincode<T> {
+    fn to_bitmaps(&self, _ops: &mut Vec<crate::write::Operation>, _field: u8, _set: bool) {
+        unreachable!()
+    }
+}
+
+impl<T: serde::Serialize + serde::de::DeserializeOwned> ToBitmaps for &Bincode<T> {
+    fn to_bitmaps(&self, _ops: &mut Vec<crate::write::Operation>, _field: u8, _set: bool) {
+        unreachable!()
+    }
+}
+
+impl AssignedIds {
+    pub fn push_document_id(&mut self, id: u32) {
+        self.document_ids.push(id);
+    }
+
+    pub fn push_counter_id(&mut self, id: i64) {
+        self.counter_ids.push(id);
+    }
+
+    pub fn get_document_id(&self, idx: usize) -> trc::Result<u32> {
+        self.document_ids.get(idx).copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
+    }
+
+    pub fn first_document_id(&self) -> trc::Result<u32> {
+        self.get_document_id(0)
+    }
+
+    pub fn last_document_id(&self) -> trc::Result<u32> {
+        self.document_ids.last().copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
+    }
+
+    pub fn last_counter_id(&self) -> trc::Result<i64> {
+        self.counter_ids.last().copied().ok_or_else(|| {
+            trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Reason, "No document ids were created")
+        })
+    }
+}
+
+impl From<String> for MaybeDynamicValue {
+    fn from(value: String) -> Self {
+        MaybeDynamicValue::Static(value.into_bytes())
+    }
+}
+
+impl From<&[u8]> for MaybeDynamicValue {
+    fn from(value: &[u8]) -> Self {
+        MaybeDynamicValue::Static(value.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for MaybeDynamicValue {
+    fn from(value: Vec<u8>) -> Self {
+        MaybeDynamicValue::Static(value)
+    }
+}
+
+impl MaybeDynamicValue {
+    pub fn resolve(&self, ids: &AssignedIds) -> trc::Result<Cow<[u8]>> {
+        match self {
+            MaybeDynamicValue::Static(value) => Ok(Cow::Borrowed(value.as_slice())),
+            MaybeDynamicValue::Dynamic(value) => value.serialize_with_id(ids).map(Cow::Owned),
+        }
+    }
+}
+
+impl MaybeDynamicId {
+    pub fn resolve(&self, ids: &AssignedIds) -> trc::Result<u32> {
+        match self {
+            MaybeDynamicId::Static(id) => Ok(*id),
+            MaybeDynamicId::Dynamic(idx) => ids.get_document_id(*idx),
+        }
+    }
+}
+
+impl ResolveId for u32 {
+    fn resolve_id(&self, _: Option<&AssignedIds>) -> u32 {
+        *self
+    }
+}
+
+impl ResolveId for MaybeDynamicId {
+    fn resolve_id(&self, ids: Option<&AssignedIds>) -> u32 {
+        match self {
+            MaybeDynamicId::Static(id) => *id,
+            MaybeDynamicId::Dynamic(idx) => ids
+                .and_then(|ids| ids.document_ids.get(*idx))
+                .copied()
+                .unwrap_or(u32::MAX),
+        }
+    }
+}
+
+impl std::fmt::Debug for MaybeDynamicValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            MaybeDynamicValue::Static(value) => write!(f, "{:?}", value),
+            MaybeDynamicValue::Dynamic(_) => write!(f, "Dynamic"),
+        }
+    }
+}
+
+impl PartialEq for MaybeDynamicValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (MaybeDynamicValue::Static(a), MaybeDynamicValue::Static(b)) => a == b,
+            (MaybeDynamicValue::Dynamic(_), MaybeDynamicValue::Dynamic(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MaybeDynamicValue {}
+
+impl Hash for MaybeDynamicValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            MaybeDynamicValue::Static(value) => value.hash(state),
+            MaybeDynamicValue::Dynamic(_) => 0.hash(state),
+        }
+    }
+}
+
+impl From<MaybeDynamicId> for MaybeDynamicValue {
+    fn from(value: MaybeDynamicId) -> Self {
+        match value {
+            MaybeDynamicId::Static(id) => MaybeDynamicValue::Static(id.serialize()),
+            MaybeDynamicId::Dynamic(idx) => {
+                MaybeDynamicValue::Dynamic(Box::new(DynamicDocumentId(idx)))
+            }
+        }
+    }
+}
+
+impl SerializeWithId for DynamicDocumentId {
+    fn serialize_with_id(&self, ids: &AssignedIds) -> trc::Result<Vec<u8>> {
+        ids.get_document_id(self.0).map(|id| id.serialize())
+    }
+}
+
+pub(crate) trait RandomAvailableId {
+    fn random_available_id(&self) -> u32;
+}
+
+impl RandomAvailableId for RoaringBitmap {
+    fn random_available_id(&self) -> u32 {
+        let mut last_id = 0;
+        let mut available_ids = Vec::with_capacity(100);
+        for id in self.iter() {
+            for i in last_id..id {
+                available_ids.push(i);
+            }
+            last_id = id + 1;
+        }
+
+        while available_ids.len() < 100 {
+            available_ids.push(last_id);
+            last_id += 1;
+        }
+
+        available_ids[rand::thread_rng().gen_range(0..available_ids.len())]
+    }
+}
+
+impl QueueClass {
+    pub fn due(&self) -> Option<u64> {
+        match self {
+            QueueClass::DmarcReportHeader(report_event) => report_event.due.into(),
+            QueueClass::TlsReportHeader(report_event) => report_event.due.into(),
+            _ => None,
         }
     }
 }

@@ -1,43 +1,33 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::Server;
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
 };
-use smtp::{core::management::QueueRequest, queue};
-use tokio::sync::oneshot;
+use smtp::queue::{self, spool::SmtpSpool};
+use std::future::Future;
 
-use crate::JMAP;
+use crate::{changes::state::StateManager, JmapMethods};
 
-impl JMAP {
-    pub async fn email_submission_get(
+pub trait EmailSubmissionGet: Sync + Send {
+    fn email_submission_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+}
+
+impl EmailSubmissionGet for Server {
+    async fn email_submission_get(
         &self,
         mut request: GetRequest<RequestArguments>,
-    ) -> Result<GetResponse, MethodError> {
-        let ids = request.unwrap_ids(self.config.get_max_objects)?;
+    ) -> trc::Result<GetResponse> {
+        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
             Property::EmailId,
@@ -60,7 +50,7 @@ impl JMAP {
         } else {
             email_submission_ids
                 .iter()
-                .take(self.config.get_max_objects)
+                .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
                 .collect::<Vec<_>>()
         };
@@ -97,25 +87,9 @@ impl JMAP {
             };
 
             // Obtain queueId
-            let mut queued_message = None;
-            let (result_tx, result_rx) = oneshot::channel();
-            if self
-                .smtp
-                .queue
-                .tx
-                .send(queue::Event::Manage(QueueRequest::Status {
-                    queue_ids: vec![push.get(&Property::MessageId).as_uint().unwrap_or(u64::MAX)],
-                    result_tx,
-                }))
-                .await
-                .is_ok()
-            {
-                queued_message = result_rx
-                    .await
-                    .ok()
-                    .and_then(|mut result| result.pop())
-                    .flatten();
-            }
+            let queued_message = self
+                .read_message(push.get(&Property::MessageId).as_uint().unwrap_or(u64::MAX))
+                .await;
 
             let mut result = Object::with_capacity(properties.len());
             for property in &properties {
@@ -124,11 +98,7 @@ impl JMAP {
                     Property::DeliveryStatus => {
                         match (queued_message.as_ref(), push.remove(property)) {
                             (Some(message), Value::Object(mut status)) => {
-                                for rcpt in message
-                                    .domains
-                                    .iter()
-                                    .flat_map(|rcpts| rcpts.recipients.iter())
-                                {
+                                for rcpt in &message.recipients {
                                     status.set(
                                         Property::_T(rcpt.address.clone()),
                                         Object::with_capacity(3)
@@ -146,14 +116,21 @@ impl JMAP {
                                             .with_property(
                                                 Property::SmtpReply,
                                                 match &rcpt.status {
-                                                    queue::Status::Completed(reply)
-                                                    | queue::Status::TemporaryFailure(reply)
+                                                    queue::Status::Completed(reply) => reply
+                                                        .response
+                                                        .to_string()
+                                                        .replace('\n', " "),
+                                                    queue::Status::TemporaryFailure(reply)
                                                     | queue::Status::PermanentFailure(reply) => {
-                                                        reply.as_str()
+                                                        reply
+                                                            .response
+                                                            .to_string()
+                                                            .replace('\n', " ")
                                                     }
-                                                    queue::Status::Scheduled => "250 2.1.5 Queued",
-                                                }
-                                                .replace('\n', " "),
+                                                    queue::Status::Scheduled => {
+                                                        "250 2.1.5 Queued".to_string()
+                                                    }
+                                                },
                                             )
                                             .with_property(Property::Displayed, "unknown"),
                                     );

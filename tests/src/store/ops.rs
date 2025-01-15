@@ -1,35 +1,237 @@
 /*
- * Copyright (c) 2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use std::collections::HashSet;
+
+use jmap_proto::types::{collection::Collection, property::Property};
 use store::{
-    write::{BatchBuilder, ValueClass},
-    Store, ValueKey,
+    write::{
+        BatchBuilder, BitmapClass, DirectoryClass, MaybeDynamicId, TagValue, ValueClass, F_CLEAR,
+    },
+    BitmapKey, Store, ValueKey,
 };
 
 // FDB max value
 const MAX_VALUE_SIZE: usize = 100000;
 
 pub async fn test(db: Store) {
+    #[cfg(feature = "foundationdb")]
+    if matches!(db, Store::FoundationDb(_)) && std::env::var("SLOW_FDB_TRX").is_ok() {
+        println!("Running slow FoundationDB transaction tests...");
+
+        // Create 900000 keys
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(0)
+            .with_collection(0)
+            .update_document(0);
+        for n in 0..900000 {
+            batch.set(
+                ValueClass::Config(format!("key{n:10}").into_bytes()),
+                format!("value{n:10}").into_bytes(),
+            );
+
+            if n % 10000 == 0 {
+                db.write(batch.build_batch()).await.unwrap();
+                batch = BatchBuilder::new();
+                batch
+                    .with_account_id(0)
+                    .with_collection(0)
+                    .update_document(0);
+            }
+        }
+        db.write(batch.build_batch()).await.unwrap();
+        println!("Created 900.000 keys...");
+
+        // Iterate over all keys
+        let mut n = 0;
+        db.iterate(
+            store::IterateParams::new(
+                ValueKey {
+                    account_id: 0,
+                    collection: 0,
+                    document_id: 0,
+                    class: ValueClass::Config(b"".to_vec()),
+                },
+                ValueKey {
+                    account_id: 0,
+                    collection: 0,
+                    document_id: 0,
+                    class: ValueClass::Config(b"\xFF".to_vec()),
+                },
+            ),
+            |key, value| {
+                assert_eq!(std::str::from_utf8(key).unwrap(), format!("key{n:10}"));
+                assert_eq!(std::str::from_utf8(value).unwrap(), format!("value{n:10}"));
+                n += 1;
+                if n % 10000 == 0 {
+                    println!("Iterated over {n} keys");
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+
+        // Delete 100 keys
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(0)
+            .with_collection(0)
+            .update_document(0);
+        for n in 0..900000 {
+            batch.clear(ValueClass::Config(format!("key{n:10}").into_bytes()));
+
+            if n % 10000 == 0 {
+                db.write(batch.build_batch()).await.unwrap();
+                batch = BatchBuilder::new();
+                batch
+                    .with_account_id(0)
+                    .with_collection(0)
+                    .update_document(0);
+            }
+        }
+        db.write(batch.build_batch()).await.unwrap();
+    }
+
+    // Testing ID assignment
+    println!("Running dynamic ID assignment tests...");
+    let mut builder = BatchBuilder::new();
+    builder
+        .with_account_id(0)
+        .with_collection(Collection::Thread)
+        .create_document()
+        .with_collection(Collection::Email)
+        .create_document()
+        .tag(
+            Property::ThreadId,
+            TagValue::Id(MaybeDynamicId::Dynamic(0)),
+            0,
+        )
+        .set(Property::ThreadId, MaybeDynamicId::Dynamic(0));
+
+    let assigned_ids = db.write(builder.build_batch()).await.unwrap();
+    assert_eq!(assigned_ids.document_ids.len(), 2);
+    let thread_id = assigned_ids.first_document_id().unwrap();
+    let email_id = assigned_ids.last_document_id().unwrap();
+
+    let email_ids = db
+        .get_bitmap(BitmapKey {
+            account_id: 0,
+            collection: Collection::Email.into(),
+            class: BitmapClass::DocumentIds,
+            document_id: 0,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(email_ids.len(), 1);
+    assert!(email_ids.contains(email_id));
+
+    let thread_ids = db
+        .get_bitmap(BitmapKey {
+            account_id: 0,
+            collection: Collection::Thread.into(),
+            class: BitmapClass::DocumentIds,
+            document_id: 0,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread_ids.len(), 1);
+    assert!(thread_ids.contains(thread_id));
+
+    let tagged_ids = db
+        .get_bitmap(BitmapKey {
+            account_id: 0,
+            collection: Collection::Email.into(),
+            class: BitmapClass::Tag {
+                field: Property::ThreadId.into(),
+                value: TagValue::Id(thread_id),
+            },
+            document_id: 0,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tagged_ids.len(), 1);
+    assert!(tagged_ids.contains(email_id));
+
+    let stored_thread_id = db
+        .get_value::<u32>(ValueKey {
+            account_id: 0,
+            collection: Collection::Email.into(),
+            document_id: email_id,
+            class: ValueClass::Property(Property::ThreadId.into()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_thread_id, thread_id);
+
+    let mut builder = BatchBuilder::new();
+    builder
+        .with_account_id(0)
+        .with_collection(Collection::Thread)
+        .delete_document(thread_id)
+        .with_collection(Collection::Email)
+        .delete_document(email_id)
+        .tag(
+            Property::ThreadId,
+            TagValue::Id(MaybeDynamicId::Static(thread_id)),
+            F_CLEAR,
+        )
+        .clear(Property::ThreadId);
+    db.write(builder.build_batch()).await.unwrap();
+
+    // Increment a counter 1000 times concurrently
+    let mut handles = Vec::new();
+    let mut assigned_ids = HashSet::new();
+    println!("Incrementing counter 1000 times concurrently...");
+    for _ in 0..1000 {
+        handles.push({
+            let db = db.clone();
+            tokio::spawn(async move {
+                let mut builder = BatchBuilder::new();
+                builder
+                    .with_account_id(0)
+                    .with_collection(0)
+                    .update_document(0)
+                    .add_and_get(ValueClass::Directory(DirectoryClass::UsedQuota(0)), 1);
+                db.write(builder.build_batch())
+                    .await
+                    .unwrap()
+                    .last_counter_id()
+                    .unwrap()
+            })
+        });
+    }
+
+    for handle in handles {
+        let assigned_id = handle.await.unwrap();
+        assert!(
+            assigned_ids.insert(assigned_id),
+            "counter assigned {assigned_id} twice or more times."
+        );
+    }
+    assert_eq!(assigned_ids.len(), 1000);
+    assert_eq!(
+        db.get_counter(ValueKey {
+            account_id: 0,
+            collection: 0,
+            document_id: 0,
+            class: ValueClass::Directory(DirectoryClass::UsedQuota(0)),
+        })
+        .await
+        .unwrap(),
+        1000
+    );
+
+    println!("Running chunking tests...");
     for (test_num, value) in [
         vec![b'A'; 0],
         vec![b'A'; 1],
@@ -56,11 +258,10 @@ pub async fn test(db: Store) {
             BatchBuilder::new()
                 .with_account_id(0)
                 .with_collection(0)
-                .with_account_id(0)
                 .update_document(0)
                 .set(ValueClass::Property(1), value.as_slice())
-                .set(ValueClass::Property(0), "check1")
-                .set(ValueClass::Property(2), "check2")
+                .set(ValueClass::Property(0), "check1".as_bytes())
+                .set(ValueClass::Property(2), "check2".as_bytes())
                 .build_batch(),
         )
         .await
@@ -86,7 +287,6 @@ pub async fn test(db: Store) {
             BatchBuilder::new()
                 .with_account_id(0)
                 .with_collection(0)
-                .with_account_id(0)
                 .update_document(0)
                 .clear(ValueClass::Property(1))
                 .build_batch(),
@@ -134,6 +334,7 @@ pub async fn test(db: Store) {
                 .update_document(0)
                 .clear(ValueClass::Property(0))
                 .clear(ValueClass::Property(2))
+                .clear(ValueClass::Directory(DirectoryClass::UsedQuota(0)))
                 .build_batch(),
         )
         .await

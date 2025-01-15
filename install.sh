@@ -1,7 +1,13 @@
 #!/usr/bin/env sh
 # shellcheck shell=dash
 
-# Stalwart Mail install script -- based on the rustup installation script.
+#
+# SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+#
+
+# Stalwart Mail Server install script -- based on the rustup installation script.
 
 set -e
 set -u
@@ -34,26 +40,43 @@ main() {
         _account="_stalwart-mail"
     fi
 
-    # Start configuration mode
-    if [ "$#" -eq 1 ] && [ "$1" = "--init" ]  ; then
-        init
-        configure
-        return 0
-    fi
+    # Read arguments
+    local _dir="/opt/stalwart-mail"
+
+    # Default component setting
+    local _component="stalwart-mail"
+
+    # Loop through the arguments
+    for arg in "$@"; do
+        case "$arg" in
+            --fdb)
+                _component="stalwart-mail-foundationdb"
+                ;;
+            *)
+                if [ -n "$arg" ]; then
+                    _dir=$arg
+                fi
+                ;;
+        esac
+    done
 
     # Detect platform architecture
     get_architecture || return 1
     local _arch="$RETVAL"
     assert_nz "$_arch" "arch"
 
+    # Create directories
+    ensure mkdir -p "$_dir" "$_dir/bin" "$_dir/etc" "$_dir/logs"
+
     # Download latest binary
-    say "⏳ Downloading installer for ${_arch}..."
-    local _dir
-    _dir="$(ensure mktemp -d)"
-    local _file="${_dir}/stalwart-install.tar.gz"
-    local _url="${BASE_URL}/stalwart-install-${_arch}.tar.gz"
+    say "⏳ Downloading ${_component} for ${_arch}..."
+    local _file="${_dir}/bin/stalwart-mail.tar.gz"
+    local _url="${BASE_URL}/${_component}-${_arch}.tar.gz"
     ensure mkdir -p "$_dir"
     ensure downloader "$_url" "$_file" "$_arch"
+    ensure tar zxvf "$_file" -C "$_dir/bin"
+    ignore chmod +x "$_dir/bin/stalwart-mail"
+    ignore rm "$_file"
 
     # Create system account
     if ! id -u ${_account} > /dev/null 2>&1; then
@@ -82,19 +105,94 @@ main() {
             ensure dscl /Local/Default -delete /Users/_stalwart-mail AuthenticationAuthority
             ensure dscl /Local/Default -delete /Users/_stalwart-mail PasswordPolicyOptions
         else
-            ensure useradd ${_account} -s /sbin/nologin -M
+            ensure useradd ${_account} -s /usr/sbin/nologin -M -r -U
         fi
     fi
 
-    # Copy binary
-    say "⬇️  Running installer..."
-    ensure tar zxvf "$_file" -C "$_dir"
-    ignore $_dir/stalwart-install
-    ignore rm "$_file"
-    ignore rm "$_dir/stalwart-install"
+    # Run init
+    ignore $_dir/bin/stalwart-mail --init "$_dir"
+
+    # Set permissions
+    say "🔐 Setting permissions..."
+    ensure chown -R ${_account}:${_account} "$_dir"
+    ensure chmod -R 755 "$_dir"
+    ensure chmod 700 "$_dir/etc/config.toml"
+
+    # Create service file
+    say "🚀 Starting service..."
+    if [ "${_os}" = "linux" ]; then
+        create_service_linux "$_dir"
+    elif [ "${_os}" = "macos" ]; then
+        create_service_macos "$_dir"
+    fi
+
+    # Installation complete
+    local _host=$(hostname -f)
+    say "🎉 Installation complete! Continue the setup at http://$_host:8080/login"
 
     return 0
 }
+
+# Functions to create service files
+create_service_linux() {
+    local _dir="$1"
+    cat <<EOF | sed "s|__PATH__|$_dir|g" > /etc/systemd/system/stalwart-mail.service
+[Unit]
+Description=Stalwart Mail Server
+Conflicts=postfix.service sendmail.service exim4.service
+ConditionPathExists=__PATH__/etc/config.toml
+After=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+ExecStart=__PATH__/bin/stalwart-mail --config=__PATH__/etc/config.toml
+SyslogIdentifier=stalwart-mail
+User=stalwart-mail
+Group=stalwart-mail
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable stalwart-mail.service
+    systemctl restart stalwart-mail.service
+}
+
+create_service_macos() {
+    local _dir="$1"
+    cat <<EOF | sed "s|__PATH__|$_dir|g" > /Library/LaunchAgents/stalwart.mail.plist
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>stalwart.mail</string>
+        <key>ServiceDescription</key>
+        <string>Stalwart Mail Server</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>__PATH__/bin/stalwart-mail</string>
+            <string>--config=__PATH__/etc/config.toml</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+    </dict>
+</plist>
+EOF
+    launchctl load /Library/LaunchAgents/stalwart.mail.plist
+    launchctl enable system/stalwart.mail
+    launchctl start system/stalwart.mail
+}
+
 
 get_architecture() {
     local _ostype _cputype _bitness _arch _clibtype
@@ -369,7 +467,7 @@ get_endianness() {
 }
 
 say() {
-    printf 'stalwart-mail: %s\n' "$1"
+    printf '%s\n' "$1"
 }
 
 err() {

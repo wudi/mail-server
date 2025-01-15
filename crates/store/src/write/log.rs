@@ -1,40 +1,23 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use ahash::AHashSet;
 use utils::{codec::leb128::Leb128Vec, map::vec_map::VecMap};
 
 use crate::Serialize;
 
-use super::{IntoOperations, Operation};
+use super::{IntoOperations, MaybeDynamicValue, Operation, SerializeWithId};
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ChangeLogBuilder {
     pub change_id: u64,
     pub changes: VecMap<u8, Changes>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Changes {
     pub inserts: AHashSet<u64>,
     pub updates: AHashSet<u64>,
@@ -144,17 +127,63 @@ impl ChangeLogBuilder {
 
 impl IntoOperations for ChangeLogBuilder {
     fn build(self, batch: &mut super::BatchBuilder) {
+        batch.with_change_id(self.change_id);
         for (collection, changes) in self.changes {
+            batch.ops.push(Operation::Collection { collection });
             batch.ops.push(Operation::Log {
-                change_id: self.change_id,
-                collection,
-                set: changes.serialize(),
+                set: changes.serialize().into(),
             });
         }
     }
 }
 
-impl Serialize for Changes {
+impl Changes {
+    pub fn insert<T, I>(id: T) -> Self
+    where
+        T: IntoIterator<Item = I>,
+        I: Into<u64>,
+    {
+        Changes {
+            inserts: id.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    pub fn update<T, I>(id: T) -> Self
+    where
+        T: IntoIterator<Item = I>,
+        I: Into<u64>,
+    {
+        Changes {
+            updates: id.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    pub fn child_update<T, I>(id: T) -> Self
+    where
+        T: IntoIterator<Item = I>,
+        I: Into<u64>,
+    {
+        Changes {
+            child_updates: id.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    pub fn delete<T, I>(id: T) -> Self
+    where
+        T: IntoIterator<Item = I>,
+        I: Into<u64>,
+    {
+        Changes {
+            deletes: id.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+}
+
+impl Serialize for &Changes {
     fn serialize(self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
             1 + (self.inserts.len()
@@ -170,11 +199,37 @@ impl Serialize for Changes {
         buf.push_leb128(self.child_updates.len());
         buf.push_leb128(self.deletes.len());
 
-        for list in [self.inserts, self.updates, self.child_updates, self.deletes] {
+        for list in [
+            &self.inserts,
+            &self.updates,
+            &self.child_updates,
+            &self.deletes,
+        ] {
             for id in list {
-                buf.push_leb128(id);
+                buf.push_leb128(*id);
             }
         }
         buf
+    }
+}
+
+impl From<Changes> for MaybeDynamicValue {
+    fn from(changes: Changes) -> Self {
+        MaybeDynamicValue::Static(changes.serialize())
+    }
+}
+
+pub struct LogInsert();
+
+impl SerializeWithId for LogInsert {
+    fn serialize_with_id(&self, ids: &super::AssignedIds) -> trc::Result<Vec<u8>> {
+        ids.last_document_id()
+            .map(|id| Changes::insert([id]).serialize())
+    }
+}
+
+impl From<LogInsert> for MaybeDynamicValue {
+    fn from(value: LogInsert) -> Self {
+        MaybeDynamicValue::Dynamic(Box::new(value))
     }
 }

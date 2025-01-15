@@ -1,49 +1,41 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::copy::{CopyBlobRequest, CopyBlobResponse},
     types::blob::BlobId,
 };
 
+use std::future::Future;
 use store::{
     write::{now, BatchBuilder, BlobOp},
     BlobClass, Serialize,
 };
 use utils::map::vec_map::VecMap;
 
-use crate::{auth::AccessToken, JMAP};
+use crate::JmapMethods;
 
-impl JMAP {
-    pub async fn blob_copy(
+use super::download::BlobDownload;
+
+pub trait BlobCopy: Sync + Send {
+    fn blob_copy(
         &self,
         request: CopyBlobRequest,
         access_token: &AccessToken,
-    ) -> Result<CopyBlobResponse, MethodError> {
+    ) -> impl Future<Output = trc::Result<CopyBlobResponse>> + Send;
+}
+
+impl BlobCopy for Server {
+    async fn blob_copy(
+        &self,
+        request: CopyBlobRequest,
+        access_token: &AccessToken,
+    ) -> trc::Result<CopyBlobResponse> {
         let mut response = CopyBlobResponse {
             from_account_id: request.from_account_id,
             account_id: request.account_id,
@@ -55,7 +47,7 @@ impl JMAP {
         for blob_id in request.blob_ids {
             if self.has_access_blob(&blob_id, access_token).await? {
                 let mut batch = BatchBuilder::new();
-                let until = now() + self.config.upload_tmp_ttl;
+                let until = now() + self.core.jmap.upload_tmp_ttl;
                 batch.with_account_id(account_id).set(
                     BlobOp::Reserve {
                         until,

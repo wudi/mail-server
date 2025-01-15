@@ -1,40 +1,27 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
 
-use directory::backend::internal::manage::ManageDirectory;
+use common::listener::blocked::BLOCKED_IP_KEY;
 use imap_proto::ResponseType;
-use jmap::services::housekeeper::Event;
 use jmap_client::{
     client::{Client, Credentials},
     core::set::{SetError, SetErrorType},
     mailbox::{self},
 };
 use jmap_proto::types::id::Id;
-use utils::listener::blocked::BLOCKED_IP_KEY;
+use store::write::now;
 
 use crate::{
+    directory::internal::TestInternalDirectory,
     imap::{ImapConnection, Type},
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes},
 };
@@ -46,41 +33,54 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .core
+            .storage
+            .data
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com", "john.doe@example.com"],
+            )
+            .await,
     )
     .to_string();
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "john.doe@example.com", "alias")
-        .await;
 
     // Reset rate limiters
-    server.rate_limit_auth.clear();
-    server.rate_limit_unauth.clear();
+    server.inner.data.jmap_limiter.clear();
+    params.webhook.clear();
 
     // Incorrect passwords should be rejected with a 401 error
     assert!(matches!(
-            Client::new()
-                .credentials(Credentials::basic("jdoe@example.com", "abcde"))
-                .accept_invalid_certs(true)
-                .connect("https://127.0.0.1:8899")
-                .await,
-            Err(jmap_client::Error::Problem(err)) if err.status() == Some(401)));
+        Client::new()
+            .credentials(Credentials::basic("jdoe@example.com", "abcde"))
+            .accept_invalid_certs(true)
+            .connect("https://127.0.0.1:8899")
+            .await,
+        Err(jmap_client::Error::Problem(err)) if err.status() == Some(401)));
 
-    // Invalid authentication requests should be rate limited
-    let mut n_401 = 0;
-    let mut n_429 = 0;
-    for n in 0..110 {
-        if let Err(jmap_client::Error::Problem(problem)) = Client::new()
+    // Wait until the beginning of the 5 seconds bucket
+    const LIMIT: u64 = 5;
+    let now = now();
+    let range_start = now / LIMIT;
+    let range_end = (range_start * LIMIT) + LIMIT;
+    tokio::time::sleep(Duration::from_secs(range_end - now)).await;
+
+    // Test fail2ban
+    assert_eq!(
+        server
+            .core
+            .storage
+            .config
+            .get(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
+            .await
+            .unwrap(),
+        None
+    );
+    for n in 0..98 {
+        match Client::new()
             .credentials(Credentials::basic(
                 "not_an_account@example.com",
                 &format!("brute_force{}", n),
@@ -89,36 +89,16 @@ pub async fn test(params: &mut JMAPTest) {
             .connect("https://127.0.0.1:8899")
             .await
         {
-            if problem.status().unwrap() == 401 {
-                n_401 += 1;
-                if n_401 > 100 {
-                    panic!("Rate limiter failed: 429: {n_429}, 401: {n_401}.");
-                }
-            } else if problem.status().unwrap() == 429 {
-                n_429 += 1;
-                if n_429 > 11 {
-                    panic!("Rate limiter too restrictive: 429: {n_429}, 401: {n_401}.");
-                }
-            } else {
-                panic!("Unexpected error status {}", problem.status().unwrap());
+            Err(jmap_client::Error::Problem(_)) => {}
+            Err(err) => {
+                panic!("Unexpected response: {:?}", err);
             }
-        } else {
-            panic!("Unexpected response.");
+            Ok(_) => {
+                panic!("Unexpected success");
+            }
         }
     }
 
-    // Limit should be restored after 1 second
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    // Test fail2ban
-    assert_eq!(
-        server
-            .store
-            .config_get(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
-            .await
-            .unwrap(),
-        None
-    );
     let mut imap = ImapConnection::connect(b"_x ").await;
     imap.send("AUTHENTICATE PLAIN AGpvaG4AY2hpbWljaGFuZ2Fz")
         .await;
@@ -133,8 +113,10 @@ pub async fn test(params: &mut JMAPTest) {
     // Make sure the IP address is blocked
     assert_eq!(
         server
-            .store
-            .config_get(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
+            .core
+            .storage
+            .config
+            .get(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
             .await
             .unwrap(),
         Some(String::new())
@@ -146,15 +128,18 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Lift ban
     server
-        .store
-        .config_clear(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
+        .core
+        .storage
+        .config
+        .clear(format!("{BLOCKED_IP_KEY}.127.0.0.1"))
         .await
         .unwrap();
     server
-        .housekeeper_tx
-        .send(Event::ReloadConfig)
-        .await
-        .unwrap();
+        .inner
+        .data
+        .blocked_ips
+        .write()
+        .remove(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
     // Valid authentication requests should not be rate limited
     for _ in 0..110 {
@@ -223,16 +208,15 @@ pub async fn test(params: &mut JMAPTest) {
     for _ in 0..8 {
         let client_ = client.clone();
         tokio::spawn(async move {
-            client_
+            let _ = client_
                 .mailbox_query(
                     mailbox::query::Filter::name("__sleep").into(),
                     [mailbox::query::Comparator::name()].into(),
                 )
-                .await
-                .unwrap();
+                .await;
         });
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(matches!(
         client
             .mailbox_query(
@@ -243,7 +227,7 @@ pub async fn test(params: &mut JMAPTest) {
             Err(jmap_client::Error::Problem(err)) if err.status() == Some(400)));
 
     // Wait for sleep to be done
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Concurrent upload test
     for _ in 0..4 {
@@ -252,7 +236,7 @@ pub async fn test(params: &mut JMAPTest) {
             client_.upload(None, b"sleep".to_vec(), None).await.unwrap();
         });
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(matches!(
         client.upload(None, b"sleep".to_vec(), None).await,
         Err(jmap_client::Error::Problem(err)) if err.status() == Some(400)));
@@ -261,4 +245,9 @@ pub async fn test(params: &mut JMAPTest) {
     params.client.set_default_account_id(&account_id);
     destroy_all_mailboxes(params).await;
     assert_is_empty(server).await;
+
+    // Check webhook events
+    params
+        .webhook
+        .assert_contains(&["auth.failed", "auth.success", "security.authentication-ban"]);
 }

@@ -1,29 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use base64::{engine::general_purpose, Engine};
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
-    error::{method::MethodError, set::SetError},
+    error::set::SetError,
     method::set::{RequestArguments, SetRequest, SetResponse},
     object::Object,
     response::references::EvalObjectReferences,
@@ -35,35 +19,44 @@ use jmap_proto::{
         value::{MaybePatchValue, Value},
     },
 };
+use std::future::Future;
 use store::{
     rand::{distributions::Alphanumeric, thread_rng, Rng},
     write::{now, BatchBuilder, F_CLEAR, F_VALUE},
 };
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{services::state::StateManager, JmapMethods};
 
 const EXPIRES_MAX: i64 = 7 * 24 * 3600; // 7 days
 const VERIFICATION_CODE_LEN: usize = 32;
 
-impl JMAP {
-    pub async fn push_subscription_set(
+pub trait PushSubscriptionSet: Sync + Send {
+    fn push_subscription_set(
+        &self,
+        request: SetRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+}
+
+impl PushSubscriptionSet for Server {
+    async fn push_subscription_set(
         &self,
         mut request: SetRequest<RequestArguments>,
         access_token: &AccessToken,
-    ) -> Result<SetResponse, MethodError> {
+    ) -> trc::Result<SetResponse> {
         let account_id = access_token.primary_id();
         let mut push_ids = self
             .get_document_ids(account_id, Collection::PushSubscription)
             .await?
             .unwrap_or_default();
-        let mut response = SetResponse::from_request(&request, self.config.set_max_objects)?;
+        let mut response = SetResponse::from_request(&request, self.core.jmap.set_max_objects)?;
         let will_destroy = request.unwrap_destroy();
 
         // Process creates
         'create: for (id, object) in request.unwrap_create() {
             let mut push = Object::with_capacity(object.properties.len());
 
-            if push_ids.len() as usize >= self.config.push_max_total {
+            if push_ids.len() as usize >= self.core.jmap.push_max_total {
                 response.not_created.append(id, SetError::forbidden().with_description(
                     "There are too many subscriptions, please delete some before adding a new one.",
                 ));
@@ -121,16 +114,13 @@ impl JMAP {
 
             // Insert record
             let mut batch = BatchBuilder::new();
-            let document_id = self
-                .assign_document_id(account_id, Collection::PushSubscription)
-                .await?;
             batch
                 .with_account_id(account_id)
                 .with_collection(Collection::PushSubscription)
-                .create_document(document_id)
+                .create_document()
                 .value(Property::Value, push, F_VALUE);
+            let document_id = self.write_batch_expect_id(batch).await?;
             push_ids.insert(document_id);
-            self.write_batch(batch).await?;
             response.created.insert(
                 id,
                 Object::with_capacity(1)
@@ -279,7 +269,7 @@ fn validate_push_value(
                 .unwrap()
                 .properties
                 .get(&Property::Value)
-                .map_or(false, |v| matches!(v, Value::Text(v) if v == &value))
+                .is_some_and(|v| matches!(v, Value::Text(v) if v == &value))
             {
                 Value::Text(value)
             } else {

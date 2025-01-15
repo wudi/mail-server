@@ -1,37 +1,21 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
-use ahash::AHashMap;
-use directory::backend::internal::manage::ManageDirectory;
 use jmap::email::crypto::{
-    try_parse_certs, Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams,
+    try_parse_certs, Algorithm, EncryptMessage, EncryptionMethod, EncryptionParams, EncryptionType,
 };
 use jmap_proto::types::id::Id;
 use mail_parser::{MessageParser, MimeHeaders};
 
-use crate::jmap::delivery::SmtpConnection;
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{delivery::SmtpConnection, ManagementApi},
+};
 
 use super::JMAPTest;
 
@@ -41,64 +25,56 @@ pub async fn test(params: &mut JMAPTest) {
     // Create test account
     let server = params.server.clone();
     let client = &mut params.client;
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
     let account_id = Id::from(
         server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
+            .core
+            .storage
+            .data
+            .create_test_user(
+                "jdoe@example.com",
+                "12345",
+                "John Doe",
+                &["jdoe@example.com"],
+            )
+            .await,
     )
     .to_string();
 
-    // Update
-    let mut params = AHashMap::from_iter([
-        ("email".to_string(), b"jdoe@example.com".to_vec()),
-        ("password".to_string(), b"12345".to_vec()),
-    ]);
+    // Build API
+    let api = ManagementApi::new(8899, "jdoe@example.com", "12345");
 
     // Try importing using multiple methods and symmetric algos
     for (file_name, method, num_certs) in [
         ("cert_smime.pem", EncryptionMethod::SMIME, 3),
         ("cert_pgp.pem", EncryptionMethod::PGP, 1),
     ] {
-        params.insert(
-            "certificate".to_string(),
-            std::fs::read(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources")
-                    .join("crypto")
-                    .join(file_name),
-            )
-            .unwrap(),
-        );
+        let certs = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("crypto")
+                .join(file_name),
+        )
+        .unwrap();
 
         for algo in [Algorithm::Aes128, Algorithm::Aes256] {
-            let encryption = format!(
-                "{}-{}",
-                match method {
-                    EncryptionMethod::PGP => "pgp",
-                    EncryptionMethod::SMIME => "smime",
+            let request = match method {
+                EncryptionMethod::PGP => EncryptionType::PGP {
+                    algo,
+                    certs: certs.clone(),
                 },
-                match algo {
-                    Algorithm::Aes128 => "128",
-                    Algorithm::Aes256 => "256",
-                }
+                EncryptionMethod::SMIME => EncryptionType::SMIME {
+                    algo,
+                    certs: certs.clone(),
+                },
+            };
+
+            assert_eq!(
+                api.post::<u32>("/api/account/crypto", &request)
+                    .await
+                    .unwrap()
+                    .unwrap_data(),
+                num_certs
             );
-            params.insert("encryption".to_string(), encryption.as_bytes().to_vec());
-            let response = post(&params).await;
-            assert!(
-                response.contains(&format!("{num_certs} certificate")),
-                "got response {response}, expected {num_certs} certs"
-            );
-            assert!(
-                response.contains(&format!("{method} ({algo})")),
-                "got response {response}, expected {encryption} algo"
-            );
-            //println!("response = {response}");
         }
     }
 
@@ -143,12 +119,12 @@ pub async fn test(params: &mut JMAPTest) {
     .await;
 
     // Disable encryption
-    params.remove("certificate");
-    params.insert("encryption".to_string(), "disable".as_bytes().to_vec());
-    let response = post(&params).await;
-    assert!(
-        response.contains("Encryption at rest disabled"),
-        "got response {response}, expected 'Encryption at rest disabled'"
+    assert_eq!(
+        api.post::<Option<String>>("/api/account/crypto", &EncryptionType::Disabled)
+            .await
+            .unwrap()
+            .unwrap_data(),
+        None
     );
 
     // Send a new message, which should NOT be encrypted
@@ -200,13 +176,14 @@ pub async fn test(params: &mut JMAPTest) {
 
 #[tokio::test]
 pub async fn import_certs_and_encrypt() {
-    for (name, expected_method, expected_certs) in [
+    for (name, method, expected_certs) in [
         ("cert_pgp.pem", EncryptionMethod::PGP, 1),
         //("cert_pgp.der", EncryptionMethod::PGP, 1),
         ("cert_smime.pem", EncryptionMethod::SMIME, 3),
         ("cert_smime.der", EncryptionMethod::SMIME, 1),
     ] {
-        let (method, mut certs) = try_parse_certs(
+        let mut certs = try_parse_certs(
+            method,
             std::fs::read(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("resources")
@@ -217,7 +194,6 @@ pub async fn import_certs_and_encrypt() {
         )
         .expect(name);
 
-        assert_eq!(method, expected_method);
         assert_eq!(certs.len(), expected_certs);
 
         if method == EncryptionMethod::PGP && certs.len() == 2 {
@@ -243,6 +219,7 @@ pub async fn import_certs_and_encrypt() {
 
     // S/MIME and PGP should not be allowed mixed
     assert!(try_parse_certs(
+        EncryptionMethod::PGP,
         std::fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
@@ -264,7 +241,7 @@ pub fn check_is_encrypted() {
     )
     .unwrap();
 
-    for raw_message in messages.split("---") {
+    for raw_message in messages.split("!!!") {
         let is_encrypted = raw_message.contains("TRUE");
         let message = MessageParser::new()
             .parse(raw_message.trim().as_bytes())
@@ -276,42 +253,4 @@ pub fn check_is_encrypted() {
             "failed for {raw_message}"
         );
     }
-}
-
-async fn post(params: &AHashMap<String, Vec<u8>>) -> String {
-    let mut form = reqwest::multipart::Form::new();
-    for (key, value) in params {
-        form = if key != "certificate" {
-            form.text(
-                key.to_string(),
-                std::str::from_utf8(value).unwrap().to_string(),
-            )
-        } else {
-            form.part(
-                key.to_string(),
-                reqwest::multipart::Part::bytes(value.to_vec())
-                    .file_name("certificate")
-                    .mime_str("application/octet-stream")
-                    .unwrap(),
-            )
-        }
-    }
-
-    String::from_utf8(
-        reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default()
-            .post("https://127.0.0.1:8899/crypto")
-            .multipart(form)
-            .send()
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap()
 }

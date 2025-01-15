@@ -1,42 +1,24 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use ahash::AHashMap;
 use store::{
-    config::ConfigStore,
     write::{blob::BlobQuota, now, BatchBuilder, BlobOp},
-    BlobClass, BlobHash, BlobStore, Serialize,
+    BlobClass, BlobStore, Serialize, Stores,
 };
-use utils::config::Config;
+use utils::{config::Config, BlobHash};
 
 use crate::store::{TempDir, CONFIG};
 
 #[tokio::test]
 pub async fn blob_tests() {
     let temp_dir = TempDir::new("blob_tests", true);
-    let config =
-        Config::new(&CONFIG.replace("{TMP}", temp_dir.path.as_path().to_str().unwrap())).unwrap();
-    let stores = config.parse_stores().await.unwrap();
+    let mut config =
+        Config::new(CONFIG.replace("{TMP}", temp_dir.path.as_path().to_str().unwrap())).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
 
     for (store_id, blob_store) in &stores.blob_stores {
         println!("Testing blob store {}...", store_id);
@@ -93,7 +75,7 @@ pub async fn blob_tests() {
         // Blob hash should now exist
         assert!(store.blob_exists(&hash).await.unwrap());
         assert!(blob_store
-            .get_blob(hash.as_ref(), 0..u32::MAX)
+            .get_blob(hash.as_ref(), 0..usize::MAX)
             .await
             .unwrap()
             .is_some());
@@ -149,7 +131,7 @@ pub async fn blob_tests() {
 
         // Blob should no longer be in store
         assert!(blob_store
-            .get_blob(hash.as_ref(), 0..u32::MAX)
+            .get_blob(hash.as_ref(), 0..usize::MAX)
             .await
             .unwrap()
             .is_none());
@@ -269,7 +251,7 @@ pub async fn blob_tests() {
             assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
             assert!(
                 blob_store
-                    .get_blob(hash.as_ref(), 0..u32::MAX)
+                    .get_blob(hash.as_ref(), 0..usize::MAX)
                     .await
                     .unwrap()
                     .is_some()
@@ -356,7 +338,7 @@ pub async fn blob_tests() {
             assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
             assert!(
                 blob_store
-                    .get_blob(hash.as_ref(), 0..u32::MAX)
+                    .get_blob(hash.as_ref(), 0..usize::MAX)
                     .await
                     .unwrap()
                     .is_some()
@@ -410,7 +392,7 @@ pub async fn blob_tests() {
             assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
             assert!(
                 blob_store
-                    .get_blob(hash.as_ref(), 0..u32::MAX)
+                    .get_blob(hash.as_ref(), 0..usize::MAX)
                     .await
                     .unwrap()
                     .is_some()
@@ -430,7 +412,7 @@ async fn test_store(store: BlobStore) {
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 0..u32::MAX)
+                .get_blob(hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()
                 .unwrap()
@@ -451,7 +433,7 @@ async fn test_store(store: BlobStore) {
     );
     assert!(store.delete_blob(hash.as_slice()).await.unwrap());
     assert!(store
-        .get_blob(hash.as_slice(), 0..u32::MAX)
+        .get_blob(hash.as_slice(), 0..usize::MAX)
         .await
         .unwrap()
         .is_none());
@@ -468,7 +450,7 @@ async fn test_store(store: BlobStore) {
     assert_eq!(
         String::from_utf8(
             store
-                .get_blob(hash.as_slice(), 0..u32::MAX)
+                .get_blob(hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()
                 .unwrap()
@@ -490,7 +472,7 @@ async fn test_store(store: BlobStore) {
     );
     assert!(store.delete_blob(hash.as_slice()).await.unwrap());
     assert!(store
-        .get_blob(hash.as_slice(), 0..u32::MAX)
+        .get_blob(hash.as_slice(), 0..usize::MAX)
         .await
         .unwrap()
         .is_none());

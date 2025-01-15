@@ -1,34 +1,25 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::utils::{AsKey, ParseValue};
+use rustls::{crypto::ring::cipher_suite::*, SupportedCipherSuite};
+
+use super::utils::ParseValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpAddrMask {
     V4 { addr: Ipv4Addr, mask: u32 },
     V6 { addr: Ipv6Addr, mask: u128 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpAddrOrMask {
+    Ip(IpAddr),
+    Mask(IpAddrMask),
 }
 
 impl IpAddrMask {
@@ -83,7 +74,7 @@ impl IpAddrMask {
 }
 
 impl ParseValue for IpAddrMask {
-    fn parse_value(key: impl AsKey, value: &str) -> super::Result<Self> {
+    fn parse_value(value: &str) -> super::Result<Self> {
         if let Some((addr, mask)) = value.rsplit_once('/') {
             if let (Ok(addr), Ok(mask)) =
                 (addr.trim().parse::<IpAddr>(), mask.trim().parse::<u32>())
@@ -122,11 +113,48 @@ impl ParseValue for IpAddrMask {
             }
         }
 
-        Err(format!(
-            "Invalid IP address {:?} for property {:?}.",
-            value,
-            key.as_key()
-        ))
+        Err(format!("Invalid IP address {:?}", value,))
+    }
+}
+
+impl ParseValue for IpAddrOrMask {
+    fn parse_value(ip: &str) -> super::Result<Self> {
+        if ip.contains('/') {
+            IpAddrMask::parse_value(ip).map(IpAddrOrMask::Mask)
+        } else {
+            IpAddr::parse_value(ip).map(IpAddrOrMask::Ip)
+        }
+    }
+}
+
+impl ParseValue for SocketAddr {
+    fn parse_value(value: &str) -> super::Result<Self> {
+        value
+            .parse()
+            .map_err(|_| format!("Invalid socket address {:?}.", value,))
+    }
+}
+
+impl ParseValue for SupportedCipherSuite {
+    fn parse_value(value: &str) -> super::Result<Self> {
+        Ok(match value {
+            // TLS1.3 suites
+            "TLS13_AES_256_GCM_SHA384" => TLS13_AES_256_GCM_SHA384,
+            "TLS13_AES_128_GCM_SHA256" => TLS13_AES_128_GCM_SHA256,
+            "TLS13_CHACHA20_POLY1305_SHA256" => TLS13_CHACHA20_POLY1305_SHA256,
+            // TLS1.2 suites
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            cipher => return Err(format!("Unsupported TLS cipher suite {:?}", cipher,)),
+        })
     }
 }
 
@@ -141,7 +169,7 @@ mod tests {
             ("10.0.0.0/8", "10.0.13.73"),
             ("192.168.1.1", "192.168.1.1"),
         ] {
-            let mask = IpAddrMask::parse_value("test", mask).unwrap();
+            let mask = IpAddrMask::parse_value(mask).unwrap();
             let ip = ip.parse::<IpAddr>().unwrap();
             assert!(mask.matches(&ip));
         }
@@ -150,7 +178,7 @@ mod tests {
             ("10.0.0.0/8", "11.30.20.11"),
             ("192.168.1.1", "193.168.1.1"),
         ] {
-            let mask = IpAddrMask::parse_value("test", mask).unwrap();
+            let mask = IpAddrMask::parse_value(mask).unwrap();
             let ip = ip.parse::<IpAddr>().unwrap();
             assert!(!mask.matches(&ip));
         }

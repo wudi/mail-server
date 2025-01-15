@@ -1,102 +1,113 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use r2d2::Pool;
 use tokio::sync::oneshot;
-use utils::{
-    config::{utils::AsKey, Config},
-    UnwrapFailure,
-};
+use utils::config::{utils::AsKey, Config};
 
-use crate::{
-    SUBSPACE_BITMAPS, SUBSPACE_BLOBS, SUBSPACE_COUNTERS, SUBSPACE_INDEXES, SUBSPACE_LOGS,
-    SUBSPACE_VALUES,
-};
+use crate::*;
 
-use super::{pool::SqliteConnectionManager, SqliteStore};
+use super::{into_error, pool::SqliteConnectionManager, SqliteStore};
 
 impl SqliteStore {
-    pub async fn open(config: &Config, prefix: impl AsKey) -> crate::Result<Self> {
+    pub fn open(config: &mut Config, prefix: impl AsKey) -> Option<Self> {
         let prefix = prefix.as_key();
         let db = Self {
             conn_pool: Pool::builder()
                 .max_size(
                     config
-                        .property((&prefix, "pool.max-connections"))?
+                        .property((&prefix, "pool.max-connections"))
                         .unwrap_or_else(|| (num_cpus::get() * 4) as u32),
                 )
                 .build(
-                    SqliteConnectionManager::file(
-                        config
-                            .value_require((&prefix, "path"))
-                            .failed("Invalid configuration file"),
+                    SqliteConnectionManager::file(config.value_require((&prefix, "path"))?)
+                        .with_init(|c| {
+                            c.execute_batch(concat!(
+                                "PRAGMA journal_mode = WAL; ",
+                                "PRAGMA synchronous = NORMAL; ",
+                                "PRAGMA temp_store = memory;",
+                                "PRAGMA busy_timeout = 30000;"
+                            ))
+                        }),
+                )
+                .map_err(|err| {
+                    config.new_build_error(
+                        prefix.as_str(),
+                        format!("Failed to build connection pool: {err}"),
                     )
-                    .with_init(|c| {
-                        c.execute_batch(concat!(
-                            "PRAGMA journal_mode = WAL; ",
-                            "PRAGMA synchronous = NORMAL; ",
-                            "PRAGMA temp_store = memory;",
-                            "PRAGMA busy_timeout = 30000;"
-                        ))
-                    }),
-                )?,
+                })
+                .ok()?,
             worker_pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(
+                .num_threads(std::cmp::max(
                     config
-                        .property::<usize>((&prefix, "pool.workers"))?
+                        .property::<usize>((&prefix, "pool.workers"))
                         .filter(|v| *v > 0)
                         .unwrap_or_else(num_cpus::get),
-                )
+                    4,
+                ))
                 .build()
                 .map_err(|err| {
-                    crate::Error::InternalError(format!("Failed to build worker pool: {}", err))
-                })?,
+                    config.new_build_error(
+                        prefix.as_str(),
+                        format!("Failed to build worker pool: {err}"),
+                    )
+                })
+                .ok()?,
         };
-        db.create_tables()?;
-        Ok(db)
+
+        if let Err(err) = db.create_tables() {
+            config.new_build_error(prefix.as_str(), format!("Failed to create tables: {err}"));
+        }
+
+        Some(db)
     }
 
     #[cfg(feature = "test_mode")]
-    pub fn open_memory() -> crate::Result<Self> {
+    pub fn open_memory() -> trc::Result<Self> {
+        use super::into_error;
+
         let db = Self {
             conn_pool: Pool::builder()
                 .max_size(1)
-                .build(SqliteConnectionManager::memory())?,
+                .build(SqliteConnectionManager::memory())
+                .map_err(into_error)?,
             worker_pool: rayon::ThreadPoolBuilder::new()
                 .num_threads(num_cpus::get())
                 .build()
                 .map_err(|err| {
-                    crate::Error::InternalError(format!("Failed to build worker pool: {}", err))
+                    into_error(err).ctx(trc::Key::Reason, "Failed to build worker pool")
                 })?,
         };
         db.create_tables()?;
         Ok(db)
     }
 
-    pub(super) fn create_tables(&self) -> crate::Result<()> {
-        let conn = self.conn_pool.get()?;
+    pub(super) fn create_tables(&self) -> trc::Result<()> {
+        let conn = self.conn_pool.get().map_err(into_error)?;
 
-        for table in [SUBSPACE_VALUES, SUBSPACE_LOGS, SUBSPACE_BLOBS] {
+        for table in [
+            SUBSPACE_ACL,
+            SUBSPACE_DIRECTORY,
+            SUBSPACE_TASK_QUEUE,
+            SUBSPACE_BLOB_RESERVE,
+            SUBSPACE_BLOB_LINK,
+            SUBSPACE_IN_MEMORY_VALUE,
+            SUBSPACE_PROPERTY,
+            SUBSPACE_SETTINGS,
+            SUBSPACE_QUEUE_MESSAGE,
+            SUBSPACE_QUEUE_EVENT,
+            SUBSPACE_REPORT_OUT,
+            SUBSPACE_REPORT_IN,
+            SUBSPACE_FTS_INDEX,
+            SUBSPACE_LOGS,
+            SUBSPACE_BLOBS,
+            SUBSPACE_TELEMETRY_SPAN,
+            SUBSPACE_TELEMETRY_METRIC,
+            SUBSPACE_TELEMETRY_INDEX,
+        ] {
             let table = char::from(table);
             conn.execute(
                 &format!(
@@ -106,10 +117,16 @@ impl SqliteStore {
                     )"
                 ),
                 [],
-            )?;
+            )
+            .map_err(into_error)?;
         }
 
-        for table in [SUBSPACE_INDEXES, SUBSPACE_BITMAPS] {
+        for table in [
+            SUBSPACE_INDEXES,
+            SUBSPACE_BITMAP_ID,
+            SUBSPACE_BITMAP_TAG,
+            SUBSPACE_BITMAP_TEXT,
+        ] {
             let table = char::from(table);
             conn.execute(
                 &format!(
@@ -118,26 +135,30 @@ impl SqliteStore {
                     )"
                 ),
                 [],
-            )?;
+            )
+            .map_err(into_error)?;
         }
 
-        conn.execute(
-            &format!(
-                "CREATE TABLE IF NOT EXISTS {} (
+        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
+            conn.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {} (
                     k BLOB PRIMARY KEY,
                     v INTEGER NOT NULL DEFAULT 0
                 )",
-                char::from(SUBSPACE_COUNTERS)
-            ),
-            [],
-        )?;
+                    char::from(table)
+                ),
+                [],
+            )
+            .map_err(into_error)?;
+        }
 
         Ok(())
     }
 
-    pub async fn spawn_worker<U, V>(&self, mut f: U) -> crate::Result<V>
+    pub async fn spawn_worker<U, V>(&self, mut f: U) -> trc::Result<V>
     where
-        U: FnMut() -> crate::Result<V> + Send,
+        U: FnMut() -> trc::Result<V> + Send,
         V: Sync + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
@@ -150,10 +171,7 @@ impl SqliteStore {
 
         match rx.await {
             Ok(result) => result,
-            Err(err) => Err(crate::Error::InternalError(format!(
-                "Worker thread failed: {}",
-                err
-            ))),
+            Err(err) => Err(trc::EventType::Server(trc::ServerEvent::ThreadError).reason(err)),
         }
     }
 }

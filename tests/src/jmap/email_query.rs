@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{collections::hash_map::Entry, time::Instant};
 
@@ -27,15 +10,19 @@ use crate::{
     jmap::{assert_is_empty, mailbox::destroy_all_mailboxes, wait_for_index},
     store::{deflate_test_resource, query::FIELDS},
 };
+use jmap::JmapMethods;
 use jmap_client::{
     client::Client,
     core::query::{Comparator, Filter},
     email,
 };
-use jmap_proto::types::{collection::Collection, id::Id};
-use mail_parser::HeaderName;
+use jmap_proto::types::{collection::Collection, id::Id, property::Property};
+use mail_parser::{DateTime, HeaderName};
 
-use store::{ahash::AHashMap, write::BatchBuilder};
+use store::{
+    ahash::AHashMap,
+    write::{now, BatchBuilder, ValueClass},
+};
 
 use super::JMAPTest;
 
@@ -57,10 +44,10 @@ pub async fn test(params: &mut JMAPTest, insert: bool) {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Mailbox);
-        for mailbox_id in 0..99999 {
-            batch.create_document(mailbox_id);
+        for mailbox_id in 1545..3010 {
+            batch.create_document_with_id(mailbox_id);
         }
-        server.store.write(batch.build()).await.unwrap();
+        server.core.storage.data.write(batch.build()).await.unwrap();
 
         // Create test messages
         println!("Inserting JMAP Mail query test messages...");
@@ -71,30 +58,21 @@ pub async fn test(params: &mut JMAPTest, insert: bool) {
         batch
             .with_account_id(account_id)
             .with_collection(Collection::Mailbox);
-        for mailbox_id in 0..99999 {
-            batch.delete_document(mailbox_id);
+        for mailbox_id in 1545..3010 {
+            batch
+                .delete_document(mailbox_id)
+                .clear(ValueClass::Property(Property::EmailIds.into()));
         }
-        server.store.write(batch.build()).await.unwrap();
+        server.core.storage.data.write(batch.build()).await.unwrap();
 
-        for thread_id in 0..MAX_THREADS {
-            assert!(
-                client
-                    .thread_get(&Id::new(thread_id as u64).to_string())
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "thread {} not found",
-                thread_id
-            );
-        }
-
-        assert!(
-            client
-                .thread_get(&Id::new(MAX_THREADS as u64).to_string())
+        assert_eq!(
+            params
+                .server
+                .get_document_ids(account_id, Collection::Thread)
                 .await
                 .unwrap()
-                .is_none(),
-            "thread {} found",
+                .unwrap()
+                .len() as usize,
             MAX_THREADS
         );
 
@@ -131,7 +109,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::after(1850)),
                 (email::query::Filter::from("george")),
             ]),
-            vec![email::query::Comparator::subject()],
+            vec![
+                email::query::Comparator::subject(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "N01389", "T10115", "N00618", "N03500", "T01587", "T00397", "N01561", "N05250",
                 "N03973", "N04973", "N04057", "N01940", "N01539", "N01612", "N04484", "N01954",
@@ -143,7 +124,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::in_mailbox(Id::new(1768u64).to_string())),
                 (email::query::Filter::cc("canvas")),
             ]),
-            vec![email::query::Comparator::from()],
+            vec![
+                email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
+            ],
             vec!["T01882", "N04689", "T00925", "N00121"],
         ),
         (
@@ -159,7 +143,10 @@ pub async fn query(client: &mut Client) {
                     Id::new(1963).to_string(),
                 ])),
             ]),
-            vec![email::query::Comparator::subject()],
+            vec![
+                email::query::Comparator::subject(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "T10330", "N01744", "N01743", "N04885", "N02688", "N02122", "A00059", "A00058",
                 "N02123", "T00651", "T09439", "N05001", "T05848", "T05508",
@@ -171,7 +158,10 @@ pub async fn query(client: &mut Client) {
                 Filter::not(vec![(email::query::Filter::from("collins"))]),
                 (email::query::Filter::body("bequeathed")).into(),
             ]),
-            vec![email::query::Comparator::subject()],
+            vec![
+                email::query::Comparator::subject(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "N02640", "A01020", "N01250", "T03430", "N01800", "N00620", "N05250", "N04630",
                 "A01040",
@@ -179,7 +169,10 @@ pub async fn query(client: &mut Client) {
         ),
         (
             email::query::Filter::not_keyword("artist").into(),
-            vec![email::query::Comparator::subject()],
+            vec![
+                email::query::Comparator::subject(),
+                email::query::Comparator::sent_at(),
+            ],
             vec!["T08626", "T09334", "T09455", "N01737", "T10965"],
         ),
         (
@@ -188,7 +181,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::before(1972)),
                 (email::query::Filter::text("colour")),
             ]),
-            vec![email::query::Comparator::from()],
+            vec![
+                email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
+            ],
             vec!["T01745", "P01436", "P01437"],
         ),
         (
@@ -213,7 +209,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::all_in_thread_have_keyword("N")),
                 (email::query::Filter::before(1800)),
             ]),
-            vec![email::query::Comparator::from()],
+            vec![
+                email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "N01496", "N05916", "N01046", "N00675", "N01320", "N01321", "N00273", "N01453",
                 "N02984",
@@ -224,7 +223,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::none_in_thread_have_keyword("N")),
                 (email::query::Filter::after(1995)),
             ]),
-            vec![email::query::Comparator::from()],
+            vec![
+                email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "AR00163", "AR00164", "AR00472", "P11481", "AR00066", "AR00178", "P77895",
                 "P77896", "P77897",
@@ -235,7 +237,10 @@ pub async fn query(client: &mut Client) {
                 (email::query::Filter::some_in_thread_have_keyword("Bronze")),
                 (email::query::Filter::before(1878)),
             ]),
-            vec![email::query::Comparator::from()],
+            vec![
+                email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
+            ],
             vec![
                 "N04326", "N01610", "N02920", "N01587", "T00167", "T00168", "N01554", "N01535",
                 "N01536", "N01622", "N01754", "N01594",
@@ -247,6 +252,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::all_in_thread_have_keyword("N"),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "N01496", "N05916", "N01046", "N00675", "N01320", "N01321", "N00273", "N01453",
@@ -261,6 +267,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::all_in_thread_have_keyword("N").descending(),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "T09417", "T01882", "T08820", "N04689", "T08891", "T00986", "N00316", "N03544",
@@ -278,6 +285,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::some_in_thread_have_keyword("Bronze"),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "N04326", "N01610", "N02920", "N01587", "T00167", "T00168", "N01554", "N01535",
@@ -293,6 +301,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::some_in_thread_have_keyword("Bronze").descending(),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "N01559", "N02123", "N01940", "N03594", "N01494", "N04271", "N04326", "N01610",
@@ -309,6 +318,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::has_keyword("attributed to"),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "T09455", "T09334", "T10965", "T08626", "T09417", "T08951", "T01851", "T01852",
@@ -328,6 +338,7 @@ pub async fn query(client: &mut Client) {
             vec![
                 email::query::Comparator::has_keyword("attributed to").descending(),
                 email::query::Comparator::from(),
+                email::query::Comparator::sent_at(),
             ],
             vec![
                 "T09417", "T08951", "T01851", "T01852", "T08761", "T08123", "T08756", "T10561",
@@ -393,6 +404,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: None,
@@ -414,6 +426,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 10,
                 anchor: None,
@@ -435,6 +448,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: -10,
                 anchor: None,
@@ -456,6 +470,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: -20,
                 anchor: None,
@@ -477,6 +492,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: -100000,
                 anchor: None,
@@ -492,6 +508,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: -1,
                 anchor: None,
@@ -507,6 +524,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "N01205").await,
@@ -528,6 +546,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "N01205").await,
@@ -549,6 +568,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "N01205").await,
@@ -570,6 +590,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "N01496").await,
@@ -585,6 +606,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "AR00164").await,
@@ -600,6 +622,7 @@ pub async fn query_options(client: &mut Client) {
                 sort: vec![
                     email::query::Comparator::subject(),
                     email::query::Comparator::from(),
+                    email::query::Comparator::sent_at(),
                 ],
                 position: 0,
                 anchor: get_anchor(client, "AR00164").await,
@@ -669,6 +692,7 @@ pub async fn query_options(client: &mut Client) {
 }
 
 pub async fn create(client: &mut Client) {
+    let sent_at = now();
     let now = Instant::now();
     let mut fields = AHashMap::default();
     for (field_num, field) in FIELDS.iter().enumerate() {
@@ -680,10 +704,11 @@ pub async fn create(client: &mut Client) {
     let mut thread_count = AHashMap::default();
     let mut artist_count = AHashMap::default();
 
-    'outer: for record in csv::ReaderBuilder::new()
+    'outer: for (idx, record) in csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(&deflate_test_resource("artwork_data.csv.gz")[..])
         .records()
+        .enumerate()
     {
         let record = record.unwrap();
         let mut values_str = AHashMap::default();
@@ -747,10 +772,11 @@ pub async fn create(client: &mut Client) {
             .email_import(
                 format!(
                     concat!(
-                "From: \"{}\" <artist@domain.com>\nCc: \"{}\" <cc@domain.com>\nMessage-ID: <{}>\n",
-                "References: <{}>\nComments: {}\nSubject: [{}]",
-                " Year {}\n\n{}\n{}\n"
-            ),
+                        "Date: {}\nFrom: \"{}\" <artist@domain.com>\nCc: \"{}\" <cc@domain.com>\nMessage-ID: <{}>\n",
+                        "References: <{}>\nComments: {}\nSubject: [{}]",
+                        " Year {}\n\n{}\n{}\n"
+                    ),
+                    DateTime::from_timestamp(sent_at as i64 + idx as i64).to_rfc822(),
                     values_str["artist"],
                     values_str["medium"],
                     values_str["accession_number"],

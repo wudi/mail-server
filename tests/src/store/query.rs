@@ -1,28 +1,12 @@
 /*
- * Copyright (c) 2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     fmt::Display,
+    io::Write,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -155,7 +139,7 @@ pub async fn test(db: Store, fts_store: FtsStore, do_insert: bool) {
                     builder
                         .with_account_id(0)
                         .with_collection(COLLECTION_ID)
-                        .create_document(document_id as u32);
+                        .create_document_with_id(document_id as u32);
                     for (pos, field) in record.iter().enumerate() {
                         let field_id = pos as u8;
                         match FIELDS_OPTIONS[pos] {
@@ -218,6 +202,7 @@ pub async fn test(db: Store, fts_store: FtsStore, do_insert: bool) {
         let mut chunk = Vec::new();
         let mut fts_chunk = Vec::new();
 
+        print!("Inserting... ",);
         for (batch, fts_batch) in batches {
             let chunk_instance = Instant::now();
             chunk.push({
@@ -235,10 +220,8 @@ pub async fn test(db: Store, fts_store: FtsStore, do_insert: bool) {
                 for handle in fts_chunk {
                     handle.await.unwrap().unwrap();
                 }
-                println!(
-                    "Store insert took {} ms.",
-                    chunk_instance.elapsed().as_millis()
-                );
+                print!(" [{} ms]", chunk_instance.elapsed().as_millis());
+                std::io::stdout().flush().unwrap();
                 chunk = Vec::new();
                 fts_chunk = Vec::new();
             }
@@ -250,14 +233,18 @@ pub async fn test(db: Store, fts_store: FtsStore, do_insert: bool) {
             }
         }
 
-        println!("Insert took {} ms.", now.elapsed().as_millis());
+        println!("\nInsert took {} ms.", now.elapsed().as_millis());
     }
 
     println!("Running filter tests...");
+    let now = Instant::now();
     test_filter(db.clone(), fts_store).await;
+    println!("Filtering took {} ms.", now.elapsed().as_millis());
 
     println!("Running sort tests...");
+    let now = Instant::now();
     test_sort(db).await;
+    println!("Sorting took {} ms.", now.elapsed().as_millis());
 }
 
 pub async fn test_filter(db: Store, fts: FtsStore) {
@@ -459,26 +446,21 @@ pub async fn test_filter(db: Store, fts: FtsStore) {
             .await
             .unwrap();
 
-        assert_eq!(
-            db.get_values::<String>(
-                sorted_docset
-                    .ids
-                    .into_iter()
-                    .map(|document_id| ValueKey {
-                        account_id: 0,
-                        collection: COLLECTION_ID,
-                        document_id: document_id as u32,
-                        class: ValueClass::Property(fields_u8["accession_number"])
-                    })
-                    .collect()
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>(),
-            expected_results
-        );
+        let mut results = Vec::new();
+        for document_id in sorted_docset.ids {
+            results.push(
+                db.get_value::<String>(ValueKey {
+                    account_id: 0,
+                    collection: COLLECTION_ID,
+                    document_id: document_id as u32,
+                    class: ValueClass::Property(fields_u8["accession_number"]),
+                })
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        assert_eq!(results, expected_results);
     }
 }
 
@@ -554,25 +536,20 @@ pub async fn test_sort(db: Store) {
             .await
             .unwrap();
 
-        assert_eq!(
-            db.get_values::<String>(
-                sorted_docset
-                    .ids
-                    .into_iter()
-                    .map(|document_id| ValueKey {
-                        account_id: 0,
-                        collection: COLLECTION_ID,
-                        document_id: document_id as u32,
-                        class: ValueClass::Property(fields["accession_number"])
-                    })
-                    .collect()
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>(),
-            expected_results
-        );
+        let mut results = Vec::new();
+        for document_id in sorted_docset.ids {
+            results.push(
+                db.get_value::<String>(ValueKey {
+                    account_id: 0,
+                    collection: COLLECTION_ID,
+                    document_id: document_id as u32,
+                    class: ValueClass::Property(fields["accession_number"]),
+                })
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+        }
+        assert_eq!(results, expected_results);
     }
 }

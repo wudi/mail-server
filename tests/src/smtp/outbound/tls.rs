@@ -1,66 +1,61 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
+use common::config::server::ServerProtocol;
 use mail_auth::MX;
-use utils::config::ServerProtocol;
+use store::write::now;
 
 use crate::smtp::{
-    inbound::{TestMessage, TestQueueEvent},
-    outbound::start_test_server,
+    inbound::TestMessage,
     session::{TestSession, VerifyResponse},
-    TestConfig, TestSMTP,
+    DnsCache, TestSMTP,
 };
-use smtp::{
-    config::{IfBlock, RequireOptional},
-    core::{Session, SMTP},
-    queue::{manager::Queue, DeliveryAttempt},
-};
+
+const LOCAL: &str = r#"
+[session.rcpt]
+relay = true
+
+[queue.outbound]
+hostname = "'badtls.foobar.org'"
+
+[queue.outbound.tls]
+starttls = [ { if = "retry_num > 0 && last_error == 'tls'", then = "disable"},
+             { else = "optional" }]
+"#;
+
+const REMOTE: &str = r#"
+[session.rcpt]
+relay = true
+
+[session.ehlo]
+reject-non-fqdn = false
+
+[session.extensions]
+dsn = true
+chunking = false
+"#;
 
 #[tokio::test]
 #[serial_test::serial]
 async fn starttls_optional() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Start test server
-    let mut core = SMTP::test();
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    let mut remote_qr = core.init_test_queue("smtp_starttls_remote");
-    let _rx = start_test_server(core.into(), &[ServerProtocol::Smtp]);
+    let mut remote = TestSMTP::new("smtp_starttls_remote", REMOTE).await;
+    let _rx = remote.start(&[ServerProtocol::Smtp]).await;
+
+    // Retry on failed STARTTLS
+    let mut local = TestSMTP::new("smtp_starttls_local", LOCAL).await;
 
     // Add mock DNS entries
-    let mut core = SMTP::test();
-    core.queue.config.hostname = IfBlock::new("badtls.foobar.org".to_string());
-    core.resolvers.dns.mx_add(
+    let core = local.build_smtp();
+    core.mx_add(
         "foobar.org",
         vec![MX {
             exchanges: vec!["mx.foobar.org".to_string()],
@@ -68,40 +63,43 @@ async fn starttls_optional() {
         }],
         Instant::now() + Duration::from_secs(10),
     );
-    core.resolvers.dns.ipv4_add(
+    core.ipv4_add(
         "mx.foobar.org",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + Duration::from_secs(10),
     );
 
-    // Retry on failed STARTTLS
-    let mut local_qr = core.init_test_queue("smtp_starttls_local");
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    core.queue.config.tls.start = IfBlock::new(RequireOptional::Optional);
-
-    let core = Arc::new(core);
-    let mut queue = Queue::default();
-    let mut session = Session::test(core.clone());
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = local.new_session();
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("mx.test.org").await;
     session
         .send_message("john@test.org", &["bill@foobar.org"], "test:no_dkim", "250")
         .await;
-    DeliveryAttempt::from(local_qr.read_event().await.unwrap_message())
-        .try_deliver(core.clone(), &mut queue)
-        .await;
-    let mut retry = local_qr.read_event().await.unwrap_retry();
-    assert!(retry.inner.domains[0].disable_tls);
-    retry.inner.domains[0].retry.due = Instant::now();
-    DeliveryAttempt::from(retry.inner)
-        .try_deliver(core.clone(), &mut queue)
-        .await;
-    local_qr.read_event().await.unwrap_done();
-    remote_qr
-        .read_event()
+    local
+        .queue_receiver
+        .expect_message_then_deliver()
         .await
-        .unwrap_message()
-        .read_lines()
+        .try_deliver(core.clone());
+    let mut retry = local.queue_receiver.expect_message().await;
+    let prev_due = retry.domains[0].retry.due;
+    let next_due = now();
+    let queue_id = retry.queue_id;
+    retry.domains[0].retry.due = next_due;
+    retry
+        .save_changes(&core, prev_due.into(), next_due.into())
+        .await;
+    local
+        .queue_receiver
+        .delivery_attempt(queue_id)
+        .await
+        .try_deliver(core.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    remote
+        .queue_receiver
+        .expect_message()
+        .await
+        .read_lines(&remote.queue_receiver)
+        .await
         .assert_not_contains("using TLSv1.3 with cipher");
 }

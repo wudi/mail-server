@@ -1,28 +1,12 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::{BufRead, Write},
     time::Duration,
 };
@@ -47,6 +31,7 @@ async fn main() -> std::io::Result<()> {
     let url = args
         .url
         .or_else(|| std::env::var("URL").ok())
+        .map(|url| url.trim_end_matches('/').to_string())
         .unwrap_or_else(|| {
             eprintln!("No URL specified. Use --url or set the URL environment variable.");
             std::process::exit(1);
@@ -79,10 +64,10 @@ async fn main() -> std::io::Result<()> {
             command.exec(client).await;
         }
         Commands::Server(command) => command.exec(client).await,
-        Commands::Account(command) => command.exec(client).await,
+        /*Commands::Account(command) => command.exec(client).await,
         Commands::Domain(command) => command.exec(client).await,
         Commands::List(command) => command.exec(client).await,
-        Commands::Group(command) => command.exec(client).await,
+        Commands::Group(command) => command.exec(client).await,*/
         Commands::Queue(command) => command.exec(client).await,
         Commands::Report(command) => command.exec(client).await,
     }
@@ -104,7 +89,7 @@ async fn oauth(url: &str) -> Credentials {
             .danger_accept_invalid_certs(is_localhost(url))
             .build()
             .unwrap_or_default()
-            .get(&format!("{}/.well-known/oauth-authorization-server", url))
+            .get(format!("{}/.well-known/oauth-authorization-server", url))
             .send()
             .await
             .unwrap_result("send OAuth GET request")
@@ -184,8 +169,20 @@ async fn oauth(url: &str) -> Credentials {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum Response<T> {
+    Error(ManagementApiError),
     Data { data: T },
-    Error { error: String, details: String },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "error")]
+#[serde(rename_all = "camelCase")]
+pub enum ManagementApiError {
+    FieldAlreadyExists { field: String, value: String },
+    FieldMissing { field: String },
+    NotFound { item: String },
+    Unsupported { details: String },
+    AssertFailed,
+    Other { details: String },
 }
 
 impl Client {
@@ -208,6 +205,20 @@ impl Client {
         url: &str,
         body: Option<B>,
     ) -> R {
+        self.try_http_request(method, url, body)
+            .await
+            .unwrap_or_else(|| {
+                eprintln!("Request failed: No data returned.");
+                std::process::exit(1);
+            })
+    }
+
+    pub async fn try_http_request<R: DeserializeOwned, B: Serialize>(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<B>,
+    ) -> Option<R> {
         let url = format!(
             "{}{}{}",
             self.url,
@@ -240,6 +251,9 @@ impl Client {
 
         match response.status() {
             StatusCode::OK => (),
+            StatusCode::NOT_FOUND => {
+                return None;
+            }
             StatusCode::UNAUTHORIZED => {
                 eprintln!("Authentication failed. Make sure the credentials are correct and that the account has administrator rights.");
                 std::process::exit(1);
@@ -253,15 +267,40 @@ impl Client {
             }
         }
 
-        match serde_json::from_slice::<Response<R>>(
-            &response.bytes().await.unwrap_result("fetch bytes"),
-        )
-        .unwrap_result("deserialize response")
-        {
-            Response::Data { data } => data,
-            Response::Error { error, details } => {
-                eprintln!("Request failed: {details} ({error:?})");
+        let bytes = response.bytes().await.unwrap_result("fetch bytes");
+        match serde_json::from_slice::<Response<R>>(&bytes).unwrap_result(&format!(
+            "deserialize response {}",
+            String::from_utf8_lossy(bytes.as_ref())
+        )) {
+            Response::Data { data } => Some(data),
+            Response::Error(error) => {
+                eprintln!("Request failed: {error})");
                 std::process::exit(1);
+            }
+        }
+    }
+}
+
+impl Display for ManagementApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManagementApiError::FieldAlreadyExists { field, value } => {
+                write!(f, "Field {} already exists with value {}.", field, value)
+            }
+            ManagementApiError::FieldMissing { field } => {
+                write!(f, "Field {} is missing.", field)
+            }
+            ManagementApiError::NotFound { item } => {
+                write!(f, "{} not found.", item)
+            }
+            ManagementApiError::Unsupported { details } => {
+                write!(f, "Unsupported: {}", details)
+            }
+            ManagementApiError::AssertFailed => {
+                write!(f, "Assertion failed.")
+            }
+            ManagementApiError::Other { details } => {
+                write!(f, "{}", details)
             }
         }
     }

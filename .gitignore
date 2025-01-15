@@ -1,8 +1,8 @@
 /target
 .vscode
+.idea
 *.failed
 *_failed
-stalwart.toml
 run.sh
 _ignore
 .DS_Store

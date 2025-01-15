@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 #![allow(dead_code)]
 
@@ -28,7 +11,10 @@ use std::{borrow::Borrow, io::Write};
 pub trait Leb128_ {
     fn to_leb128_writer(self, out: &mut impl Write) -> std::io::Result<usize>;
     fn to_leb128_bytes(self, out: &mut Vec<u8>);
-    fn from_leb128_bytes(slice: &[u8]) -> Option<(Self, usize)>
+    fn from_leb128_bytes_pos(slice: &[u8]) -> Option<(Self, usize)>
+    where
+        Self: std::marker::Sized;
+    fn from_leb128_bytes(slice: &[u8]) -> Option<Self>
     where
         Self: std::marker::Sized;
     fn from_leb128_it<T, I>(it: T) -> Option<Self>
@@ -79,7 +65,7 @@ where
 pub trait Leb128Reader: AsRef<[u8]> {
     #[inline(always)]
     fn read_leb128<T: Leb128_>(&self) -> Option<(T, usize)> {
-        T::from_leb128_bytes(self.as_ref())
+        T::from_leb128_bytes_pos(self.as_ref())
     }
 
     #[inline(always)]
@@ -133,13 +119,29 @@ macro_rules! impl_unsigned_leb128 {
             }
 
             #[inline(always)]
-            fn from_leb128_bytes(slice: &[u8]) -> Option<($int_ty, usize)> {
+            fn from_leb128_bytes_pos(slice: &[u8]) -> Option<($int_ty, usize)> {
                 let mut result = 0;
 
                 for (shift, (pos, &byte)) in $shifts.into_iter().zip(slice.iter().enumerate()) {
                     if (byte & 0x80) == 0 {
                         result |= (byte as $int_ty) << shift;
                         return Some((result, pos + 1));
+                    } else {
+                        result |= ((byte & 0x7F) as $int_ty) << shift;
+                    }
+                }
+
+                None
+            }
+
+            #[inline(always)]
+            fn from_leb128_bytes(slice: &[u8]) -> Option<$int_ty> {
+                let mut result = 0;
+
+                for (shift, &byte) in $shifts.into_iter().zip(slice.iter()) {
+                    if (byte & 0x80) == 0 {
+                        result |= (byte as $int_ty) << shift;
+                        return Some(result);
                     } else {
                         result |= ((byte & 0x7F) as $int_ty) << shift;
                     }

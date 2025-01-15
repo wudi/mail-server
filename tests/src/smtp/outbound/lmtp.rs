@@ -1,45 +1,53 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use crate::smtp::{
-    inbound::{TestMessage, TestQueueEvent},
-    outbound::start_test_server,
+    inbound::TestMessage,
     session::{TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig, TestSMTP,
+    DnsCache, TestSMTP,
 };
-use smtp::{
-    config::{remote::ConfigHost, ConfigContext, IfBlock},
-    core::{Session, SMTP},
-    queue::{manager::Queue, DeliveryAttempt, Event, WorkerResult},
-};
-use utils::config::{Config, ServerProtocol};
+use common::{config::server::ServerProtocol, ipc::QueueEvent};
+use smtp::queue::{spool::SmtpSpool, DeliveryAttempt};
+use store::write::now;
 
 const REMOTE: &str = "
+[session.ehlo]
+reject-non-fqdn = false
+
+[session.rcpt]
+relay = true
+
+[session.extensions]
+dsn = true
+";
+
+const LOCAL: &str = r#"
+[queue.outbound]
+next-hop = [{if = "rcpt_domain = 'foobar.org'", then = "'lmtp'"},
+            {else = false}]
+
+[session.rcpt]
+relay = true
+max-recipients = 100
+
+[session.extensions]
+dsn = true
+
+[queue.schedule]
+retry = "1s"
+notify = [{if = "rcpt_domain = 'foobar.org'", then = "[1s, 2s]"},
+          {else = [1s]}]
+expire = [{if = "rcpt_domain = 'foobar.org'", then = "4s"},
+          {else = "5s"}]
+
+[queue.outbound.timeouts]
+data = "50ms"
+
 [remote.lmtp]
 address = lmtp.foobar.org
 port = 9924
@@ -49,61 +57,31 @@ concurrency = 5
 [remote.lmtp.tls]
 implicit = true
 allow-invalid-certs = true
-";
+"#;
 
 #[tokio::test]
 #[serial_test::serial]
 async fn lmtp_delivery() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Start test server
-    let mut core = SMTP::test();
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    core.session.config.extensions.dsn = IfBlock::new(true);
-    let mut remote_qr = core.init_test_queue("lmtp_delivery_remote");
-    let _rx = start_test_server(core.into(), &[ServerProtocol::Lmtp]);
+    let mut remote = TestSMTP::new("lmtp_delivery_remote", REMOTE).await;
+    let _rx = remote.start(&[ServerProtocol::Lmtp]).await;
+
+    // Multiple delivery attempts
+    let mut local = TestSMTP::new("lmtp_delivery_local", LOCAL).await;
 
     // Add mock DNS entries
-    let mut core = SMTP::test();
-    core.resolvers.dns.ipv4_add(
+    let core = local.build_smtp();
+    core.ipv4_add(
         "lmtp.foobar.org",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + Duration::from_secs(10),
     );
 
-    // Multiple delivery attempts
-    let mut local_qr = core.init_test_queue("lmtp_delivery_local");
-
-    let mut ctx = ConfigContext::new(&[]);
-    let config = Config::new(REMOTE).unwrap();
-    config.parse_remote_hosts(&mut ctx).unwrap();
-    core.queue.config.next_hop = "[{if = 'rcpt-domain', eq = 'foobar.org', then = 'lmtp'},
-    {else = false}]"
-        .parse_if::<Option<String>>(&ctx)
-        .into_relay_host(&ctx)
-        .unwrap();
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    core.session.config.rcpt.max_recipients = IfBlock::new(100);
-    core.session.config.extensions.dsn = IfBlock::new(true);
-    let config = &mut core.queue.config;
-    config.retry = IfBlock::new(vec![Duration::from_millis(100)]);
-    config.notify = "[{if = 'rcpt-domain', eq = 'foobar.org', then = ['100ms', '200ms']},
-    {else = ['100ms']}]"
-        .parse_if(&ctx);
-    config.expire = "[{if = 'rcpt-domain', eq = 'foobar.org', then = '400ms'},
-    {else = '500ms'}]"
-        .parse_if(&ctx);
-    config.timeout.data = IfBlock::new(Duration::from_millis(50));
-
-    let core = Arc::new(core);
-    let mut queue = Queue::default();
-    let mut session = Session::test(core.clone());
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = local.new_session();
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("mx.test.org").await;
     session
@@ -121,43 +99,48 @@ async fn lmtp_delivery() {
             "250",
         )
         .await;
-    DeliveryAttempt::from(local_qr.read_event().await.unwrap_message())
-        .try_deliver(core.clone(), &mut queue)
-        .await;
+    local
+        .queue_receiver
+        .expect_message_then_deliver()
+        .await
+        .try_deliver(core.clone());
     let mut dsn = Vec::new();
     loop {
-        match local_qr.try_read_event().await {
-            Some(Event::Queue(message)) => {
-                dsn.push(message.inner);
-            }
-            Some(Event::Done(wr)) => match wr {
-                WorkerResult::Done => {
-                    break;
-                }
-                WorkerResult::Retry(retry) => {
-                    queue.schedule(retry);
-                }
-                WorkerResult::OnHold(_) => unreachable!(),
-            },
-            None | Some(Event::Stop) => break,
-            Some(Event::Manage(_)) => unreachable!(),
+        match local.queue_receiver.try_read_event().await {
+            Some(QueueEvent::Refresh | QueueEvent::WorkerDone { .. }) => {}
+            Some(QueueEvent::Paused(_)) => unreachable!(),
+            None | Some(QueueEvent::Stop) => break,
         }
 
-        if !queue.scheduled.is_empty() {
-            tokio::time::sleep(queue.wake_up_time()).await;
-            DeliveryAttempt::from(queue.next_due().unwrap())
-                .try_deliver(core.clone(), &mut queue)
-                .await;
+        let events = core.next_event().await;
+        if events.is_empty() {
+            break;
+        }
+        let now = now();
+        for event in events {
+            if event.due > now {
+                tokio::time::sleep(Duration::from_secs(event.due - now)).await;
+            }
+
+            let message = core.read_message(event.queue_id).await.unwrap();
+            if message.return_path.is_empty() {
+                message.clone().remove(&core, event.due).await;
+                dsn.push(message);
+            } else {
+                DeliveryAttempt::new(event).try_deliver(core.clone());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
-    assert!(queue.scheduled.is_empty());
+    local.queue_receiver.assert_queue_is_empty().await;
     assert_eq!(dsn.len(), 4);
 
     let mut dsn = dsn.into_iter();
 
     dsn.next()
         .unwrap()
-        .read_lines()
+        .read_lines(&local.queue_receiver)
+        .await
         .assert_contains("<bill@foobar.org> (delivered to")
         .assert_contains("<jane@foobar.org> (delivered to")
         .assert_contains("<john@foobar.org> (delivered to")
@@ -166,27 +149,30 @@ async fn lmtp_delivery() {
 
     dsn.next()
         .unwrap()
-        .read_lines()
+        .read_lines(&local.queue_receiver)
+        .await
         .assert_contains("<delay@foobar.org> (host 'lmtp.foobar.org' rejected")
         .assert_contains("Action: delayed");
 
     dsn.next()
         .unwrap()
-        .read_lines()
+        .read_lines(&local.queue_receiver)
+        .await
         .assert_contains("<delay@foobar.org> (host 'lmtp.foobar.org' rejected")
         .assert_contains("Action: delayed");
 
     dsn.next()
         .unwrap()
-        .read_lines()
+        .read_lines(&local.queue_receiver)
+        .await
         .assert_contains("<delay@foobar.org> (host 'lmtp.foobar.org' rejected")
         .assert_contains("Action: failed");
 
     assert_eq!(
-        remote_qr
-            .read_event()
+        remote
+            .queue_receiver
+            .expect_message()
             .await
-            .unwrap_message()
             .recipients
             .into_iter()
             .map(|r| r.address)
@@ -197,5 +183,5 @@ async fn lmtp_delivery() {
             "john@foobar.org".to_string()
         ]
     );
-    remote_qr.assert_empty_queue();
+    remote.queue_receiver.assert_no_events();
 }

@@ -1,29 +1,12 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::QueryBy;
+use common::Server;
+use directory::{backend::internal::PrincipalField, QueryBy};
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
@@ -32,17 +15,31 @@ use store::{
     roaring::RoaringBitmap,
     write::{BatchBuilder, F_VALUE},
 };
+use trc::AddContext;
+use utils::sanitize_email;
 
-use crate::JMAP;
+use crate::{changes::state::StateManager, JmapMethods};
 
-use super::set::sanitize_email;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn identity_get(
+pub trait IdentityGet: Sync + Send {
+    fn identity_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn identity_get_or_create(
+        &self,
+        account_id: u32,
+    ) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+}
+
+impl IdentityGet for Server {
+    async fn identity_get(
         &self,
         mut request: GetRequest<RequestArguments>,
-    ) -> Result<GetResponse, MethodError> {
-        let ids = request.unwrap_ids(self.config.get_max_objects)?;
+    ) -> trc::Result<GetResponse> {
+        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
             Property::Name,
@@ -60,7 +57,7 @@ impl JMAP {
         } else {
             identity_ids
                 .iter()
-                .take(self.config.get_max_objects)
+                .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
                 .collect::<Vec<_>>()
         };
@@ -81,7 +78,7 @@ impl JMAP {
                 response.not_found.push(id.into());
                 continue;
             }
-            let mut push = if let Some(push) = self
+            let mut identity = if let Some(identity) = self
                 .get_property::<Object<Value>>(
                     account_id,
                     Collection::Identity,
@@ -90,7 +87,7 @@ impl JMAP {
                 )
                 .await?
             {
-                push
+                identity
             } else {
                 response.not_found.push(id.into());
                 continue;
@@ -104,8 +101,17 @@ impl JMAP {
                     Property::MayDelete => {
                         result.append(Property::MayDelete, Value::Bool(true));
                     }
+                    Property::TextSignature | Property::HtmlSignature => {
+                        result.append(
+                            property.clone(),
+                            identity
+                                .properties
+                                .remove(property)
+                                .unwrap_or(Value::Text(String::new())),
+                        );
+                    }
                     property => {
-                        result.append(property.clone(), push.remove(property));
+                        result.append(property.clone(), identity.remove(property));
                     }
                 }
             }
@@ -115,10 +121,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn identity_get_or_create(
-        &self,
-        account_id: u32,
-    ) -> Result<RoaringBitmap, MethodError> {
+    async fn identity_get_or_create(&self, account_id: u32) -> trc::Result<RoaringBitmap> {
         let mut identity_ids = self
             .get_document_ids(account_id, Collection::Identity)
             .await?
@@ -129,19 +132,15 @@ impl JMAP {
 
         // Obtain principal
         let principal = self
+            .core
+            .storage
             .directory
             .query(QueryBy::Id(account_id), false)
             .await
-            .map_err(|err| {
-                tracing::error!(
-                    event = "error",
-                    context = "identity_get_or_create",
-                    error = ?err,
-                    "Failed to query directory.");
-                MethodError::ServerPartialFail
-            })?
+            .caused_by(trc::location!())?
             .unwrap_or_default();
-        if principal.emails.is_empty() {
+        let num_emails = principal.field_len(PrincipalField::Emails);
+        if num_emails == 0 {
             return Ok(identity_ids);
         }
 
@@ -152,19 +151,17 @@ impl JMAP {
 
         // Create identities
         let name = principal
-            .description
-            .unwrap_or(principal.name)
+            .description()
+            .unwrap_or(principal.name())
             .trim()
             .to_string();
-        let has_many = principal.emails.len() > 1;
-        for email in principal.emails {
-            let email = sanitize_email(&email).unwrap_or_default();
+        let has_many = num_emails > 1;
+        for (idx, email) in principal.iter_str(PrincipalField::Emails).enumerate() {
+            let document_id = idx as u32;
+            let email = sanitize_email(email).unwrap_or_default();
             if email.is_empty() {
                 continue;
             }
-            let identity_id = self
-                .assign_document_id(account_id, Collection::Identity)
-                .await?;
             let name = if name.is_empty() {
                 email.clone()
             } else if has_many {
@@ -172,23 +169,21 @@ impl JMAP {
             } else {
                 name.clone()
             };
-            batch.create_document(identity_id).value(
+            batch.create_document_with_id(document_id).value(
                 Property::Value,
                 Object::with_capacity(4)
                     .with_property(Property::Name, name)
                     .with_property(Property::Email, email),
                 F_VALUE,
             );
-            identity_ids.insert(identity_id);
+            identity_ids.insert(document_id);
         }
-        self.store.write(batch.build()).await.map_err(|err| {
-            tracing::error!(
-                event = "error",
-                context = "identity_get_or_create",
-                error = ?err,
-                "Failed to create identities.");
-            MethodError::ServerPartialFail
-        })?;
+        self.core
+            .storage
+            .data
+            .write(batch.build())
+            .await
+            .caused_by(trc::location!())?;
 
         Ok(identity_ids)
     }

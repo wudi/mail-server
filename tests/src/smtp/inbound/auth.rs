@@ -1,41 +1,35 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::core::config::ConfigDirectory;
-use smtp_proto::{AUTH_LOGIN, AUTH_PLAIN};
-use store::{Store, Stores};
-use utils::config::{Config, DynValue, Servers};
+use common::Core;
 
-use crate::smtp::{
-    session::{TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig,
+use store::Stores;
+use utils::config::Config;
+
+use crate::{
+    smtp::{
+        session::{TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
-use smtp::{
-    config::{ConfigContext, EnvelopeKey, IfBlock},
-    core::{Session, State, SMTP},
-};
+use smtp::core::{Session, State};
 
-const DIRECTORY: &str = r#"
+const CONFIG: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+directory = "local"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/queue.db"
+
 [directory."local"]
 type = "memory"
 
@@ -54,48 +48,40 @@ secret = "p4ssw0rd"
 email = "jane@example.org"
 email-list = ["info@example.org"]
 member-of = ["sales", "support"]
+
+[session.auth]
+require = [{if = "remote_ip = '10.0.0.1'", then = true},
+           {else = false}]
+mechanisms = [{if = "remote_ip = '10.0.0.1' && is_tls", then = "[plain, login]"},
+              {else = 0}]
+directory = [{if = "remote_ip = '10.0.0.1'", then = "'local'"},
+             {else = false}]
+must-match-sender = true
+
+[session.auth.errors]
+total = [{if = "remote_ip = '10.0.0.1'", then = 2},
+              {else = 3}]
+wait = "100ms"
+
+[session.extensions]
+future-release = [{if = '!is_empty(authenticated_as)', then = '1d'},
+                  {else = false}]
 "#;
 
 #[tokio::test]
 async fn auth() {
-    let mut core = SMTP::test();
-    let mut ctx = ConfigContext::new(&[]);
-    ctx.directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
+    // Enable logging
+    crate::enable_logging();
 
-    let config = &mut core.session.config.auth;
-
-    config.require = r"[{if = 'remote-ip', eq = '10.0.0.1', then = true},
-    {else = false}]"
-        .parse_if(&ctx);
-    config.directory = r"[{if = 'remote-ip', eq = '10.0.0.1', then = 'local'},
-    {else = false}]"
-        .parse_if::<Option<DynValue<EnvelopeKey>>>(&ctx)
-        .map_if_block(&ctx.directory.directories, "", "")
-        .unwrap();
-    config.errors_max = r"[{if = 'remote-ip', eq = '10.0.0.1', then = 2},
-    {else = 3}]"
-        .parse_if(&ctx);
-    config.errors_wait = "'100ms'".parse_if(&ctx);
-    config.mechanisms = format!(
-        "[{{if = 'remote-ip', eq = '10.0.0.1', then = {}}},
-    {{else = 0}}]",
-        AUTH_PLAIN | AUTH_LOGIN
-    )
-    .as_str()
-    .parse_if(&ctx);
-    config.must_match_sender = IfBlock::new(true);
-    core.session.config.extensions.future_release =
-        r"[{if = 'authenticated-as', ne = '', then = '1d'},
-    {else = false}]"
-            .parse_if(&ConfigContext::new(&[]));
+    let tmp_dir = TempDir::new("smtp_auth_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // EHLO should not advertise plain text auth without TLS
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.stream.tls = false;
     session
@@ -156,13 +142,13 @@ async fn auth() {
         .assert_contains("FUTURERELEASE 86400");
 
     // Successful LOGIN authentication
-    session.data.authenticated_as.clear();
+    session.data.authenticated_as.take();
     session.cmd("AUTH LOGIN", "334").await;
     session.cmd("amFuZQ==", "334").await;
     session.cmd("cDRzc3cwcmQ=", "235 2.7.0").await;
 
     // Login should not be advertised to 10.0.0.2
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.2".to_string();
     session.eval_session_params().await;
     session.stream.tls = true;
     session

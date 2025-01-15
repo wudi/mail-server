@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{io::Write, slice::Iter};
 
@@ -57,8 +40,12 @@ impl Base32Writer {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_raw_capacity((capacity + 3) / 4 * 5)
+    }
+
+    pub fn with_raw_capacity(capacity: usize) -> Self {
         Base32Writer {
-            result: String::with_capacity((capacity + 3) / 4 * 5),
+            result: String::with_capacity(capacity),
             last_byte: 0,
             pos: 0,
         }
@@ -66,6 +53,10 @@ impl Base32Writer {
 
     pub fn push_char(&mut self, ch: char) {
         self.result.push(ch);
+    }
+
+    pub fn push_string(&mut self, string: &str) {
+        self.result.push_str(string);
     }
 
     fn push_byte(&mut self, byte: u8, is_remainder: bool) {

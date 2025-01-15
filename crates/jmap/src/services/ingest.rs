@@ -1,40 +1,68 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::QueryBy;
+use common::{
+    ipc::{DeliveryResult, IngestMessage},
+    Server,
+};
+use directory::Permission;
 use jmap_proto::types::{state::StateChange, type_state::DataType};
 use mail_parser::MessageParser;
+use std::future::Future;
 use store::ahash::AHashMap;
-use utils::ipc::{DeliveryResult, IngestMessage};
 
-use crate::{email::ingest::IngestEmail, mailbox::INBOX_ID, IngestError, JMAP};
+use crate::{
+    email::{
+        bayes::EmailBayesTrain,
+        ingest::{EmailIngest, IngestEmail, IngestSource},
+    },
+    mailbox::INBOX_ID,
+    sieve::{get::SieveScriptGet, ingest::SieveScriptIngest},
+};
 
-impl JMAP {
-    pub async fn deliver_message(&self, message: IngestMessage) -> Vec<DeliveryResult> {
+use super::state::StateManager;
+
+pub trait MailDelivery: Sync + Send {
+    fn deliver_message(
+        &self,
+        message: IngestMessage,
+    ) -> impl Future<Output = Vec<DeliveryResult>> + Send;
+}
+
+impl MailDelivery for Server {
+    async fn deliver_message(&self, message: IngestMessage) -> Vec<DeliveryResult> {
         // Read message
-        let raw_message = match message.read_message().await {
-            Ok(raw_message) => raw_message,
-            Err(_) => {
+        let raw_message = match self
+            .core
+            .storage
+            .blob
+            .get_blob(message.message_blob.as_slice(), 0..usize::MAX)
+            .await
+        {
+            Ok(Some(raw_message)) => raw_message,
+            Ok(None) => {
+                trc::event!(
+                    MessageIngest(trc::MessageIngestEvent::Error),
+                    Reason = "Blob not found.",
+                    SpanId = message.session_id,
+                    CausedBy = trc::location!()
+                );
+
+                return (0..message.recipients.len())
+                    .map(|_| DeliveryResult::TemporaryFailure {
+                        reason: "Blob not found.".into(),
+                    })
+                    .collect::<Vec<_>>();
+            }
+            Err(err) => {
+                trc::error!(err
+                    .details("Failed to fetch message blob.")
+                    .span_id(message.session_id)
+                    .caused_by(trc::location!()));
+
                 return (0..message.recipients.len())
                     .map(|_| DeliveryResult::TemporaryFailure {
                         reason: "Temporary I/O error.".into(),
@@ -44,69 +72,89 @@ impl JMAP {
         };
 
         // Obtain the UIDs for each recipient
-        let mut recipients = Vec::with_capacity(message.recipients.len());
-        let mut deliver_names = AHashMap::with_capacity(message.recipients.len());
-        for rcpt in &message.recipients {
-            let uids = self.directory.email_to_ids(rcpt).await.unwrap_or_default();
-            for uid in &uids {
-                deliver_names.insert(*uid, (DeliveryResult::Success, rcpt));
-            }
-            recipients.push(uids);
-        }
-
-        // Deliver to each recipient
-        for (uid, (status, rcpt)) in &mut deliver_names {
-            // Check if there is an active sieve script
-            let result = match self.sieve_script_get_active(*uid).await {
-                Ok(Some(active_script)) => {
-                    self.sieve_script_ingest(
-                        &raw_message,
-                        &message.sender_address,
-                        rcpt,
-                        *uid,
-                        active_script,
-                    )
-                    .await
-                }
+        let mut uids: AHashMap<u32, usize> = AHashMap::with_capacity(message.recipients.len());
+        let mut results = Vec::with_capacity(message.recipients.len());
+        for rcpt in message.recipients {
+            let uid = match self
+                .email_to_id(&self.core.storage.directory, &rcpt, message.session_id)
+                .await
+            {
+                Ok(Some(uid)) => uid,
                 Ok(None) => {
-                    let account_quota = match self.directory.query(QueryBy::Id(*uid), false).await {
-                        Ok(Some(p)) => p.quota as i64,
-                        Ok(None) => 0,
-                        Err(_) => {
-                            *status = DeliveryResult::TemporaryFailure {
-                                reason: "Transient server failure.".into(),
-                            };
-                            continue;
-                        }
-                    };
-
-                    self.email_ingest(IngestEmail {
-                        raw_message: &raw_message,
-                        message: MessageParser::new().parse(&raw_message),
-                        account_id: *uid,
-                        account_quota,
-                        mailbox_ids: vec![INBOX_ID],
-                        keywords: vec![],
-                        received_at: None,
-                        skip_duplicates: true,
-                        encrypt: self.config.encrypt,
-                    })
-                    .await
+                    // Something went wrong
+                    results.push(DeliveryResult::PermanentFailure {
+                        code: [5, 5, 0],
+                        reason: "Mailbox not found.".into(),
+                    });
+                    continue;
                 }
-                Err(_) => {
-                    *status = DeliveryResult::TemporaryFailure {
-                        reason: "Transient server failure.".into(),
-                    };
+                Err(err) => {
+                    trc::error!(err
+                        .details("Failed to lookup recipient.")
+                        .ctx(trc::Key::To, rcpt)
+                        .span_id(message.session_id)
+                        .caused_by(trc::location!()));
+                    results.push(DeliveryResult::TemporaryFailure {
+                        reason: "Address lookup failed.".into(),
+                    });
                     continue;
                 }
             };
+            if let Some(result) = uids.get(&uid).and_then(|pos| results.get(*pos)) {
+                results.push(result.clone());
+                continue;
+            }
 
-            match result {
+            // Obtain access token
+            let result = match self.get_access_token(uid).await.and_then(|token| {
+                token
+                    .assert_has_permission(Permission::EmailReceive)
+                    .map(|_| token)
+            }) {
+                Ok(access_token) => {
+                    // Check if there is an active sieve script
+                    match self.sieve_script_get_active(uid).await {
+                        Ok(Some(active_script)) => {
+                            self.sieve_script_ingest(
+                                &access_token,
+                                &raw_message,
+                                &message.sender_address,
+                                &rcpt,
+                                message.session_id,
+                                active_script,
+                            )
+                            .await
+                        }
+                        Ok(None) => {
+                            // Ingest message
+                            self.email_ingest(IngestEmail {
+                                raw_message: &raw_message,
+                                message: MessageParser::new().parse(&raw_message),
+                                resource: access_token.as_resource_token(),
+                                mailbox_ids: vec![INBOX_ID],
+                                keywords: vec![],
+                                received_at: None,
+                                source: IngestSource::Smtp { deliver_to: &rcpt },
+                                spam_classify: access_token
+                                    .has_permission(Permission::SpamFilterClassify),
+                                spam_train: self.email_bayes_can_train(&access_token),
+                                session_id: message.session_id,
+                            })
+                            .await
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+
+                Err(err) => Err(err),
+            };
+
+            let result = match result {
                 Ok(ingested_message) => {
                     // Notify state change
                     if ingested_message.change_id != u64::MAX {
                         self.broadcast_state_change(
-                            StateChange::new(*uid)
+                            StateChange::new(uid)
                                 .with_change(DataType::EmailDelivery, ingested_message.change_id)
                                 .with_change(DataType::Email, ingested_message.change_id)
                                 .with_change(DataType::Mailbox, ingested_message.change_id)
@@ -114,70 +162,62 @@ impl JMAP {
                         )
                         .await;
                     }
-                }
-                Err(err) => match err {
-                    IngestError::OverQuota => {
-                        *status = DeliveryResult::TemporaryFailure {
-                            reason: "Mailbox over quota.".into(),
-                        }
-                    }
-                    IngestError::Temporary => {
-                        *status = DeliveryResult::TemporaryFailure {
-                            reason: "Transient server failure.".into(),
-                        }
-                    }
-                    IngestError::Permanent { code, reason } => {
-                        *status = DeliveryResult::PermanentFailure {
-                            code,
-                            reason: reason.into(),
-                        }
-                    }
-                },
-            }
-        }
 
-        // Build result
-        recipients
-            .into_iter()
-            .map(|names| {
-                match names.len() {
-                    1 => {
-                        // Delivery to single recipient
-                        deliver_names.get(&names[0]).unwrap().0.clone()
-                    }
-                    0 => {
-                        // Something went wrong
-                        DeliveryResult::TemporaryFailure {
-                            reason: "Address lookup failed.".into(),
-                        }
-                    }
-                    _ => {
-                        // Delivery to list, count number of successes and failures
-                        let mut success = 0;
-                        let mut temp_failures = 0;
-                        for uid in names {
-                            match deliver_names.get(&uid).unwrap().0 {
-                                DeliveryResult::Success => success += 1,
-                                DeliveryResult::TemporaryFailure { .. } => temp_failures += 1,
-                                DeliveryResult::PermanentFailure { .. } => {}
-                            }
-                        }
-                        if success > temp_failures {
-                            DeliveryResult::Success
-                        } else if temp_failures > 0 {
+                    DeliveryResult::Success
+                }
+                Err(err) => {
+                    let result = match err.as_ref() {
+                        trc::EventType::Limit(trc::LimitEvent::Quota) => {
                             DeliveryResult::TemporaryFailure {
-                                reason: "Delivery to one or more recipients failed temporarily."
-                                    .into(),
+                                reason: "Mailbox over quota.".into(),
                             }
-                        } else {
+                        }
+                        trc::EventType::Limit(trc::LimitEvent::TenantQuota) => {
+                            DeliveryResult::TemporaryFailure {
+                                reason: "Organization over quota.".into(),
+                            }
+                        }
+                        trc::EventType::Security(trc::SecurityEvent::Unauthorized) => {
                             DeliveryResult::PermanentFailure {
                                 code: [5, 5, 0],
-                                reason: "Delivery to all recipients failed.".into(),
+                                reason: "This account is not authorized to receive email.".into(),
                             }
                         }
-                    }
+                        trc::EventType::MessageIngest(trc::MessageIngestEvent::Error) => {
+                            DeliveryResult::PermanentFailure {
+                                code: err
+                                    .value(trc::Key::Code)
+                                    .and_then(|v| v.to_uint())
+                                    .map(|n| {
+                                        [(n / 100) as u8, ((n % 100) / 10) as u8, (n % 10) as u8]
+                                    })
+                                    .unwrap_or([5, 5, 0]),
+                                reason: err
+                                    .value_as_str(trc::Key::Reason)
+                                    .unwrap_or_default()
+                                    .to_string()
+                                    .into(),
+                            }
+                        }
+                        _ => DeliveryResult::TemporaryFailure {
+                            reason: "Transient server failure.".into(),
+                        },
+                    };
+
+                    trc::error!(err
+                        .ctx(trc::Key::To, rcpt.to_string())
+                        .span_id(message.session_id));
+
+                    result
                 }
-            })
-            .collect()
+            };
+
+            // Cache response for UID to avoid duplicate deliveries
+            uids.insert(uid, results.len());
+
+            results.push(result);
+        }
+
+        results
     }
 }

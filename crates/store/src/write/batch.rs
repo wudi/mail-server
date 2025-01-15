@@ -1,29 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use super::{
-    assert::ToAssertValue, Batch, BatchBuilder, BitmapClass, HasFlag, IntoOperations, Operation,
-    Serialize, TagValue, ToBitmaps, ValueClass, ValueOp, F_BITMAP, F_CLEAR, F_INDEX, F_VALUE,
+    assert::ToAssertValue, Batch, BatchBuilder, BitmapClass, HasFlag, IntoOperations,
+    MaybeDynamicId, MaybeDynamicValue, Operation, Serialize, TagValue, ToBitmaps, ValueClass,
+    ValueOp, F_BITMAP, F_CLEAR, F_INDEX, F_VALUE,
 };
 
 impl BatchBuilder {
@@ -31,6 +15,11 @@ impl BatchBuilder {
         Self {
             ops: Vec::with_capacity(16),
         }
+    }
+
+    pub fn with_change_id(&mut self, change_id: u64) -> &mut Self {
+        self.ops.push(Operation::ChangeId { change_id });
+        self
     }
 
     pub fn with_account_id(&mut self, account_id: u32) -> &mut Self {
@@ -45,8 +34,10 @@ impl BatchBuilder {
         self
     }
 
-    pub fn create_document(&mut self, document_id: u32) -> &mut Self {
-        self.ops.push(Operation::DocumentId { document_id });
+    pub fn create_document(&mut self) -> &mut Self {
+        self.ops.push(Operation::DocumentId {
+            document_id: u32::MAX,
+        });
 
         // Add document id
         self.ops.push(Operation::Bitmap {
@@ -54,10 +45,16 @@ impl BatchBuilder {
             set: true,
         });
 
-        // Remove reserved id
-        self.ops.push(Operation::Value {
-            class: ValueClass::ReservedId,
-            op: ValueOp::Clear,
+        self
+    }
+
+    pub fn create_document_with_id(&mut self, document_id: u32) -> &mut Self {
+        self.ops.push(Operation::DocumentId { document_id });
+
+        // Add document id
+        self.ops.push(Operation::Bitmap {
+            class: BitmapClass::DocumentIds,
+            set: true,
         });
 
         self
@@ -79,7 +76,7 @@ impl BatchBuilder {
 
     pub fn assert_value(
         &mut self,
-        class: impl Into<ValueClass>,
+        class: impl Into<ValueClass<MaybeDynamicId>>,
         value: impl ToAssertValue,
     ) -> &mut Self {
         self.ops.push(Operation::AssertValue {
@@ -116,7 +113,7 @@ impl BatchBuilder {
             self.ops.push(Operation::Value {
                 class: ValueClass::Property(field),
                 op: if is_set {
-                    ValueOp::Set(value)
+                    ValueOp::Set(value.into())
                 } else {
                     ValueOp::Clear
                 },
@@ -129,7 +126,7 @@ impl BatchBuilder {
     pub fn tag(
         &mut self,
         field: impl Into<u8>,
-        value: impl Into<TagValue>,
+        value: impl Into<TagValue<MaybeDynamicId>>,
         options: u32,
     ) -> &mut Self {
         self.ops.push(Operation::Bitmap {
@@ -142,15 +139,31 @@ impl BatchBuilder {
         self
     }
 
-    pub fn add(&mut self, class: impl Into<ValueClass>, value: i64) -> &mut Self {
+    pub fn add(&mut self, class: impl Into<ValueClass<MaybeDynamicId>>, value: i64) -> &mut Self {
         self.ops.push(Operation::Value {
             class: class.into(),
-            op: ValueOp::Add(value),
+            op: ValueOp::AtomicAdd(value),
         });
         self
     }
 
-    pub fn set(&mut self, class: impl Into<ValueClass>, value: impl Into<Vec<u8>>) -> &mut Self {
+    pub fn add_and_get(
+        &mut self,
+        class: impl Into<ValueClass<MaybeDynamicId>>,
+        value: i64,
+    ) -> &mut Self {
+        self.ops.push(Operation::Value {
+            class: class.into(),
+            op: ValueOp::AddAndGet(value),
+        });
+        self
+    }
+
+    pub fn set(
+        &mut self,
+        class: impl Into<ValueClass<MaybeDynamicId>>,
+        value: impl Into<MaybeDynamicValue>,
+    ) -> &mut Self {
         self.ops.push(Operation::Value {
             class: class.into(),
             op: ValueOp::Set(value.into()),
@@ -158,11 +171,16 @@ impl BatchBuilder {
         self
     }
 
-    pub fn clear(&mut self, class: impl Into<ValueClass>) -> &mut Self {
+    pub fn clear(&mut self, class: impl Into<ValueClass<MaybeDynamicId>>) -> &mut Self {
         self.ops.push(Operation::Value {
             class: class.into(),
             op: ValueOp::Clear,
         });
+        self
+    }
+
+    pub fn log(&mut self, value: impl Into<MaybeDynamicValue>) -> &mut Self {
+        self.ops.push(Operation::Log { set: value.into() });
         self
     }
 
@@ -209,8 +227,8 @@ impl Batch {
                 op,
                 Operation::AssertValue { .. }
                     | Operation::Value {
-                        class: ValueClass::ReservedId,
-                        op: ValueOp::Set(_)
+                        op: ValueOp::AddAndGet(_),
+                        ..
                     }
             )
         })

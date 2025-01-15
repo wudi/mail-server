@@ -1,58 +1,48 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod cron;
-pub mod dynvalue;
 pub mod ipmask;
-pub mod listener;
 pub mod parser;
-pub mod tls;
 pub mod utils;
 
-use std::{
-    borrow::Cow,
-    collections::BTreeMap,
-    fmt::Display,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
-use ahash::{AHashMap, AHashSet};
-use tokio::net::TcpSocket;
+use ahash::AHashMap;
+use serde::Serialize;
 
-use crate::{
-    acme::AcmeManager,
-    failed,
-    listener::{blocked::BlockedIps, tls::Certificate, TcpAcceptor},
-    UnwrapFailure,
-};
-
-use self::{ipmask::IpAddrMask, utils::ParseValue};
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Serialize)]
 pub struct Config {
+    #[serde(skip)]
     pub keys: BTreeMap<String, String>,
+    pub warnings: AHashMap<String, ConfigWarning>,
+    pub errors: AHashMap<String, ConfigError>,
+    #[cfg(debug_assertions)]
+    #[serde(skip)]
+    pub keys_read: parking_lot::Mutex<ahash::AHashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigWarning {
+    Missing,
+    AppliedDefault { default: String },
+    Unread { value: String },
+    Build { error: String },
+    Parse { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigError {
+    Parse { error: String },
+    Build { error: String },
+    Macro { error: String },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -61,212 +51,231 @@ pub struct ConfigKey {
     pub value: String,
 }
 
-#[derive(Debug, Default)]
-pub struct Server {
-    pub id: String,
-    pub internal_id: u16,
-    pub hostname: String,
-    pub data: String,
-    pub protocol: ServerProtocol,
-    pub listeners: Vec<Listener>,
-    pub proxy_networks: Vec<IpAddrMask>,
-    pub blocked_ips: Arc<BlockedIps>,
-    pub acceptor: TcpAcceptor,
-    pub tls_implicit: bool,
-    pub max_connections: u64,
-}
-
-#[derive(Default)]
-pub struct Servers {
-    pub inner: Vec<Server>,
-    pub certificates: Vec<Arc<Certificate>>,
-    pub acme_managers: Vec<Arc<AcmeManager>>,
-    pub blocked_ips: Arc<BlockedIps>,
-}
-
-#[derive(Debug)]
-pub struct Listener {
-    pub socket: TcpSocket,
-    pub addr: SocketAddr,
-    pub backlog: Option<u32>,
-
-    // TCP options
-    pub ttl: Option<u32>,
-    pub linger: Option<Duration>,
-    pub nodelay: bool,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
-pub enum ServerProtocol {
-    #[default]
-    Smtp,
-    Lmtp,
-    Jmap,
-    Imap,
-    Http,
-    ManageSieve,
-}
-
-#[derive(Debug, Clone)]
-pub enum DynValue<T: ParseValue> {
-    String(String),
-    Position(usize),
-    Key(T),
-    List(Vec<DynValue<T>>),
-}
-
-pub trait KeyLookup {
-    type Key: ParseValue;
-
-    fn key(&self, key: &Self::Key) -> Cow<'_, str>;
-    fn key_as_int(&self, key: &Self::Key) -> i32;
-    fn key_as_ip(&self, key: &Self::Key) -> IpAddr;
-}
-
-impl KeyLookup for () {
-    type Key = String;
-
-    fn key(&self, _: &Self::Key) -> Cow<'_, str> {
-        "".into()
-    }
-
-    fn key_as_int(&self, _: &Self::Key) -> i32 {
-        0
-    }
-
-    fn key_as_ip(&self, _: &Self::Key) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))
-    }
-}
-
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Rate {
     pub requests: u64,
     pub period: Duration,
 }
 
-impl Display for ServerProtocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerProtocol::Smtp => write!(f, "smtp"),
-            ServerProtocol::Lmtp => write!(f, "lmtp"),
-            ServerProtocol::Jmap => write!(f, "jmap"),
-            ServerProtocol::Imap => write!(f, "imap"),
-            ServerProtocol::Http => write!(f, "http"),
-            ServerProtocol::ManageSieve => write!(f, "managesieve"),
-        }
-    }
-}
-
 pub type Result<T> = std::result::Result<T, String>;
 
 impl Config {
-    pub fn init() -> Self {
-        let mut config_path = None;
-        let mut found_param = false;
-
-        for arg in std::env::args().skip(1) {
-            if let Some((key, value)) = arg.split_once('=') {
-                if key.starts_with("--config") {
-                    config_path = value.trim().to_string().into();
-                    break;
-                } else {
-                    failed(&format!("Invalid command line argument: {key}"));
-                }
-            } else if found_param {
-                config_path = arg.into();
-                break;
-            } else if arg.starts_with("--config") {
-                found_param = true;
-            } else {
-                failed(&format!("Invalid command line argument: {arg}"));
-            }
+    pub async fn resolve_macros(&mut self, classes: &[&str]) {
+        for macro_class in classes {
+            self.resolve_macro_type(macro_class).await;
         }
-
-        // Read main configuration file
-        let mut config = Config::default();
-        config
-            .parse(
-                &std::fs::read_to_string(
-                    config_path.failed("Missing parameter --config=<path-to-config>."),
-                )
-                .failed("Could not read configuration file"),
-            )
-            .failed("Invalid configuration file");
-
-        // Extract macros and includes
-        let mut keys = BTreeMap::new();
-        let mut includes = AHashSet::new();
-        let mut macros = AHashMap::new();
-
-        for (key, value) in config.keys {
-            if let Some(macro_name) = key.strip_prefix("macros.") {
-                macros.insert(macro_name.to_ascii_lowercase(), value);
-            } else if key.starts_with("include.files.") {
-                includes.insert(value);
-            } else {
-                keys.insert(key, value);
-            }
-        }
-
-        // Include files
-        config.keys = keys;
-        for mut include in includes {
-            include.replace_macros("include.files", &macros);
-            config
-                .parse(&std::fs::read_to_string(&include).failed(&format!(
-                    "Could not read included configuration file {include:?}"
-                )))
-                .failed(&format!("Invalid included configuration file {include:?}"));
-        }
-
-        // Replace macros
-        for (key, value) in &mut config.keys {
-            value.replace_macros(key, &macros);
-        }
-
-        config
     }
 
-    pub fn update(&mut self, config: Self) {
-        self.keys.extend(config.keys);
+    pub async fn resolve_all_macros(&mut self) {
+        self.resolve_macros(&["env", "file", "cfg"]).await;
     }
-}
 
-trait ReplaceMacros: Sized {
-    fn replace_macros(&mut self, key: &str, macros: &AHashMap<String, String>);
-}
+    async fn resolve_macro_type(&mut self, class: &str) {
+        let macro_start = format!("%{{{class}:");
+        let mut replacements = AHashMap::new();
+        'outer: for (key, value) in &self.keys {
+            if value.contains(&macro_start) && value.contains("}%") {
+                let mut result = String::with_capacity(value.len());
+                let mut snippet: &str = value.as_str();
 
-impl ReplaceMacros for String {
-    fn replace_macros(&mut self, key: &str, macros: &AHashMap<String, String>) {
-        if self.contains("%{") {
-            let mut result = String::with_capacity(self.len());
-            let mut value = self.as_str();
+                loop {
+                    if let Some((suffix, macro_name)) = snippet.split_once(&macro_start) {
+                        if !suffix.is_empty() {
+                            result.push_str(suffix);
+                        }
+                        if let Some((location, rest)) = macro_name.split_once("}%") {
+                            match class {
+                                "cfg" => {
+                                    if let Some(value) = replacements
+                                        .get(location)
+                                        .or_else(|| self.keys.get(location))
+                                    {
+                                        result.push_str(value);
+                                    } else {
+                                        self.errors.insert(
+                                            key.clone(),
+                                            ConfigError::Macro {
+                                                error: format!("Unknown key {location:?}"),
+                                            },
+                                        );
+                                    }
+                                }
+                                "env" => match std::env::var(location) {
+                                    Ok(value) => {
+                                        result.push_str(&value);
+                                    }
+                                    Err(_) => {
+                                        self.errors.insert(
+                                                key.clone(),
+                                                ConfigError::Macro { error : format!(
+                                                    "Failed to obtain environment variable {location:?}"
+                                                )},
+                                            );
+                                    }
+                                },
+                                "file" => {
+                                    let file_name = location.strip_prefix("//").unwrap_or(location);
+                                    match tokio::fs::read(file_name).await {
+                                        Ok(value) => match String::from_utf8(value) {
+                                            Ok(value) => {
+                                                result.push_str(&value);
+                                            }
+                                            Err(err) => {
+                                                self.errors.insert(
+                                                    key.clone(),
+                                                    ConfigError::Macro {
+                                                        error: format!(
+                                                        "Failed to read file {file_name:?}: {err}"
+                                                    ),
+                                                    },
+                                                );
+                                                continue 'outer;
+                                            }
+                                        },
+                                        Err(err) => {
+                                            self.errors.insert(
+                                                key.clone(),
+                                                ConfigError::Macro {
+                                                    error: format!(
+                                                        "Failed to read file {file_name:?}: {err}"
+                                                    ),
+                                                },
+                                            );
+                                            continue 'outer;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    unreachable!()
+                                }
+                            };
 
-            loop {
-                if let Some((suffix, macro_name)) = value.split_once("%{") {
-                    if !suffix.is_empty() {
-                        result.push_str(suffix);
-                    }
-                    if let Some((macro_name, rest)) = macro_name.split_once("}%") {
-                        if let Some(macro_value) = macros.get(&macro_name.to_ascii_lowercase()) {
-                            result.push_str(macro_value);
-                            value = rest;
-                        } else {
-                            failed(&format!("Unknown macro {macro_name:?} for key {key:?}"));
+                            snippet = rest;
                         }
                     } else {
-                        failed(&format!(
-                            "Unterminated macro name {value:?} for key {key:?}"
-                        ));
+                        result.push_str(snippet);
+                        break;
                     }
-                } else {
-                    result.push_str(value);
-                    break;
                 }
-            }
 
-            *self = result;
+                replacements.insert(key.clone(), result);
+            }
+        }
+
+        if !replacements.is_empty() {
+            for (key, value) in replacements {
+                self.keys.insert(key, value);
+            }
+        }
+    }
+
+    pub fn update(&mut self, settings: Vec<(String, String)>) {
+        self.keys.extend(settings);
+    }
+
+    pub fn log_errors(&self) {
+        for (key, err) in &self.errors {
+            let (cause, message) = match err {
+                ConfigError::Parse { error } => (
+                    trc::ConfigEvent::ParseError,
+                    format!("Failed to parse setting {key:?}: {error}"),
+                ),
+                ConfigError::Build { error } => (
+                    trc::ConfigEvent::BuildError,
+                    format!("Build error for key {key:?}: {error}"),
+                ),
+                ConfigError::Macro { error } => (
+                    trc::ConfigEvent::MacroError,
+                    format!("Macro expansion error for setting {key:?}: {error}"),
+                ),
+            };
+
+            trc::error!(trc::EventType::Config(cause).into_err().details(message));
+        }
+    }
+
+    pub fn log_warnings(&mut self) {
+        #[cfg(debug_assertions)]
+        self.warn_unread_keys();
+
+        for (key, warn) in &self.warnings {
+            let (cause, message) = match warn {
+                ConfigWarning::AppliedDefault { default } => (
+                    trc::ConfigEvent::DefaultApplied,
+                    format!("WARNING: Missing setting {key:?}, applied default {default:?}"),
+                ),
+                ConfigWarning::Missing => (
+                    trc::ConfigEvent::MissingSetting,
+                    format!("WARNING: Missing setting {key:?}"),
+                ),
+                ConfigWarning::Unread { value } => (
+                    trc::ConfigEvent::UnusedSetting,
+                    format!("WARNING: Unused setting {key:?} with value {value:?}"),
+                ),
+                ConfigWarning::Parse { error } => (
+                    trc::ConfigEvent::ParseWarning,
+                    format!("WARNING: Failed to parse {key:?}: {error}"),
+                ),
+                ConfigWarning::Build { error } => (
+                    trc::ConfigEvent::BuildWarning,
+                    format!("WARNING for {key:?}: {error}"),
+                ),
+            };
+
+            trc::error!(trc::EventType::Config(cause).into_err().details(message));
+        }
+    }
+}
+
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            warnings: self.warnings.clone(),
+            errors: self.errors.clone(),
+            #[cfg(debug_assertions)]
+            keys_read: Default::default(),
+        }
+    }
+}
+
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys && self.warnings == other.warnings && self.errors == other.errors
+    }
+}
+
+impl Eq for Config {}
+
+impl From<(String, String)> for ConfigKey {
+    fn from((key, value): (String, String)) -> Self {
+        Self { key, value }
+    }
+}
+
+impl From<(&str, &str)> for ConfigKey {
+    fn from((key, value): (&str, &str)) -> Self {
+        Self {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
+impl From<(&str, String)> for ConfigKey {
+    fn from((key, value): (&str, String)) -> Self {
+        Self {
+            key: key.to_string(),
+            value,
+        }
+    }
+}
+
+impl From<(String, &str)> for ConfigKey {
+    fn from((key, value): (String, &str)) -> Self {
+        Self {
+            key,
+            value: value.to_string(),
         }
     }
 }

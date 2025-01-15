@@ -1,52 +1,99 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-pub mod glob;
-pub mod lookup;
-pub mod main;
+use std::collections::hash_map::Entry;
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
+use utils::{config::Config, glob::GlobMap};
 
-use crate::Value;
+use crate::{InMemoryStore, Stores, Value};
 
-use self::glob::GlobPattern;
+pub type StaticMemoryStore = GlobMap<Value<'static>>;
 
-pub enum MemoryStore {
-    List(LookupList),
-    Map(LookupMap),
-}
+impl Stores {
+    pub fn parse_static_stores(&mut self, config: &mut Config, is_reload: bool) {
+        let mut lookups = AHashMap::new();
+        let mut errors = Vec::new();
 
-#[derive(Default)]
-pub struct LookupList {
-    pub set: AHashSet<String>,
-    pub matches: Vec<MatchType>,
-}
+        for (key, value) in config.iterate_prefix("lookup") {
+            if let Some((id, key)) = key
+                .split_once('.')
+                .filter(|(id, key)| !id.is_empty() && !key.is_empty())
+            {
+                // Detect value type
+                let value = if !value.is_empty() {
+                    let mut has_integers = false;
+                    let mut has_floats = false;
+                    let mut has_others = false;
 
-pub type LookupMap = AHashMap<String, Value<'static>>;
+                    for (pos, ch) in value.as_bytes().iter().enumerate() {
+                        match ch {
+                            b'.' if !has_floats && has_integers => {
+                                has_floats = true;
+                            }
+                            b'0'..=b'9' => {
+                                has_integers = true;
+                            }
+                            b'-' if pos == 0 && value.len() > 1 => {}
+                            _ => {
+                                has_others = true;
+                            }
+                        }
+                    }
 
-pub enum MatchType {
-    StartsWith(String),
-    EndsWith(String),
-    Glob(GlobPattern),
-    Regex(regex::Regex),
+                    if has_others {
+                        if value == "true" {
+                            Value::Integer(1.into())
+                        } else if value == "false" {
+                            Value::Integer(0.into())
+                        } else {
+                            Value::Text(value.to_string().into())
+                        }
+                    } else if has_floats {
+                        value
+                            .parse()
+                            .map(Value::Float)
+                            .unwrap_or_else(|_| Value::Text(value.to_string().into()))
+                    } else {
+                        value
+                            .parse()
+                            .map(Value::Integer)
+                            .unwrap_or_else(|_| Value::Text(value.to_string().into()))
+                    }
+                } else {
+                    Value::Text("".into())
+                };
+
+                // Add entry
+                lookups
+                    .entry(id.to_string())
+                    .or_insert_with(StaticMemoryStore::default)
+                    .insert(key, value);
+            } else {
+                errors.push(key.to_string());
+            }
+        }
+
+        for error in errors {
+            config.new_parse_error(error, "Invalid lookup key format");
+        }
+
+        for (id, store) in lookups {
+            match self.in_memory_stores.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(InMemoryStore::Static(store.into()));
+                }
+                Entry::Occupied(e) if !is_reload => {
+                    config.new_build_error(
+                        ("lookup", e.key().as_str()),
+                        "An in-memory store with this id already exists",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }

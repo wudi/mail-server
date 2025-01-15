@@ -1,37 +1,23 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
+use common::{
+    expr::{functions::ResolveVariable, V_MX},
+    Server,
+};
 use mail_auth::{IpLookupStrategy, MX};
 use rand::{seq::SliceRandom, Rng};
-use utils::config::KeyLookup;
 
-use crate::{
-    config::EnvelopeKey,
-    core::SMTP,
-    queue::{Error, ErrorDetails, Status},
-};
+use crate::queue::{Error, ErrorDetails, Status};
 
 use super::NextHop;
 
@@ -41,8 +27,25 @@ pub struct IpLookupResult {
     pub remote_ips: Vec<IpAddr>,
 }
 
-impl SMTP {
-    pub async fn ip_lookup(
+pub trait DnsLookup: Sync + Send {
+    fn ip_lookup(
+        &self,
+        key: &str,
+        strategy: IpLookupStrategy,
+        max_results: usize,
+    ) -> impl Future<Output = mail_auth::Result<Vec<IpAddr>>> + Send;
+
+    fn resolve_host(
+        &self,
+        remote_host: &NextHop<'_>,
+        envelope: &impl ResolveVariable,
+        max_multihomed: usize,
+        session_id: u64,
+    ) -> impl Future<Output = Result<IpLookupResult, Status<(), Error>>> + Send;
+}
+
+impl DnsLookup for Server {
+    async fn ip_lookup(
         &self,
         key: &str,
         strategy: IpLookupStrategy,
@@ -55,7 +58,14 @@ impl SMTP {
             IpLookupStrategy::Ipv6thenIpv4 => (true, true, false),
         };
         let ipv4_addrs = if has_ipv4 {
-            match self.resolvers.dns.ipv4_lookup(key).await {
+            match self
+                .core
+                .smtp
+                .resolvers
+                .dns
+                .ipv4_lookup(key, Some(&self.inner.cache.dns_ipv4))
+                .await
+            {
                 Ok(addrs) => addrs,
                 Err(_) if has_ipv6 => Arc::new(Vec::new()),
                 Err(err) => return Err(err),
@@ -65,7 +75,14 @@ impl SMTP {
         };
 
         if has_ipv6 {
-            let ipv6_addrs = match self.resolvers.dns.ipv6_lookup(key).await {
+            let ipv6_addrs = match self
+                .core
+                .smtp
+                .resolvers
+                .dns
+                .ipv6_lookup(key, Some(&self.inner.cache.dns_ipv6))
+                .await
+            {
                 Ok(addrs) => addrs,
                 Err(_) if !ipv4_addrs.is_empty() => Arc::new(Vec::new()),
                 Err(err) => return Err(err),
@@ -97,16 +114,19 @@ impl SMTP {
         }
     }
 
-    pub async fn resolve_host(
+    async fn resolve_host(
         &self,
         remote_host: &NextHop<'_>,
-        envelope: &impl KeyLookup<Key = EnvelopeKey>,
+        envelope: &impl ResolveVariable,
         max_multihomed: usize,
+        session_id: u64,
     ) -> Result<IpLookupResult, Status<(), Error>> {
         let remote_ips = self
             .ip_lookup(
                 remote_host.fqdn_hostname().as_ref(),
-                *self.queue.config.ip_strategy.eval(envelope).await,
+                self.eval_if(&self.core.smtp.queue.ip_strategy, envelope, session_id)
+                    .await
+                    .unwrap_or(IpLookupStrategy::Ipv4thenIpv6),
                 max_multihomed,
             )
             .await
@@ -132,7 +152,14 @@ impl SMTP {
             };
 
             // Obtain source IPv4 address
-            let source_ips = self.queue.config.source_ip.ipv4.eval(envelope).await;
+            let source_ips = self
+                .eval_if::<Vec<Ipv4Addr>, _>(
+                    &self.core.smtp.queue.source_ip.ipv4,
+                    envelope,
+                    session_id,
+                )
+                .await
+                .unwrap_or_default();
             match source_ips.len().cmp(&1) {
                 std::cmp::Ordering::Equal => {
                     result.source_ipv4 = IpAddr::from(*source_ips.first().unwrap()).into();
@@ -146,7 +173,14 @@ impl SMTP {
             }
 
             // Obtain source IPv6 address
-            let source_ips = self.queue.config.source_ip.ipv6.eval(envelope).await;
+            let source_ips = self
+                .eval_if::<Vec<Ipv6Addr>, _>(
+                    &self.core.smtp.queue.source_ip.ipv6,
+                    envelope,
+                    session_id,
+                )
+                .await
+                .unwrap_or_default();
             match source_ips.len().cmp(&1) {
                 std::cmp::Ordering::Equal => {
                     result.source_ipv6 = IpAddr::from(*source_ips.first().unwrap()).into();
@@ -163,7 +197,7 @@ impl SMTP {
         } else {
             Err(Status::TemporaryFailure(Error::DnsError(format!(
                 "No IP addresses found for {:?}.",
-                envelope.key(&EnvelopeKey::Mx)
+                envelope.resolve_variable(V_MX).to_string()
             ))))
         }
     }
@@ -174,7 +208,7 @@ pub trait ToNextHop {
         &'x self,
         domain: &'y str,
         max_mx: usize,
-    ) -> Option<Vec<NextHop<'_>>>;
+    ) -> Option<Vec<NextHop<'x>>>;
 }
 
 impl ToNextHop for Vec<MX> {
@@ -182,7 +216,7 @@ impl ToNextHop for Vec<MX> {
         &'x self,
         domain: &'y str,
         max_mx: usize,
-    ) -> Option<Vec<NextHop<'_>>> {
+    ) -> Option<Vec<NextHop<'x>>> {
         if !self.is_empty() {
             // Obtain max number of MX hosts to process
             let mut remote_hosts = Vec::with_capacity(max_mx);

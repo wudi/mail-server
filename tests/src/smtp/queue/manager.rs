@@ -1,69 +1,68 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mail_auth::hickory_resolver::proto::op::ResponseCode;
 
-use smtp::queue::{manager::Queue, Domain, Message, Schedule, Status};
+use smtp::queue::{spool::SmtpSpool, Domain, Message, Schedule, Status};
+use store::write::now;
 
-#[test]
-fn queue_due() {
-    let mut queue = Queue::default();
+use crate::smtp::TestSMTP;
+
+const CONFIG: &str = r#"
+[session.ehlo]
+reject-non-fqdn = false
+
+[session.rcpt]
+relay = true
+"#;
+
+#[tokio::test]
+async fn queue_due() {
+    // Enable logging
+    crate::enable_logging();
+
+    let local = TestSMTP::new("smtp_queue_due_test", CONFIG).await;
+    let core = local.build_smtp();
+    let qr = &local.queue_receiver;
 
     let mut message = new_message(0);
     message.domains.push(domain("c", 3, 8, 9));
-    queue.schedule(Schedule {
-        due: message.next_delivery_event(),
-        inner: message,
-    });
+    let due = message.next_delivery_event();
+    message.save_changes(&core, 0.into(), due.into()).await;
 
     let mut message = new_message(1);
     message.domains.push(domain("b", 2, 6, 7));
-    queue.schedule(Schedule {
-        due: message.next_delivery_event(),
-        inner: message,
-    });
+    let due = message.next_delivery_event();
+    message.save_changes(&core, 0.into(), due.into()).await;
 
     let mut message = new_message(2);
     message.domains.push(domain("a", 1, 4, 5));
-    queue.schedule(Schedule {
-        due: message.next_delivery_event(),
-        inner: message,
-    });
+    let due = message.next_delivery_event();
+    message.save_changes(&core, 0.into(), due.into()).await;
 
     for domain in vec!["a", "b", "c"].into_iter() {
-        let wake_up = queue.wake_up_time();
-        assert!(
-            (900..=1000).contains(&wake_up.as_millis()),
-            "{}",
-            wake_up.as_millis()
-        );
-        std::thread::sleep(wake_up);
-        queue.next_due().unwrap().domain(domain);
+        let now = now();
+        for queue_event in core.next_event().await {
+            if queue_event.due > now {
+                let wake_up = queue_event.due - now;
+                assert_eq!(wake_up, 1);
+                std::thread::sleep(Duration::from_secs(wake_up));
+            }
+            if let Some(message) = core.read_message(queue_event.queue_id).await {
+                message.domain(domain);
+                message.remove(&core, queue_event.due).await;
+            } else {
+                panic!("Message not found");
+            }
+        }
     }
 
-    assert!(queue.next_due().is_none());
+    qr.assert_queue_is_empty().await;
 }
 
 #[test]
@@ -127,11 +126,11 @@ fn delivery_events() {
     assert!(message.next_event().is_none());
 }
 
-pub fn new_message(id: u64) -> Box<Message> {
-    Box::new(Message {
+pub fn new_message(queue_id: u64) -> Message {
+    Message {
         size: 0,
-        id,
-        path: Default::default(),
+        queue_id,
+        span_id: 0,
         created: 0,
         return_path: "sender@foobar.org".to_string(),
         return_path_lcase: "".to_string(),
@@ -141,8 +140,9 @@ pub fn new_message(id: u64) -> Box<Message> {
         flags: 0,
         env_id: None,
         priority: 0,
-        queue_refs: vec![],
-    })
+        quota_keys: vec![],
+        blob_hash: Default::default(),
+    }
 }
 
 fn domain(domain: &str, retry: u64, notify: u64, expires: u64) -> Domain {
@@ -150,10 +150,8 @@ fn domain(domain: &str, retry: u64, notify: u64, expires: u64) -> Domain {
         domain: domain.to_string(),
         retry: Schedule::later(Duration::from_secs(retry)),
         notify: Schedule::later(Duration::from_secs(notify)),
-        expires: Instant::now() + Duration::from_secs(expires),
+        expires: now() + expires,
         status: Status::Scheduled,
-        disable_tls: false,
-        changed: false,
     }
 }
 
@@ -164,7 +162,10 @@ pub trait TestMessage {
 
 impl TestMessage for Message {
     fn domain(&self, name: &str) -> &Domain {
-        self.domains.iter().find(|d| d.domain == name).unwrap()
+        self.domains
+            .iter()
+            .find(|d| d.domain == name)
+            .unwrap_or_else(|| panic!("Expected domain {name} not found in {:?}", self.domains))
     }
 
     fn domain_mut(&mut self, name: &str) -> &mut Domain {

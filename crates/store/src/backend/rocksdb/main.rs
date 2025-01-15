@@ -1,85 +1,101 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::path::PathBuf;
 
-use roaring::RoaringBitmap;
-use rocksdb::{
-    compaction_filter::Decision, ColumnFamilyDescriptor, MergeOperands, OptimisticTransactionDB,
-    Options,
-};
+use rocksdb::{ColumnFamilyDescriptor, MergeOperands, OptimisticTransactionDB, Options};
 
 use tokio::sync::oneshot;
-use utils::{
-    config::{utils::AsKey, Config},
-    UnwrapFailure,
-};
+use utils::config::{utils::AsKey, Config};
 
-use crate::{Deserialize, Error};
+use crate::*;
 
-use super::{RocksDbStore, CF_BITMAPS, CF_BLOBS, CF_COUNTERS, CF_INDEXES, CF_LOGS, CF_VALUES};
+use super::{RocksDbStore, CF_BLOBS};
 
 impl RocksDbStore {
-    pub async fn open(config: &Config, prefix: impl AsKey) -> crate::Result<Self> {
+    pub async fn open(config: &mut Config, prefix: impl AsKey) -> Option<Self> {
         let prefix = prefix.as_key();
         // Create the database directory if it doesn't exist
-        let idx_path: PathBuf = PathBuf::from(
-            config
-                .value_require((&prefix, "path"))
-                .failed("Invalid configuration file"),
-        );
-        std::fs::create_dir_all(&idx_path).map_err(|err| {
-            Error::InternalError(format!(
-                "Failed to create index directory {}: {:?}",
-                idx_path.display(),
-                err
-            ))
-        })?;
+        let idx_path: PathBuf = PathBuf::from(config.value_require((&prefix, "path"))?);
+        std::fs::create_dir_all(&idx_path)
+            .map_err(|err| {
+                config.new_build_error(
+                    (&prefix, "path"),
+                    format!(
+                        "Failed to create database directory {}: {:?}",
+                        idx_path.display(),
+                        err
+                    ),
+                )
+            })
+            .ok()?;
 
         let mut cfs = Vec::new();
 
         // Bitmaps
-        let mut cf_opts = Options::default();
-        cf_opts.set_max_write_buffer_number(16);
-        cf_opts.set_merge_operator("merge", bitmap_merge, bitmap_partial_merge);
-        cf_opts.set_compaction_filter("compact", bitmap_compact);
-        cfs.push(ColumnFamilyDescriptor::new(CF_BITMAPS, cf_opts));
+        for subspace in [
+            SUBSPACE_BITMAP_ID,
+            SUBSPACE_BITMAP_TAG,
+            SUBSPACE_BITMAP_TEXT,
+        ] {
+            let mut cf_opts = Options::default();
+            cf_opts.set_max_write_buffer_number(16);
+            cfs.push(ColumnFamilyDescriptor::new(
+                std::str::from_utf8(&[subspace]).unwrap(),
+                cf_opts,
+            ));
+        }
 
         // Counters
-        let mut cf_opts = Options::default();
-        cf_opts.set_merge_operator_associative("merge", numeric_value_merge);
-        cfs.push(ColumnFamilyDescriptor::new(CF_COUNTERS, cf_opts));
+        for subspace in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
+            let mut cf_opts = Options::default();
+            cf_opts.set_merge_operator_associative("merge", numeric_value_merge);
+            cfs.push(ColumnFamilyDescriptor::new(
+                std::str::from_utf8(&[subspace]).unwrap(),
+                cf_opts,
+            ));
+        }
 
         // Blobs
         let mut cf_opts = Options::default();
         cf_opts.set_enable_blob_files(true);
-        cf_opts.set_min_blob_size(config.property_or_static((&prefix, "min-blob-size"), "16834")?);
+        cf_opts.set_min_blob_size(
+            config
+                .property_or_default((&prefix, "min-blob-size"), "16834")
+                .unwrap_or(16834),
+        );
         cfs.push(ColumnFamilyDescriptor::new(CF_BLOBS, cf_opts));
 
         // Other cfs
-        for cf in [CF_INDEXES, CF_LOGS, CF_VALUES] {
+        for subspace in [
+            SUBSPACE_INDEXES,
+            SUBSPACE_ACL,
+            SUBSPACE_DIRECTORY,
+            SUBSPACE_TASK_QUEUE,
+            SUBSPACE_BLOB_RESERVE,
+            SUBSPACE_BLOB_LINK,
+            SUBSPACE_IN_MEMORY_VALUE,
+            SUBSPACE_PROPERTY,
+            SUBSPACE_SETTINGS,
+            SUBSPACE_QUEUE_MESSAGE,
+            SUBSPACE_QUEUE_EVENT,
+            SUBSPACE_REPORT_OUT,
+            SUBSPACE_REPORT_IN,
+            SUBSPACE_FTS_INDEX,
+            SUBSPACE_LOGS,
+            SUBSPACE_BLOBS,
+            SUBSPACE_TELEMETRY_SPAN,
+            SUBSPACE_TELEMETRY_METRIC,
+            SUBSPACE_TELEMETRY_INDEX,
+        ] {
             let cf_opts = Options::default();
-            cfs.push(ColumnFamilyDescriptor::new(cf, cf_opts));
+            cfs.push(ColumnFamilyDescriptor::new(
+                std::str::from_utf8(&[subspace]).unwrap(),
+                cf_opts,
+            ));
         }
 
         let mut db_opts = Options::default();
@@ -92,30 +108,43 @@ impl RocksDbStore {
         //db_opts.set_keep_log_file_num(100);
         //db_opts.set_max_successive_merges(100);
         db_opts.set_write_buffer_size(
-            config.property_or_static((&prefix, "write-buffer-size"), "134217728")?,
+            config
+                .property_or_default((&prefix, "write-buffer-size"), "134217728")
+                .unwrap_or(134217728),
         );
 
-        Ok(RocksDbStore {
+        Some(RocksDbStore {
             db: OptimisticTransactionDB::open_cf_descriptors(&db_opts, idx_path, cfs)
-                .map_err(|e| Error::InternalError(e.into_string()))?
+                .map_err(|err| {
+                    config.new_build_error(
+                        prefix.as_str(),
+                        format!("Failed to open database: {:?}", err),
+                    )
+                })
+                .ok()?
                 .into(),
             worker_pool: rayon::ThreadPoolBuilder::new()
-                .num_threads(
+                .num_threads(std::cmp::max(
                     config
-                        .property::<usize>((&prefix, "pool.workers"))?
+                        .property::<usize>((&prefix, "pool.workers"))
                         .filter(|v| *v > 0)
-                        .unwrap_or_else(|| num_cpus::get() * 4),
-                )
+                        .unwrap_or_else(num_cpus::get),
+                    4,
+                ))
                 .build()
                 .map_err(|err| {
-                    crate::Error::InternalError(format!("Failed to build worker pool: {}", err))
-                })?,
+                    config.new_build_error(
+                        (&prefix, "pool.workers"),
+                        format!("Failed to build worker pool: {:?}", err),
+                    )
+                })
+                .ok()?,
         })
     }
 
-    pub async fn spawn_worker<U, V>(&self, mut f: U) -> crate::Result<V>
+    pub async fn spawn_worker<U, V>(&self, mut f: U) -> trc::Result<V>
     where
-        U: FnMut() -> crate::Result<V> + Send,
+        U: FnMut() -> trc::Result<V> + Send,
         V: Sync + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
@@ -128,10 +157,7 @@ impl RocksDbStore {
 
         match rx.await {
             Ok(result) => result,
-            Err(err) => Err(crate::Error::InternalError(format!(
-                "Worker thread failed: {}",
-                err
-            ))),
+            Err(err) => Err(trc::EventType::Server(trc::ServerEvent::ThreadError).reason(err)),
         }
     }
 }
@@ -154,28 +180,4 @@ pub fn numeric_value_merge(
     let mut bytes = Vec::with_capacity(std::mem::size_of::<i64>());
     bytes.extend_from_slice(&value.to_le_bytes());
     Some(bytes)
-}
-
-pub fn bitmap_merge(
-    _new_key: &[u8],
-    existing_val: Option<&[u8]>,
-    operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    super::bitmap::bitmap_merge(existing_val, operands.len(), operands)
-}
-
-pub fn bitmap_partial_merge(
-    _new_key: &[u8],
-    _existing_val: Option<&[u8]>,
-    _operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    // Force a full merge
-    None
-}
-
-pub fn bitmap_compact(_level: u32, _key: &[u8], value: &[u8]) -> Decision {
-    match RoaringBitmap::deserialize(value) {
-        Ok(bm) if bm.is_empty() => Decision::Remove,
-        _ => Decision::Keep,
-    }
 }

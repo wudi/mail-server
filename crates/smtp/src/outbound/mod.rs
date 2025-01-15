@@ -1,44 +1,37 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::borrow::Cow;
 
+use common::{
+    config::{
+        server::ServerProtocol,
+        smtp::queue::{RelayHost, RequireOptional},
+    },
+    ipc::QueuedMessage,
+};
 use mail_send::Credentials;
 use smtp_proto::{Response, Severity};
-use utils::config::ServerProtocol;
 
-use crate::{
-    config::RelayHost,
-    queue::{DeliveryAttempt, Error, ErrorDetails, HostResponse, Message, Status},
-};
+use crate::queue::{DeliveryAttempt, Error, ErrorDetails, HostResponse, Status};
 
+pub mod client;
 pub mod dane;
 pub mod delivery;
-#[cfg(feature = "local_delivery")]
 pub mod local;
 pub mod lookup;
 pub mod mta_sts;
 pub mod session;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TlsStrategy {
+    pub dane: RequireOptional,
+    pub mta_sts: RequireOptional,
+    pub tls: RequireOptional,
+}
 
 impl Status<(), Error> {
     pub fn from_smtp_error(hostname: &str, command: &str, err: mail_send::Error) -> Self {
@@ -149,7 +142,6 @@ impl Status<(), Error> {
         }))
     }
 
-    #[cfg(feature = "local_delivery")]
     pub fn local_error() -> Self {
         Status::TemporaryFailure(Error::ConnectionError(ErrorDetails {
             entity: "localhost".to_string(),
@@ -195,7 +187,7 @@ impl From<mta_sts::Error> for Status<(), Error> {
                 } else if err.is_status()
                     & err
                         .status()
-                        .map_or(false, |s| s == reqwest::StatusCode::NOT_FOUND)
+                        .is_some_and(|s| s == reqwest::StatusCode::NOT_FOUND)
                 {
                     Status::PermanentFailure(Error::MtaStsError("Policy not found.".to_string()))
                 } else {
@@ -211,22 +203,11 @@ impl From<mta_sts::Error> for Status<(), Error> {
     }
 }
 
-impl From<Box<Message>> for DeliveryAttempt {
-    fn from(message: Box<Message>) -> Self {
+impl DeliveryAttempt {
+    pub fn new(event: QueuedMessage) -> Self {
         DeliveryAttempt {
-            span: tracing::info_span!(
-                "delivery",
-                "id" = message.id,
-                "return_path" = if !message.return_path.is_empty() {
-                    message.return_path.as_ref()
-                } else {
-                    "<>"
-                },
-                "nrcpt" = message.recipients.len(),
-                "size" = message.size
-            ),
             in_flight: Vec::new(),
-            message,
+            event,
         }
     }
 }
@@ -237,9 +218,9 @@ pub enum NextHop<'x> {
     MX(&'x str),
 }
 
-impl<'x> NextHop<'x> {
+impl NextHop<'_> {
     #[inline(always)]
-    fn hostname(&self) -> &str {
+    pub fn hostname(&self) -> &str {
         match self {
             NextHop::MX(host) => {
                 if let Some(host) = host.strip_suffix('.') {
@@ -253,7 +234,7 @@ impl<'x> NextHop<'x> {
     }
 
     #[inline(always)]
-    fn fqdn_hostname(&self) -> Cow<'_, str> {
+    pub fn fqdn_hostname(&self) -> Cow<'_, str> {
         match self {
             NextHop::MX(host) => {
                 if !host.ends_with('.') {

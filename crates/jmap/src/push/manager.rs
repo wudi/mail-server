@@ -1,64 +1,30 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use base64::{engine::general_purpose, Engine};
+use common::{core::BuildServer, Inner, IPC_CHANNEL_BUFFER};
 use jmap_proto::types::id::Id;
 use store::ahash::{AHashMap, AHashSet};
 use tokio::sync::mpsc;
-use utils::{config::Config, UnwrapFailure};
+use trc::PushSubscriptionEvent;
 
-use crate::{api::StateChangeResponse, services::IPC_CHANNEL_BUFFER, LONG_SLUMBER};
+use crate::{api::StateChangeResponse, LONG_SLUMBER};
 
 use super::{ece::ece_encrypt, EncryptionKeys, Event, PushServer, PushUpdate};
 
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use std::{
     collections::hash_map::Entry,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-pub fn spawn_push_manager(settings: &Config) -> mpsc::Sender<Event> {
+pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
     let (push_tx_, mut push_rx) = mpsc::channel::<Event>(IPC_CHANNEL_BUFFER);
     let push_tx = push_tx_.clone();
-
-    let push_attempt_interval: Duration = settings
-        .property_or_static("jmap.push.attempts.interval", "1m")
-        .failed("Invalid configuration");
-    let push_attempts_max: u32 = settings
-        .property_or_static("jmap.push.attempts.max", "3")
-        .failed("Invalid configuration");
-    let push_retry_interval: Duration = settings
-        .property_or_static("jmap.push.retry.interval", "1s")
-        .failed("Invalid configuration");
-    let push_timeout: Duration = settings
-        .property_or_static("jmap.push.timeout.request", "10s")
-        .failed("Invalid configuration");
-    let push_verify_timeout: Duration = settings
-        .property_or_static("jmap.push.timeout.verify", "1m")
-        .failed("Invalid configuration");
-    let push_throttle: Duration = settings
-        .property_or_static("jmap.push.throttle", "1s")
-        .failed("Invalid configuration");
 
     tokio::spawn(async move {
         let mut subscriptions = AHashMap::default();
@@ -68,7 +34,19 @@ pub fn spawn_push_manager(settings: &Config) -> mpsc::Sender<Event> {
         let mut retry_ids = AHashSet::default();
 
         loop {
-            match tokio::time::timeout(retry_timeout, push_rx.recv()).await {
+            // Wait for the next event or timeout
+            let event_or_timeout = tokio::time::timeout(retry_timeout, push_rx.recv()).await;
+
+            // Load settings
+            let server = inner.build_server();
+            let push_attempt_interval = server.core.jmap.push_attempt_interval;
+            let push_attempts_max = server.core.jmap.push_attempts_max;
+            let push_retry_interval = server.core.jmap.push_retry_interval;
+            let push_timeout = server.core.jmap.push_timeout;
+            let push_verify_timeout = server.core.jmap.push_verify_timeout;
+            let push_throttle = server.core.jmap.push_throttle;
+
+            match event_or_timeout {
                 Ok(Some(event)) => match event {
                     Event::Update { updates } => {
                         for update in updates {
@@ -118,13 +96,14 @@ pub fn spawn_push_manager(settings: &Config) -> mpsc::Sender<Event> {
 
                                         last_verify.insert(account_id, current_time);
                                     } else {
-                                        tracing::debug!(
-                                            concat!(
-                                                "Failed to verify push subscription: ",
-                                                "Too many requests from accountId {}."
-                                            ),
-                                            account_id
+                                        trc::event!(
+                                            PushSubscription(PushSubscriptionEvent::Error),
+                                            Details = "Failed to verify push subscription",
+                                            Url = url.clone(),
+                                            AccountId = account_id,
+                                            Reason = "Too many requests"
                                         );
+
                                         continue;
                                     }
                                 }
@@ -166,7 +145,10 @@ pub fn spawn_push_manager(settings: &Config) -> mpsc::Sender<Event> {
                                     retry_ids.insert(id);
                                 }
                             } else {
-                                tracing::debug!("No push subscription found for id: {}", id);
+                                trc::event!(
+                                    PushSubscription(PushSubscriptionEvent::NotFound),
+                                    Id = id.document_id(),
+                                );
                             }
                         }
                     }
@@ -215,13 +197,13 @@ pub fn spawn_push_manager(settings: &Config) -> mpsc::Sender<Event> {
                                 if subscription.num_attempts < push_attempts_max {
                                     subscription.send(*retry_id, push_tx.clone(), push_timeout);
                                 } else {
-                                    tracing::debug!(
-                                        concat!(
-                                            "Failed to deliver push subscription: ",
-                                            "Too many attempts for url {}."
-                                        ),
-                                        subscription.url
+                                    trc::event!(
+                                        PushSubscription(PushSubscriptionEvent::Error),
+                                        Details = "Failed to deliver push subscription",
+                                        Url = subscription.url.clone(),
+                                        Reason = "Too many attempts"
                                     );
+
                                     subscription.state_changes.clear();
                                     subscription.num_attempts = 0;
                                 }
@@ -323,16 +305,43 @@ async fn http_request(
             }
             Err(err) => {
                 // Do not reattempt if encryption fails.
-                tracing::debug!("Failed to encrypt push subscription to {}: {}", url, err);
+
+                trc::event!(
+                    PushSubscription(PushSubscriptionEvent::Error),
+                    Details = "Failed to encrypt push subscription",
+                    Url = url,
+                    Reason = err
+                );
                 return true;
             }
         }
     }
 
     match client.body(body).send().await {
-        Ok(response) => response.status().is_success(),
+        Ok(response) => {
+            if response.status().is_success() {
+                trc::event!(PushSubscription(PushSubscriptionEvent::Success), Url = url,);
+
+                true
+            } else {
+                trc::event!(
+                    PushSubscription(PushSubscriptionEvent::Error),
+                    Details = "HTTP POST failed",
+                    Url = url,
+                    Code = response.status().as_u16(),
+                );
+
+                false
+            }
+        }
         Err(err) => {
-            tracing::debug!("HTTP post to {} failed with: {}", url, err);
+            trc::event!(
+                PushSubscription(PushSubscriptionEvent::Error),
+                Details = "HTTP POST failed",
+                Url = url,
+                Reason = err.to_string()
+            );
+
             false
         }
     }

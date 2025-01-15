@@ -1,51 +1,27 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use foundationdb::{
     future::FdbSlice,
     options::{self, StreamingMode},
     KeySelector, RangeOption, Transaction,
 };
-use futures::StreamExt;
+use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 
 use crate::{
+    backend::deserialize_i64_le,
     write::{
-        bitmap::DeserializeBlock,
         key::{DeserializeBigEndian, KeySerializer},
         BitmapClass, ValueClass,
     },
     BitmapKey, Deserialize, IterateParams, Key, ValueKey, U32_LEN, WITH_SUBSPACE,
 };
 
-use super::{FdbStore, MAX_VALUE_SIZE};
-
-#[cfg(feature = "fdb-chunked-bm")]
-pub(crate) enum ChunkedBitmap {
-    Single(RoaringBitmap),
-    Chunked { n_chunks: u8, bitmap: RoaringBitmap },
-    None,
-}
+use super::{into_error, FdbStore, ReadVersion, TimedTransaction, MAX_VALUE_SIZE};
 
 #[allow(dead_code)]
 pub(crate) enum ChunkedValue {
@@ -55,12 +31,12 @@ pub(crate) enum ChunkedValue {
 }
 
 impl FdbStore {
-    pub(crate) async fn get_value<U>(&self, key: impl Key) -> crate::Result<Option<U>>
+    pub(crate) async fn get_value<U>(&self, key: impl Key) -> trc::Result<Option<U>>
     where
         U: Deserialize,
     {
         let key = key.serialize(WITH_SUBSPACE);
-        let trx = self.db.create_trx()?;
+        let trx = self.read_trx().await?;
 
         match read_chunked_value(&key, &trx, true).await? {
             ChunkedValue::Single(bytes) => U::deserialize(&bytes).map(Some),
@@ -71,81 +47,101 @@ impl FdbStore {
 
     pub(crate) async fn get_bitmap(
         &self,
-        mut key: BitmapKey<BitmapClass>,
-    ) -> crate::Result<Option<RoaringBitmap>> {
-        #[cfg(feature = "fdb-chunked-bm")]
-        {
-            read_chunked_bitmap(&key.serialize(WITH_SUBSPACE), &self.db.create_trx()?, true)
-                .await
-                .map(Into::into)
-        }
+        mut key: BitmapKey<BitmapClass<u32>>,
+    ) -> trc::Result<Option<RoaringBitmap>> {
+        let mut bm = RoaringBitmap::new();
+        let begin = key.serialize(WITH_SUBSPACE);
+        key.document_id = u32::MAX;
+        let end = key.serialize(WITH_SUBSPACE);
+        let key_len = begin.len();
+        let trx = self.read_trx().await?;
+        let mut values = trx.get_ranges_keyvalues(
+            RangeOption {
+                begin: KeySelector::first_greater_or_equal(begin),
+                end: KeySelector::first_greater_or_equal(end),
+                mode: StreamingMode::WantAll,
+                reverse: false,
+                ..RangeOption::default()
+            },
+            true,
+        );
 
-        #[cfg(not(feature = "fdb-chunked-bm"))]
-        {
-            let mut bm = RoaringBitmap::new();
-            let begin = key.serialize(WITH_SUBSPACE);
-            key.block_num = u32::MAX;
-            let end = key.serialize(WITH_SUBSPACE);
-            let key_len = begin.len();
-            let trx = self.db.create_trx()?;
-            let mut values = trx.get_ranges(
-                RangeOption {
-                    begin: KeySelector::first_greater_or_equal(begin),
-                    end: KeySelector::first_greater_or_equal(end),
-                    mode: StreamingMode::WantAll,
-                    reverse: false,
-                    ..RangeOption::default()
-                },
-                true,
-            );
-
-            while let Some(values) = values.next().await {
-                for value in values? {
-                    let key = value.key();
-                    if key.len() == key_len {
-                        bm.deserialize_block(
-                            value.value(),
-                            key.deserialize_be_u32(key.len() - U32_LEN)?,
-                        );
-                    }
-                }
+        while let Some(value) = values.try_next().await.map_err(into_error)? {
+            let key = value.key();
+            if key.len() == key_len {
+                bm.insert(key.deserialize_be_u32(key.len() - U32_LEN)?);
             }
-            Ok(if !bm.is_empty() { Some(bm) } else { None })
         }
+
+        Ok(if !bm.is_empty() { Some(bm) } else { None })
     }
 
     pub(crate) async fn iterate<T: Key>(
         &self,
         params: IterateParams<T>,
-        mut cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> crate::Result<bool> + Sync + Send,
-    ) -> crate::Result<()> {
-        let begin = params.begin.serialize(WITH_SUBSPACE);
+        mut cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+    ) -> trc::Result<()> {
+        let mut begin = params.begin.serialize(WITH_SUBSPACE);
         let end = params.end.serialize(WITH_SUBSPACE);
 
-        let trx = self.db.create_trx()?;
-        let mut iter = trx.get_ranges(
-            RangeOption {
-                begin: KeySelector::first_greater_or_equal(&begin),
-                end: KeySelector::first_greater_than(&end),
-                mode: if params.first {
-                    options::StreamingMode::Small
-                } else {
-                    options::StreamingMode::Iterator
-                },
-                reverse: !params.ascending,
-                ..Default::default()
-            },
-            true,
-        );
+        if !params.first {
+            let mut begin_selector = KeySelector::first_greater_or_equal(&begin);
 
-        while let Some(values) = iter.next().await {
-            for value in values? {
-                let key = value.key().get(1..).unwrap_or_default();
-                let value = value.value();
+            loop {
+                let mut last_key_bytes = None;
 
-                if !cb(key, value)? || params.first {
-                    return Ok(());
+                {
+                    let trx = self.timed_read_trx().await?;
+                    let mut values = trx.as_ref().get_ranges(
+                        RangeOption {
+                            begin: begin_selector,
+                            end: KeySelector::first_greater_than(&end),
+                            mode: options::StreamingMode::WantAll,
+                            reverse: !params.ascending,
+                            ..Default::default()
+                        },
+                        true,
+                    );
+
+                    while let Some(values) = values.try_next().await.map_err(into_error)? {
+                        let mut last_key = &[] as &[u8];
+
+                        for value in values.iter() {
+                            last_key = value.key();
+                            if !cb(last_key.get(1..).unwrap_or_default(), value.value())? {
+                                return Ok(());
+                            }
+                        }
+
+                        if values.more() && trx.is_expired() {
+                            last_key_bytes = last_key.to_vec().into();
+                            break;
+                        }
+                    }
                 }
+
+                if let Some(last_key_bytes) = last_key_bytes {
+                    begin = last_key_bytes;
+                    begin_selector = KeySelector::first_greater_than(&begin);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            let trx = self.read_trx().await?;
+            let mut values = trx.get_ranges_keyvalues(
+                RangeOption {
+                    begin: KeySelector::first_greater_or_equal(&begin),
+                    end: KeySelector::first_greater_than(&end),
+                    mode: options::StreamingMode::Small,
+                    reverse: !params.ascending,
+                    ..Default::default()
+                },
+                true,
+            );
+
+            if let Some(value) = values.try_next().await.map_err(into_error)? {
+                cb(value.key().get(1..).unwrap_or_default(), value.value())?;
             }
         }
 
@@ -154,16 +150,44 @@ impl FdbStore {
 
     pub(crate) async fn get_counter(
         &self,
-        key: impl Into<ValueKey<ValueClass>> + Sync + Send,
-    ) -> crate::Result<i64> {
+        key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
+    ) -> trc::Result<i64> {
         let key = key.into().serialize(WITH_SUBSPACE);
-        if let Some(bytes) = self.db.create_trx()?.get(&key, true).await? {
-            Ok(i64::from_le_bytes(bytes[..].try_into().map_err(|_| {
-                crate::Error::InternalError("Invalid counter value.".to_string())
-            })?))
+        if let Some(bytes) = self
+            .read_trx()
+            .await?
+            .get(&key, true)
+            .await
+            .map_err(into_error)?
+        {
+            deserialize_i64_le(&key, &bytes)
         } else {
             Ok(0)
         }
+    }
+
+    pub(crate) async fn read_trx(&self) -> trc::Result<Transaction> {
+        let (is_expired, mut read_version) = {
+            let version = self.version.lock();
+            (version.is_expired(), version.version)
+        };
+        let trx = self.db.create_trx().map_err(into_error)?;
+
+        if is_expired {
+            read_version = trx.get_read_version().await.map_err(into_error)?;
+            *self.version.lock() = ReadVersion::new(read_version);
+        } else {
+            trx.set_read_version(read_version);
+        }
+
+        Ok(trx)
+    }
+
+    pub(crate) async fn timed_read_trx(&self) -> trc::Result<TimedTransaction> {
+        self.db
+            .create_trx()
+            .map_err(into_error)
+            .map(TimedTransaction::new)
     }
 }
 
@@ -171,8 +195,8 @@ pub(crate) async fn read_chunked_value(
     key: &[u8],
     trx: &Transaction,
     snapshot: bool,
-) -> crate::Result<ChunkedValue> {
-    if let Some(bytes) = trx.get(key, snapshot).await? {
+) -> trc::Result<ChunkedValue> {
+    if let Some(bytes) = trx.get(key, snapshot).await.map_err(into_error)? {
         if bytes.len() < MAX_VALUE_SIZE {
             Ok(ChunkedValue::Single(bytes))
         } else {
@@ -183,7 +207,7 @@ pub(crate) async fn read_chunked_value(
                 .write(0u8)
                 .finalize();
 
-            while let Some(bytes) = trx.get(&key, snapshot).await? {
+            while let Some(bytes) = trx.get(&key, snapshot).await.map_err(into_error)? {
                 value.extend_from_slice(&bytes);
                 *key.last_mut().unwrap() += 1;
             }
@@ -195,39 +219,5 @@ pub(crate) async fn read_chunked_value(
         }
     } else {
         Ok(ChunkedValue::None)
-    }
-}
-
-#[cfg(feature = "fdb-chunked-bm")]
-pub(crate) async fn read_chunked_bitmap(
-    key: &[u8],
-    trx: &Transaction,
-    snapshot: bool,
-) -> crate::Result<ChunkedBitmap> {
-    match read_chunked_value(key, trx, snapshot).await? {
-        ChunkedValue::Single(bytes) => RoaringBitmap::deserialize_unchecked_from(bytes.as_ref())
-            .map(ChunkedBitmap::Single)
-            .map_err(|e| {
-                crate::Error::InternalError(format!("Failed to deserialize bitmap: {}", e))
-            }),
-        ChunkedValue::Chunked { bytes, n_chunks } => {
-            RoaringBitmap::deserialize_unchecked_from(bytes.as_slice())
-                .map(|bitmap| ChunkedBitmap::Chunked { n_chunks, bitmap })
-                .map_err(|e| {
-                    crate::Error::InternalError(format!("Failed to deserialize bitmap: {}", e))
-                })
-        }
-        ChunkedValue::None => Ok(ChunkedBitmap::None),
-    }
-}
-
-#[cfg(feature = "fdb-chunked-bm")]
-impl From<ChunkedBitmap> for Option<RoaringBitmap> {
-    fn from(bitmap: ChunkedBitmap) -> Self {
-        match bitmap {
-            ChunkedBitmap::Single(bitmap) => Some(bitmap),
-            ChunkedBitmap::Chunked { bitmap, .. } => Some(bitmap),
-            ChunkedBitmap::None => None,
-        }
     }
 }

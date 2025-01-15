@@ -1,40 +1,24 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
 use mysql_async::{prelude::Queryable, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts};
-use utils::config::utils::AsKey;
+use utils::config::{utils::AsKey, Config};
 
-use crate::{
-    SUBSPACE_BITMAPS, SUBSPACE_BLOBS, SUBSPACE_COUNTERS, SUBSPACE_INDEXES, SUBSPACE_LOGS,
-    SUBSPACE_VALUES,
-};
+use crate::*;
 
-use super::MysqlStore;
+use super::{into_error, MysqlStore};
 
 impl MysqlStore {
-    pub async fn open(config: &utils::config::Config, prefix: impl AsKey) -> crate::Result<Self> {
+    pub async fn open(
+        config: &mut Config,
+        prefix: impl AsKey,
+        create_tables: bool,
+    ) -> Option<Self> {
         let prefix = prefix.as_key();
         let mut opts = OptsBuilder::default()
             .ip_or_hostname(config.value_require((&prefix, "host"))?.to_string())
@@ -46,29 +30,44 @@ impl MysqlStore {
                     .to_string()
                     .into(),
             )
-            .max_allowed_packet(config.property((&prefix, "max-allowed-packet"))?)
+            .max_allowed_packet(config.property((&prefix, "max-allowed-packet")))
             .wait_timeout(
                 config
-                    .property::<Duration>((&prefix, "timeout.wait"))?
+                    .property::<Option<Duration>>((&prefix, "timeout"))
+                    .unwrap_or_default()
                     .map(|t| t.as_secs() as usize),
             );
-        if let Some(port) = config.property((&prefix, "port"))? {
+        if let Some(port) = config.property((&prefix, "port")) {
             opts = opts.tcp_port(port);
         }
 
-        if config.property_or_static::<bool>((&prefix, "tls.allow-invalid-certs"), "false")? {
+        if config
+            .property_or_default::<bool>((&prefix, "tls.enable"), "false")
+            .unwrap_or_default()
+        {
+            let allow_invalid = config
+                .property_or_default::<bool>((&prefix, "tls.allow-invalid-certs"), "false")
+                .unwrap_or_default();
             opts = opts.ssl_opts(Some(
-                SslOpts::default().with_danger_accept_invalid_certs(true),
+                SslOpts::default()
+                    .with_danger_accept_invalid_certs(allow_invalid)
+                    .with_danger_skip_domain_validation(allow_invalid),
             ));
         }
 
         // Configure connection pool
         let mut pool_min = PoolConstraints::default().min();
         let mut pool_max = PoolConstraints::default().max();
-        if let Some(n_size) = config.property::<usize>((&prefix, "pool.min-connections"))? {
+        if let Some(n_size) = config
+            .property::<usize>((&prefix, "pool.min-connections"))
+            .filter(|&n| n > 0)
+        {
             pool_min = n_size;
         }
-        if let Some(n_size) = config.property::<usize>((&prefix, "pool.max-connections"))? {
+        if let Some(n_size) = config
+            .property::<usize>((&prefix, "pool.max-connections"))
+            .filter(|&n| n > 0)
+        {
             pool_max = n_size;
         }
         opts = opts.pool_opts(
@@ -79,27 +78,50 @@ impl MysqlStore {
             conn_pool: Pool::new(opts),
         };
 
-        db.create_tables().await?;
+        if create_tables {
+            if let Err(err) = db.create_tables().await {
+                config.new_build_error(prefix.as_str(), format!("Failed to create tables: {err}"));
+            }
+        }
 
-        Ok(db)
+        Some(db)
     }
 
-    pub(super) async fn create_tables(&self) -> crate::Result<()> {
-        let mut conn = self.conn_pool.get_conn().await?;
+    pub(crate) async fn create_tables(&self) -> trc::Result<()> {
+        let mut conn = self.conn_pool.get_conn().await.map_err(into_error)?;
 
-        for table in [SUBSPACE_VALUES, SUBSPACE_LOGS] {
+        for table in [
+            SUBSPACE_ACL,
+            SUBSPACE_DIRECTORY,
+            SUBSPACE_TASK_QUEUE,
+            SUBSPACE_BLOB_RESERVE,
+            SUBSPACE_BLOB_LINK,
+            SUBSPACE_IN_MEMORY_VALUE,
+            SUBSPACE_PROPERTY,
+            SUBSPACE_SETTINGS,
+            SUBSPACE_QUEUE_MESSAGE,
+            SUBSPACE_QUEUE_EVENT,
+            SUBSPACE_REPORT_OUT,
+            SUBSPACE_REPORT_IN,
+            SUBSPACE_FTS_INDEX,
+            SUBSPACE_LOGS,
+            SUBSPACE_TELEMETRY_SPAN,
+            SUBSPACE_TELEMETRY_METRIC,
+            SUBSPACE_TELEMETRY_INDEX,
+        ] {
             let table = char::from(table);
-            conn.query_drop(&format!(
+            conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
                     k TINYBLOB,
                     v MEDIUMBLOB NOT NULL,
                     PRIMARY KEY (k(255))
                 ) ENGINE=InnoDB"
             ))
-            .await?;
+            .await
+            .map_err(into_error)?;
         }
 
-        conn.query_drop(&format!(
+        conn.query_drop(format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 k TINYBLOB,
                 v LONGBLOB NOT NULL,
@@ -107,28 +129,38 @@ impl MysqlStore {
             ) ENGINE=InnoDB",
             char::from(SUBSPACE_BLOBS),
         ))
-        .await?;
+        .await
+        .map_err(into_error)?;
 
-        for table in [SUBSPACE_INDEXES, SUBSPACE_BITMAPS] {
+        for table in [
+            SUBSPACE_INDEXES,
+            SUBSPACE_BITMAP_ID,
+            SUBSPACE_BITMAP_TAG,
+            SUBSPACE_BITMAP_TEXT,
+        ] {
             let table = char::from(table);
-            conn.query_drop(&format!(
+            conn.query_drop(format!(
                 "CREATE TABLE IF NOT EXISTS {table} (
                     k BLOB,
                     PRIMARY KEY (k(400))
                 ) ENGINE=InnoDB"
             ))
-            .await?;
+            .await
+            .map_err(into_error)?;
         }
 
-        conn.query_drop(&format!(
-            "CREATE TABLE IF NOT EXISTS {} (
+        for table in [SUBSPACE_COUNTER, SUBSPACE_QUOTA, SUBSPACE_IN_MEMORY_COUNTER] {
+            conn.query_drop(format!(
+                "CREATE TABLE IF NOT EXISTS {} (
                 k TINYBLOB,
                 v BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (k(255))
             ) ENGINE=InnoDB",
-            char::from(SUBSPACE_COUNTERS)
-        ))
-        .await?;
+                char::from(table)
+            ))
+            .await
+            .map_err(into_error)?;
+        }
 
         Ok(())
     }

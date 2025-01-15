@@ -1,31 +1,16 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use ahash::AHashSet;
+use trc::AddContext;
+use utils::{BlobHash, BLOB_HASH_LEN};
 
 use crate::{
-    write::BatchBuilder, BlobClass, BlobHash, BlobStore, Deserialize, IterateParams, Store,
-    ValueKey, BLOB_HASH_LEN, U32_LEN, U64_LEN,
+    write::BatchBuilder, BlobClass, BlobStore, Deserialize, IterateParams, Store, ValueKey,
+    U32_LEN, U64_LEN,
 };
 
 use super::{key::DeserializeBigEndian, now, BlobOp, Operation, ValueClass, ValueOp};
@@ -37,10 +22,7 @@ pub struct BlobQuota {
 }
 
 impl Store {
-    pub async fn blob_exists(
-        &self,
-        hash: impl AsRef<BlobHash> + Sync + Send,
-    ) -> crate::Result<bool> {
+    pub async fn blob_exists(&self, hash: impl AsRef<BlobHash> + Sync + Send) -> trc::Result<bool> {
         self.get_value::<()>(ValueKey {
             account_id: 0,
             collection: 0,
@@ -51,9 +33,10 @@ impl Store {
         })
         .await
         .map(|v| v.is_some())
+        .caused_by(trc::location!())
     }
 
-    pub async fn blob_quota(&self, account_id: u32) -> crate::Result<BlobQuota> {
+    pub async fn blob_quota(&self, account_id: u32) -> trc::Result<BlobQuota> {
         let from_key = ValueKey {
             account_id,
             collection: 0,
@@ -80,7 +63,7 @@ impl Store {
             IterateParams::new(from_key, to_key).ascending(),
             |key, value| {
                 let until = key.deserialize_be_u64(key.len() - U64_LEN)?;
-                if until > now {
+                if until > now && value.len() == U32_LEN {
                     let bytes = u32::deserialize(value)?;
                     if bytes > 0 {
                         quota.bytes += bytes as usize;
@@ -90,7 +73,8 @@ impl Store {
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         Ok(quota)
     }
@@ -99,7 +83,7 @@ impl Store {
         &self,
         hash: impl AsRef<BlobHash> + Sync + Send,
         class: impl AsRef<BlobClass> + Sync + Send,
-    ) -> crate::Result<bool> {
+    ) -> trc::Result<bool> {
         let key = match class.as_ref() {
             BlobClass::Reserved {
                 account_id,
@@ -131,7 +115,7 @@ impl Store {
         self.get_value::<()>(key).await.map(|v| v.is_some())
     }
 
-    pub async fn purge_blobs(&self, blob_store: BlobStore) -> crate::Result<()> {
+    pub async fn purge_blobs(&self, blob_store: BlobStore) -> trc::Result<()> {
         // Remove expired temporary blobs
         let from_key = ValueKey {
             account_id: 0,
@@ -158,29 +142,21 @@ impl Store {
             IterateParams::new(from_key, to_key).ascending().no_values(),
             |key, _| {
                 let hash = BlobHash::try_from_hash_slice(
-                    key.get(1 + U32_LEN..1 + U32_LEN + BLOB_HASH_LEN)
-                        .ok_or_else(|| {
-                            crate::Error::InternalError(format!(
-                                "Invalid key {key:?} in blob hash tables"
-                            ))
-                        })?,
+                    key.get(U32_LEN..U32_LEN + BLOB_HASH_LEN)
+                        .ok_or_else(|| trc::Error::corrupted_key(key, None, trc::location!()))?,
                 )
                 .unwrap();
                 let until = key.deserialize_be_u64(key.len() - U64_LEN)?;
                 if until <= now {
-                    delete_keys.push(ValueKey {
-                        account_id: key.deserialize_be_u32(1)?,
-                        collection: 0,
-                        document_id: 0,
-                        class: ValueClass::Blob(BlobOp::Reserve { until, hash }),
-                    });
+                    delete_keys.push((key.deserialize_be_u32(0)?, BlobOp::Reserve { until, hash }));
                 } else {
                     active_hashes.insert(hash);
                 }
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         // Validate linked blobs
         let from_key = ValueKey {
@@ -204,11 +180,8 @@ impl Store {
             IterateParams::new(from_key, to_key).ascending().no_values(),
             |key, _| {
                 let hash = BlobHash::try_from_hash_slice(
-                    key.get(1..1 + BLOB_HASH_LEN).ok_or_else(|| {
-                        crate::Error::InternalError(format!(
-                            "Invalid key {key:?} in blob hash tables"
-                        ))
-                    })?,
+                    key.get(0..BLOB_HASH_LEN)
+                        .ok_or_else(|| trc::Error::corrupted_key(key, None, trc::location!()))?,
                 )
                 .unwrap();
                 let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
@@ -219,54 +192,55 @@ impl Store {
                     }
                 } else if last_hash != hash && !active_hashes.contains(&hash) {
                     // Unlinked or expired blob, delete.
-                    delete_keys.push(ValueKey {
-                        account_id: 0,
-                        collection: 0,
-                        document_id: 0,
-                        class: ValueClass::Blob(BlobOp::Commit { hash }),
-                    });
+                    delete_keys.push((0, BlobOp::Commit { hash }));
                 }
 
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         // Delete expired or unlinked blobs
-        for key in &delete_keys {
-            if let ValueClass::Blob(BlobOp::Commit { hash }) = &key.class {
-                blob_store.delete_blob(hash.as_ref()).await?;
+        for (_, op) in &delete_keys {
+            if let BlobOp::Commit { hash } = op {
+                blob_store
+                    .delete_blob(hash.as_ref())
+                    .await
+                    .caused_by(trc::location!())?;
             }
         }
 
         // Delete hashes
         let mut batch = BatchBuilder::new();
         let mut last_account_id = u32::MAX;
-        for key in delete_keys.into_iter() {
+        for (account_id, op) in delete_keys.into_iter() {
             if batch.ops.len() >= 1000 {
                 last_account_id = u32::MAX;
-                self.write(batch.build()).await?;
+                self.write(batch.build())
+                    .await
+                    .caused_by(trc::location!())?;
                 batch = BatchBuilder::new();
             }
-            if matches!(key.class, ValueClass::Blob(BlobOp::Reserve { .. }))
-                && key.account_id != last_account_id
-            {
-                batch.with_account_id(key.account_id);
-                last_account_id = key.account_id;
+            if matches!(op, BlobOp::Reserve { .. }) && account_id != last_account_id {
+                batch.with_account_id(account_id);
+                last_account_id = account_id;
             }
             batch.ops.push(Operation::Value {
-                class: key.class,
+                class: ValueClass::Blob(op),
                 op: ValueOp::Clear,
             })
         }
         if !batch.is_empty() {
-            self.write(batch.build()).await?;
+            self.write(batch.build())
+                .await
+                .caused_by(trc::location!())?;
         }
 
         Ok(())
     }
 
-    pub async fn blob_hash_unlink_account(&self, account_id: u32) -> crate::Result<()> {
+    pub async fn blob_hash_unlink_account(&self, account_id: u32) -> trc::Result<()> {
         // Validate linked blobs
         let from_key = ValueKey {
             account_id: 0,
@@ -290,54 +264,54 @@ impl Store {
             |key, _| {
                 let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
 
-                if document_id != u32::MAX
-                    && key.deserialize_be_u32(1 + BLOB_HASH_LEN)? == account_id
-                {
-                    delete_keys.push(ValueKey {
-                        account_id,
-                        collection: key[1 + BLOB_HASH_LEN + U32_LEN],
+                if document_id != u32::MAX && key.deserialize_be_u32(BLOB_HASH_LEN)? == account_id {
+                    delete_keys.push((
+                        key[BLOB_HASH_LEN + U32_LEN],
                         document_id,
-                        class: ValueClass::Blob(BlobOp::Link {
+                        BlobOp::Link {
                             hash: BlobHash::try_from_hash_slice(
-                                key.get(1..1 + BLOB_HASH_LEN).ok_or_else(|| {
-                                    crate::Error::InternalError(format!(
-                                        "Invalid key {key:?} in blob hash tables"
-                                    ))
+                                key.get(0..BLOB_HASH_LEN).ok_or_else(|| {
+                                    trc::Error::corrupted_key(key, None, trc::location!())
                                 })?,
                             )
                             .unwrap(),
-                        }),
-                    });
+                        },
+                    ));
                 }
 
                 Ok(true)
             },
         )
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
 
         // Unlink blobs
         let mut batch = BatchBuilder::new();
         batch.with_account_id(account_id);
         let mut last_collection = u8::MAX;
-        for key in delete_keys.into_iter() {
+        for (collection, document_id, op) in delete_keys.into_iter() {
             if batch.ops.len() >= 1000 {
-                self.write(batch.build()).await?;
+                self.write(batch.build())
+                    .await
+                    .caused_by(trc::location!())?;
                 batch = BatchBuilder::new();
                 batch.with_account_id(account_id);
                 last_collection = u8::MAX;
             }
-            if key.collection != last_collection {
-                batch.with_collection(key.collection);
-                last_collection = key.collection;
+            if collection != last_collection {
+                batch.with_collection(collection);
+                last_collection = collection;
             }
-            batch.update_document(key.document_id);
+            batch.update_document(document_id);
             batch.ops.push(Operation::Value {
-                class: key.class,
+                class: ValueClass::Blob(op),
                 op: ValueOp::Clear,
             });
         }
         if !batch.is_empty() {
-            self.write(batch.build()).await?;
+            self.write(batch.build())
+                .await
+                .caused_by(trc::location!())?;
         }
 
         Ok(())

@@ -1,34 +1,18 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
-    error::method::MethodError,
     method::query::{Comparator, Filter, QueryRequest, QueryResponse, SortProperty},
     object::email::QueryArguments,
     types::{acl::Acl, collection::Collection, keyword::Keyword, property::Property},
 };
 use mail_parser::HeaderName;
 use nlp::language::Language;
+use std::future::Future;
 use store::{
     fts::{Field, FilterGroup, FtsFilter, IntoFilterGroup},
     query::{self},
@@ -37,14 +21,31 @@ use store::{
     ValueKey,
 };
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{auth::acl::AclMethods, JmapMethods};
 
-impl JMAP {
-    pub async fn email_query(
+use super::cache::ThreadCache;
+
+pub trait EmailQuery: Sync + Send {
+    fn email_query(
+        &self,
+        request: QueryRequest<QueryArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<QueryResponse>> + Send;
+
+    fn thread_keywords(
+        &self,
+        account_id: u32,
+        keyword: Keyword,
+        match_all: bool,
+    ) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
+}
+
+impl EmailQuery for Server {
+    async fn email_query(
         &self,
         mut request: QueryRequest<QueryArguments>,
         access_token: &AccessToken,
-    ) -> Result<QueryResponse, MethodError> {
+    ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
         let mut filters = Vec::with_capacity(request.filter.len());
 
@@ -79,17 +80,17 @@ impl JMAP {
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Header(HeaderName::Subject),
                                     &text,
-                                    self.config.default_language,
+                                    self.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Body,
                                     &text,
-                                    self.config.default_language,
+                                    self.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::has_text_detect(
                                     Field::Attachment,
                                     text,
-                                    self.config.default_language,
+                                    self.core.jmap.default_language,
                                 ));
                                 fts_filters.push(FtsFilter::End);
                             }
@@ -116,26 +117,28 @@ impl JMAP {
                             Filter::Subject(text) => fts_filters.push(FtsFilter::has_text_detect(
                                 Field::Header(HeaderName::Subject),
                                 text,
-                                self.config.default_language,
+                                self.core.jmap.default_language,
                             )),
                             Filter::Body(text) => fts_filters.push(FtsFilter::has_text_detect(
                                 Field::Body,
                                 text,
-                                self.config.default_language,
+                                self.core.jmap.default_language,
                             )),
                             Filter::Header(header) => {
                                 let mut header = header.into_iter();
                                 let header_name = header.next().ok_or_else(|| {
-                                    MethodError::InvalidArguments(
-                                        "Header name is missing.".to_string(),
-                                    )
+                                    trc::JmapEvent::InvalidArguments
+                                        .into_err()
+                                        .details("Header name is missing.".to_string())
                                 })?;
 
                                 match HeaderName::parse(header_name) {
                                     Some(HeaderName::Other(header_name)) => {
-                                        return Err(MethodError::InvalidArguments(format!(
-                                            "Querying header '{header_name}' is not supported.",
-                                        )));
+                                        return Err(trc::JmapEvent::InvalidArguments
+                                            .into_err()
+                                            .details(format!(
+                                                "Querying header '{header_name}' is not supported.",
+                                            )));
                                     }
                                     Some(header_name) => {
                                         if let Some(header_value) = header.next() {
@@ -170,7 +173,11 @@ impl JMAP {
                             Filter::And | Filter::Or | Filter::Not | Filter::Close => {
                                 fts_filters.push(cond.into());
                             }
-                            other => return Err(MethodError::UnsupportedFilter(other.to_string())),
+                            other => {
+                                return Err(trc::JmapEvent::UnsupportedFilter
+                                    .into_err()
+                                    .details(other.to_string()))
+                            }
                         }
                     }
                     filters.push(query::Filter::is_in_set(
@@ -265,7 +272,11 @@ impl JMAP {
                             filters.push(cond.into());
                         }
 
-                        other => return Err(MethodError::UnsupportedFilter(other.to_string())),
+                        other => {
+                            return Err(trc::JmapEvent::UnsupportedFilter
+                                .into_err()
+                                .details(other.to_string()))
+                        }
                     }
                 }
             }
@@ -341,7 +352,11 @@ impl JMAP {
                         query::Comparator::field(Property::Cc, comparator.is_ascending)
                     }
 
-                    other => return Err(MethodError::UnsupportedSort(other.to_string())),
+                    other => {
+                        return Err(trc::JmapEvent::UnsupportedSort
+                            .into_err()
+                            .details(other.to_string()))
+                    }
                 });
             }
 
@@ -370,42 +385,39 @@ impl JMAP {
         account_id: u32,
         keyword: Keyword,
         match_all: bool,
-    ) -> Result<RoaringBitmap, MethodError> {
+    ) -> trc::Result<RoaringBitmap> {
         let keyword_doc_ids = self
             .get_tag(account_id, Collection::Email, Property::Keywords, keyword)
             .await?
             .unwrap_or_default();
+        if keyword_doc_ids.is_empty() {
+            return Ok(keyword_doc_ids);
+        }
+        let keyword_thread_ids = self
+            .get_cached_thread_ids(account_id, keyword_doc_ids.iter())
+            .await?;
 
         let mut not_matched_ids = RoaringBitmap::new();
         let mut matched_ids = RoaringBitmap::new();
 
-        for keyword_doc_id in &keyword_doc_ids {
+        for (keyword_doc_id, thread_id) in keyword_thread_ids {
             if matched_ids.contains(keyword_doc_id) || not_matched_ids.contains(keyword_doc_id) {
                 continue;
             }
-            if let Some(thread_id) = self
-                .get_property::<u32>(
-                    account_id,
-                    Collection::Email,
-                    keyword_doc_id,
-                    &Property::ThreadId,
-                )
+
+            if let Some(thread_doc_ids) = self
+                .get_tag(account_id, Collection::Email, Property::ThreadId, thread_id)
                 .await?
             {
-                if let Some(thread_doc_ids) = self
-                    .get_tag(account_id, Collection::Email, Property::ThreadId, thread_id)
-                    .await?
-                {
-                    let mut thread_tag_intersection = thread_doc_ids.clone();
-                    thread_tag_intersection &= &keyword_doc_ids;
+                let mut thread_tag_intersection = thread_doc_ids.clone();
+                thread_tag_intersection &= &keyword_doc_ids;
 
-                    if (match_all && thread_tag_intersection == thread_doc_ids)
-                        || (!match_all && !thread_tag_intersection.is_empty())
-                    {
-                        matched_ids |= &thread_doc_ids;
-                    } else if !thread_tag_intersection.is_empty() {
-                        not_matched_ids |= &thread_tag_intersection;
-                    }
+                if (match_all && thread_tag_intersection == thread_doc_ids)
+                    || (!match_all && !thread_tag_intersection.is_empty())
+                {
+                    matched_ids |= &thread_doc_ids;
+                } else if !thread_tag_intersection.is_empty() {
+                    not_matched_ids |= &thread_tag_intersection;
                 }
             }
         }

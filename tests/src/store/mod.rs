@@ -1,36 +1,22 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod assign_id;
 pub mod blob;
+pub mod import_export;
 pub mod lookup;
 pub mod ops;
 pub mod query;
 
 use std::io::Read;
 
-use store::{config::ConfigStore, FtsStore};
+use store::{FtsStore, Stores};
 use utils::config::Config;
+
+use crate::AssertConfig;
 
 pub struct TempDir {
     pub path: std::path::PathBuf,
@@ -78,7 +64,13 @@ password = "password"
 
 [store."redis"]
 type = "redis"
-url = "redis://127.0.0.1"
+urls = "redis://127.0.0.1"
+redis-type = "single"
+
+[storage]
+lookup = "mysql"
+data = "postgresql"
+blob = "sqlite"
 
 "#;
 
@@ -86,8 +78,10 @@ url = "redis://127.0.0.1"
 pub async fn store_tests() {
     let insert = true;
     let temp_dir = TempDir::new("store_tests", insert);
-    let config = Config::new(&CONFIG.replace("{TMP}", &temp_dir.path.to_string_lossy())).unwrap();
-    let stores = config.parse_stores().await.unwrap();
+    let mut config = Config::new(CONFIG.replace("{TMP}", &temp_dir.path.to_string_lossy()))
+        .unwrap()
+        .assert_no_errors();
+    let stores = Stores::parse_all(&mut config, false).await;
 
     let store_id = std::env::var("STORE")
         .expect("Missing store type. Try running `STORE=<store_type> cargo test`");
@@ -101,9 +95,11 @@ pub async fn store_tests() {
     if insert {
         store.destroy().await;
     }
+
+    import_export::test(store.clone()).await;
+    assign_id::test(store.clone()).await;
     ops::test(store.clone()).await;
     query::test(store.clone(), FtsStore::Store(store.clone()), insert).await;
-    assign_id::test(store).await;
 
     if insert {
         temp_dir.delete();

@@ -1,76 +1,71 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use crate::jmap::{
-    assert_is_empty, delivery::SmtpConnection, jmap_raw_request, mailbox::destroy_all_mailboxes,
-    test_account_login,
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{
+        assert_is_empty, delivery::SmtpConnection, emails_purge_tombstoned, jmap_raw_request,
+        mailbox::destroy_all_mailboxes, test_account_login,
+    },
 };
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::{blob::upload::DISABLE_UPLOAD_QUOTA, mailbox::INBOX_ID};
+use jmap::{blob::upload::DISABLE_UPLOAD_QUOTA, mailbox::INBOX_ID, JmapMethods};
 use jmap_client::{
     core::set::{SetErrorType, SetObject},
     email::EmailBodyPart,
 };
 use jmap_proto::types::{collection::Collection, id::Id};
+use smtp::queue::spool::SmtpSpool;
 
 use super::JMAPTest;
 
 pub async fn test(params: &mut JMAPTest) {
     println!("Running quota tests...");
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("robert@example.com", "aabbcc", "Robert Foobar")
-        .await;
-    let other_account_id = Id::from(
-        server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
-    );
-    let account_id = Id::from(
-        server
-            .store
-            .get_or_create_account_id("robert@example.com")
-            .await
-            .unwrap(),
-    );
-    params
-        .directory
+    let mut account_id = Id::from(0u64);
+    let mut other_account_id = Id::from(0u64);
+
+    for (id, email, password, name) in [
+        (
+            &mut other_account_id,
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+        ),
+        (
+            &mut account_id,
+            "robert@example.com",
+            "aabbcc",
+            "Robert Foobar",
+        ),
+    ] {
+        *id = Id::from(
+            server
+                .core
+                .storage
+                .data
+                .create_test_user(email, password, name, &[email][..])
+                .await,
+        );
+    }
+
+    server
+        .core
+        .storage
+        .data
         .set_test_quota("robert@example.com", 1024)
         .await;
-    params
-        .directory
+    server
+        .core
+        .storage
+        .data
         .add_to_group("robert@example.com", "jdoe@example.com")
         .await;
 
     // Delete temporary blobs from previous tests
-    server.store.blob_expire_all().await;
+    server.core.storage.data.blob_expire_all().await;
 
     // Test temporary blob quota (3 files)
     DISABLE_UPLOAD_QUOTA.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -93,7 +88,7 @@ pub async fn test(params: &mut JMAPTest) {
         jmap_client::Error::Problem(err) if err.detail().unwrap().contains("quota") => (),
         other => panic!("Unexpected error: {:?}", other),
     }
-    server.store.blob_expire_all().await;
+    server.core.storage.data.blob_expire_all().await;
 
     // Test temporary blob quota (50000 bytes)
     for i in 0..2 {
@@ -114,7 +109,7 @@ pub async fn test(params: &mut JMAPTest) {
         jmap_client::Error::Problem(err) if err.detail().unwrap().contains("quota") => (),
         other => panic!("Unexpected error: {:?}", other),
     }
-    server.store.blob_expire_all().await;
+    server.core.storage.data.blob_expire_all().await;
 
     // Test JMAP Quotas extension
     let response = jmap_raw_request(
@@ -187,6 +182,7 @@ pub async fn test(params: &mut JMAPTest) {
     for message_id in message_ids {
         client.email_destroy(&message_id).await.unwrap();
     }
+    emails_purge_tombstoned(&server).await;
     assert_eq!(
         server
             .get_used_quota(account_id.document_id())
@@ -234,6 +230,7 @@ pub async fn test(params: &mut JMAPTest) {
     for message_id in message_ids {
         client.email_destroy(&message_id).await.unwrap();
     }
+    emails_purge_tombstoned(&server).await;
     assert_eq!(
         server
             .get_used_quota(account_id.document_id())
@@ -296,6 +293,7 @@ pub async fn test(params: &mut JMAPTest) {
     for message_id in message_ids {
         client.email_destroy(&message_id).await.unwrap();
     }
+    emails_purge_tombstoned(&server).await;
     assert_eq!(
         server
             .get_used_quota(account_id.document_id())
@@ -314,7 +312,7 @@ pub async fn test(params: &mut JMAPTest) {
                 "jane@example.com",
                 "robert@example.com",
                 &format!("Ingest test {i}"),
-                100,
+                513,
             ))
             .unwrap(),
         )
@@ -340,6 +338,14 @@ pub async fn test(params: &mut JMAPTest) {
     for account_id in [&account_id, &other_account_id] {
         params.client.set_default_account_id(account_id.to_string());
         destroy_all_mailboxes(params).await;
+    }
+    for event in server.next_event().await {
+        server
+            .read_message(event.queue_id)
+            .await
+            .unwrap()
+            .remove(&server, event.due)
+            .await;
     }
     assert_is_empty(server).await;
 }

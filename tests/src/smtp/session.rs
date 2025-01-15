@@ -1,42 +1,25 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
+use common::{
+    config::server::ServerProtocol,
+    listener::{limiter::ConcurrencyLimiter, ServerInstance, SessionStream, TcpAcceptor},
+    Server,
+};
 use rustls::{server::ResolvesServerCert, ServerConfig};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::watch,
 };
 
-use smtp::core::{Session, SessionAddress, SessionData, SessionParameters, State, SMTP};
+use smtp::core::{Session, SessionAddress, SessionData, SessionParameters, State};
 use tokio_rustls::TlsAcceptor;
-use utils::{
-    config::ServerProtocol,
-    listener::{limiter::ConcurrencyLimiter, ServerInstance, SessionStream, TcpAcceptor},
-};
-
-use super::TestConfig;
+use utils::snowflake::SnowflakeIdGenerator;
 
 pub struct DummyIo {
     pub tx_buf: Vec<u8>,
@@ -99,8 +82,8 @@ impl Unpin for DummyIo {}
 
 #[allow(async_fn_in_trait)]
 pub trait TestSession {
-    fn test(core: impl Into<Arc<SMTP>>) -> Self;
-    fn test_with_shutdown(core: impl Into<Arc<SMTP>>, shutdown_rx: watch::Receiver<bool>) -> Self;
+    fn test(server: Server) -> Self;
+    fn test_with_shutdown(server: Server, shutdown_rx: watch::Receiver<bool>) -> Self;
     fn response(&mut self) -> Vec<String>;
     fn write_rx(&mut self, data: &str);
     async fn rset(&mut self);
@@ -114,12 +97,11 @@ pub trait TestSession {
 }
 
 impl TestSession for Session<DummyIo> {
-    fn test_with_shutdown(core: impl Into<Arc<SMTP>>, shutdown_rx: watch::Receiver<bool>) -> Self {
+    fn test_with_shutdown(server: Server, shutdown_rx: watch::Receiver<bool>) -> Self {
         Self {
             state: State::default(),
             instance: Arc::new(ServerInstance::test_with_shutdown(shutdown_rx)),
-            core: core.into(),
-            span: tracing::info_span!("test"),
+            server,
             stream: DummyIo {
                 rx_buf: vec![],
                 tx_buf: vec![],
@@ -127,16 +109,20 @@ impl TestSession for Session<DummyIo> {
             },
             data: SessionData::new(
                 "127.0.0.1".parse().unwrap(),
+                0,
                 "127.0.0.1".parse().unwrap(),
+                0,
+                Default::default(),
                 0,
             ),
             params: SessionParameters::default(),
             in_flight: vec![],
+            hostname: "localhost".to_string(),
         }
     }
 
-    fn test(core: impl Into<Arc<SMTP>>) -> Self {
-        Self::test_with_shutdown(core, watch::channel(false).1)
+    fn test(server: Server) -> Self {
+        Self::test_with_shutdown(server, watch::channel(false).1)
     }
 
     fn response(&mut self) -> Vec<String> {
@@ -274,6 +260,8 @@ impl TestSession for Session<DummyIo> {
                         dsn_info: None,
                     },
                 ],
+                self.server.inner.data.queue_id_gen.generate().unwrap(),
+                0,
             )
             .await;
         assert_eq!(
@@ -358,21 +346,24 @@ pub trait TestServerInstance {
 
 impl TestServerInstance for ServerInstance {
     fn test_with_shutdown(shutdown_rx: watch::Receiver<bool>) -> Self {
+        let tls_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(DummyCertResolver)),
+        );
+
         Self {
             id: "smtp".to_string(),
-            listener_id: 1,
-            hostname: "mx.example.org".to_string(),
             protocol: ServerProtocol::Smtp,
-            data: "220 mx.example.org at your service.\r\n".to_string(),
-            acceptor: TcpAcceptor::Tls(TlsAcceptor::from(Arc::new(
-                ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(DummyCertResolver)),
-            ))),
+            acceptor: TcpAcceptor::Tls {
+                config: tls_config.clone(),
+                acceptor: TlsAcceptor::from(tls_config),
+                implicit: false,
+            },
             limiter: ConcurrencyLimiter::new(100),
             shutdown_rx,
             proxy_networks: vec![],
-            blocked_ips: Arc::new(Default::default()),
+            span_id_gen: Arc::new(SnowflakeIdGenerator::new()),
         }
     }
 }
@@ -386,8 +377,6 @@ impl ResolvesServerCert for DummyCertResolver {
     }
 }
 
-impl TestConfig for ServerInstance {
-    fn test() -> Self {
-        Self::test_with_shutdown(watch::channel(false).1)
-    }
+pub fn test_server_instance() -> ServerInstance {
+    ServerInstance::test_with_shutdown(watch::channel(false).1)
 }

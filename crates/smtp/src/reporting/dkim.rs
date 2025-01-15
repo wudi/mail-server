@@ -1,35 +1,19 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::listener::SessionStream;
 use mail_auth::{
     common::verify::VerifySignature, AuthenticatedMessage, AuthenticationResults, DkimOutput,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use trc::OutgoingReportEvent;
 use utils::config::Rate;
 
-use crate::core::Session;
+use crate::{core::Session, reporting::SmtpReporting};
 
-impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
+impl<T: SessionStream> Session<T> {
     pub async fn send_dkim_report(
         &self,
         rcpt: &str,
@@ -46,56 +30,72 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
         };
 
         // Throttle recipient
-        if !self.throttle_rcpt(rcpt, rate, "dkim") {
-            tracing::debug!(
-                parent: &self.span,
-                context = "report",
-                report = "dkim",
-                event = "throttle",
-                rcpt = rcpt,
+        if !self.throttle_rcpt(rcpt, rate, "dkim").await {
+            trc::event!(
+                OutgoingReport(OutgoingReportEvent::DkimRateLimited),
+                SpanId = self.data.session_id,
+                To = rcpt.to_string(),
+                Limit = vec![
+                    trc::Value::from(rate.requests),
+                    trc::Value::from(rate.period)
+                ],
             );
+
             return;
         }
 
-        let config = &self.core.report.config.dkim;
-        let from_addr = config.address.eval(self).await;
+        let config = &self.server.core.smtp.report.dkim;
+        let from_addr = self
+            .server
+            .eval_if(&config.address, self, self.data.session_id)
+            .await
+            .unwrap_or_else(|| "MAILER-DAEMON@localhost".to_string());
         let mut report = Vec::with_capacity(128);
         self.new_auth_failure(output.result().into(), rejected)
             .with_authentication_results(
-                AuthenticationResults::new(&self.instance.hostname)
+                AuthenticationResults::new(&self.hostname)
                     .with_dkim_result(output, message.from())
                     .to_string(),
             )
             .with_dkim_domain(signature.domain())
             .with_dkim_selector(signature.selector())
             .with_dkim_identity(signature.identity())
-            .with_headers(message.raw_headers())
+            .with_headers(std::str::from_utf8(message.raw_headers()).unwrap_or_default())
             .write_rfc5322(
-                (config.name.eval(self).await.as_str(), from_addr.as_str()),
+                (
+                    self.server
+                        .eval_if(&config.name, self, self.data.session_id)
+                        .await
+                        .unwrap_or_else(|| "Mail Delivery Subsystem".to_string())
+                        .as_str(),
+                    from_addr.as_str(),
+                ),
                 rcpt,
-                config.subject.eval(self).await,
+                &self
+                    .server
+                    .eval_if(&config.subject, self, self.data.session_id)
+                    .await
+                    .unwrap_or_else(|| "DKIM Report".to_string()),
                 &mut report,
             )
             .ok();
 
-        tracing::info!(
-            parent: &self.span,
-            context = "report",
-            report = "dkim",
-            event = "queue",
-            rcpt = rcpt,
-            "Queueing DKIM authentication failure report."
+        trc::event!(
+            OutgoingReport(OutgoingReportEvent::DkimReport),
+            SpanId = self.data.session_id,
+            From = from_addr.to_string(),
+            To = rcpt.to_string(),
         );
 
         // Send report
-        self.core
+        self.server
             .send_report(
-                from_addr,
+                &from_addr,
                 [rcpt].into_iter(),
                 report,
                 &config.sign,
-                &self.span,
                 true,
+                self.data.session_id,
             )
             .await;
     }

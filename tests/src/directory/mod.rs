@@ -1,72 +1,43 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 pub mod imap;
 pub mod internal;
 pub mod ldap;
+pub mod oidc;
 pub mod smtp;
 pub mod sql;
 
-use ::smtp::core::Lookup;
+use common::{config::smtp::session::AddressMapping, Core, Server};
 use directory::{
-    backend::internal::manage::ManageDirectory, core::config::ConfigDirectory, AddressMapping,
-    Directories, Principal,
+    backend::internal::{manage::ManageDirectory, PrincipalField},
+    Directories, Principal, Type,
 };
 use mail_send::Credentials;
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::PrivateKeyDer;
-use std::{borrow::Cow, io::BufReader, path::PathBuf, sync::Arc};
-use store::{config::ConfigStore, LookupStore, Store, Stores};
+use std::{borrow::Cow, io::BufReader, sync::Arc};
+use store::{Store, Stores};
 use tokio_rustls::TlsAcceptor;
-use utils::config::Servers;
 
-use crate::store::TempDir;
+use crate::{store::TempDir, AssertConfig};
 
 const CONFIG: &str = r#"
 [directory."rocksdb"]
 type = "internal"
 store = "rocksdb"
 
-[directory."rocksdb".options]
-catch-all = true
-subaddressing = true
-
 [directory."foundationdb"]
 type = "internal"
 store = "foundationdb"
 
-[directory."foundationdb".options]
-catch-all = true
-subaddressing = true
-
 [directory."sqlite"]
 type = "sql"
 store = "sqlite"
-
-[directory."sqlite".options]
-catch-all = true
-subaddressing = true
 
 [directory."sqlite".columns]
 name = "name"
@@ -74,7 +45,7 @@ description = "description"
 secret = "secret"
 email = "address"
 quota = "quota"
-type = "type"
+class = "type"
 
 [store."rocksdb"]
 type = "rocksdb"
@@ -96,15 +67,14 @@ verify = "SELECT address FROM emails WHERE address LIKE '%' || ? || '%' AND type
 expand = "SELECT p.address FROM emails AS p JOIN emails AS l ON p.name = l.name WHERE p.type = 'primary' AND l.address = ? AND l.type = 'list' ORDER BY p.address LIMIT 50"
 domains = "SELECT 1 FROM emails WHERE address LIKE '%@' || ? LIMIT 1"
 
+[storage]
+lookup = "sqlite"
+
 ##############################################################################
 
 [directory."postgresql"]
 type = "sql"
 store = "postgresql"
-
-[directory."postgresql".options]
-catch-all = true
-subaddressing = true
 
 [directory."postgresql".columns]
 name = "name"
@@ -112,7 +82,7 @@ description = "description"
 secret = "secret"
 email = "address"
 quota = "quota"
-type = "type"
+class = "type"
 
 [store."postgresql"]
 type = "postgresql"
@@ -137,17 +107,13 @@ domains = "SELECT 1 FROM emails WHERE address LIKE '%@' || $1 LIMIT 1"
 type = "sql"
 store = "mysql"
 
-[directory."mysql".options]
-catch-all = true
-subaddressing = true
-
 [directory."mysql".columns]
 name = "name"
 description = "description"
 secret = "secret"
 email = "address"
 quota = "quota"
-type = "type"
+class = "type"
 
 [store."mysql"]
 type = "mysql"
@@ -170,7 +136,7 @@ domains = "SELECT 1 FROM emails WHERE address LIKE CONCAT('%@', ?) LIMIT 1"
 
 [directory."ldap"]
 type = "ldap"
-address = "ldap://localhost:3893"
+url = "ldap://localhost:3893"
 base-dn = "dc=example,dc=org"
 
 [directory."ldap".bind]
@@ -180,10 +146,6 @@ secret = "mysecret"
 [directory."ldap".bind.auth]
 enable = false
 dn = "cn=?,ou=svcaccts,dc=example,dc=org"
-
-[directory."ldap".options]
-catch-all = true
-subaddressing = true
 
 [directory."ldap".filter]
 name = "(&(|(objectClass=posixAccount)(objectClass=posixGroup))(uid=?))"
@@ -203,27 +165,27 @@ groups = ["memberOf", "otherGroups"]
 email = "mail"
 email-alias = "givenName"
 quota = "diskQuota"
-type = "objectClass"
+class = "objectClass"
 
 ##############################################################################
 
 [directory."imap"]
 type = "imap"
-address = "127.0.0.1"
+host = "127.0.0.1"
 port = 9198
 
 [directory."imap".pool]
 max-connections = 5
 
 [directory."imap".tls]
-implicit = true
+enable = true
 allow-invalid-certs = true
 
 ##############################################################################
 
 [directory."smtp"]
 type = "lmtp"
-address = "127.0.0.1"
+host = "127.0.0.1"
 port = 9199
 
 [directory."smtp".limits]
@@ -234,7 +196,7 @@ rcpt = 5
 max-connections = 5
 
 [directory."smtp".tls]
-implicit = true
+enable = true
 allow-invalid-certs = true
 
 [directory."smtp".cache]
@@ -246,13 +208,9 @@ ttl = {positive = '10s', negative = '5s'}
 [directory."local"]
 type = "memory"
 
-[directory."local".options]
-catch-all = true
-subaddressing = true
-
 [[directory."local".principals]]
 name = "john"
-type = "individual"
+class = "individual"
 description = "John Doe"
 secret = "12345"
 email = ["john@example.org", "jdoe@example.org", "john.doe@example.org"]
@@ -261,7 +219,7 @@ member-of = ["sales"]
 
 [[directory."local".principals]]
 name = "jane"
-type = "individual"
+class = "individual"
 description = "Jane Doe"
 secret = "abcde"
 email = "jane@example.org"
@@ -270,7 +228,7 @@ member-of = ["sales", "support"]
 
 [[directory."local".principals]]
 name = "bill"
-type = "individual"
+class = "individual"
 description = "Bill Foobar"
 secret = "$2y$05$bvIG6Nmid91Mu9RcmmWZfO5HJIMCT8riNW0hEp8f6/FuA2/mHZFpe"
 quota = 500000
@@ -279,24 +237,98 @@ email-list = ["info@example.org"]
 
 [[directory."local".principals]]
 name = "sales"
-type = "group"
+class = "group"
 description = "Sales Team"
 
 [[directory."local".principals]]
 name = "support"
-type = "group"
+class = "group"
 description = "Support Team"
+
+##############################################################################
+
+[directory."oidc-userinfo"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/userinfo"
+endpoint.method = "userinfo"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-none"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-none"
+endpoint.method = "introspect"
+auth.method = "none"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-user-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-user-token"
+endpoint.method = "introspect"
+auth.method = "user-token"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-token"
+endpoint.method = "introspect"
+auth.method = "token"
+auth.token = "token_of_gratitude"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-basic"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-basic"
+endpoint.method = "introspect"
+auth.method = "basic"
+auth.username = "myuser"
+auth.secret = "mypass"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
 
 "#;
 
 pub struct DirectoryStore {
-    pub store: LookupStore,
+    pub store: Store,
 }
 
 pub struct DirectoryTest {
     pub directories: Directories,
     pub stores: Stores,
     pub temp_dir: TempDir,
+    pub server: Server,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TestPrincipal {
+    pub id: u32,
+    pub typ: Type,
+    pub quota: u64,
+    pub name: String,
+    pub secrets: Vec<String>,
+    pub emails: Vec<String>,
+    pub member_of: Vec<String>,
+    pub roles: Vec<String>,
+    pub lists: Vec<String>,
+    pub description: Option<String>,
 }
 
 impl DirectoryTest {
@@ -306,25 +338,45 @@ impl DirectoryTest {
         if id_store.is_some() {
             // Disable foundationdb store for SQL tests (the fdb select api version can only be run once per process)
             config_file = config_file
-                .replace("type = \"foundationdb\"", "type = \"ignore\"")
-                .replace("store = \"foundationdb\"", "disable = true");
+                .replace(
+                    "type = \"foundationdb\"",
+                    "type = \"foundationdb\"\ndisable = true",
+                )
+                .replace(
+                    "store = \"foundationdb\"",
+                    "store = \"foundationdb\"\ndisable = true",
+                )
+        } else {
+            // Disable internal store
+            config_file =
+                config_file.replace("type = \"memory\"", "type = \"memory\"\ndisable = true")
         }
-        let config = utils::config::Config::new(&config_file).unwrap();
-        let stores = config.parse_stores().await.unwrap();
+        let mut config = utils::config::Config::new(&config_file).unwrap();
+        let stores = Stores::parse_all(&mut config, false).await;
+        let directories = Directories::parse(
+            &mut config,
+            &stores,
+            id_store
+                .map(|id| stores.stores.get(id).unwrap().clone())
+                .unwrap_or_default(),
+            true,
+        )
+        .await;
+        config.assert_no_errors();
+
+        // Enable catch-all and subaddressing
+        let mut core = Core::default();
+        core.smtp.session.rcpt.catch_all = AddressMapping::Enable;
+        core.smtp.session.rcpt.subaddressing = AddressMapping::Enable;
 
         DirectoryTest {
-            directories: config
-                .parse_directory(
-                    &stores,
-                    &Servers::default(),
-                    id_store
-                        .map(|id| stores.stores.get(id).unwrap().clone())
-                        .unwrap_or_default(),
-                )
-                .await
-                .unwrap(),
+            directories,
             stores,
             temp_dir,
+            server: Server {
+                inner: Default::default(),
+                core: core.into(),
+            },
         }
     }
 }
@@ -437,6 +489,64 @@ pub fn dummy_tls_acceptor() -> Arc<TlsAcceptor> {
     )))
 }
 
+trait IntoTestPrincipal {
+    fn into_test(self) -> TestPrincipal;
+}
+
+impl IntoTestPrincipal for Principal {
+    fn into_test(self) -> TestPrincipal {
+        TestPrincipal::from(self)
+    }
+}
+
+impl TestPrincipal {
+    pub fn into_sorted(mut self) -> Self {
+        self.member_of.sort_unstable();
+        self.emails.sort_unstable();
+        self
+    }
+}
+
+impl From<Principal> for TestPrincipal {
+    fn from(mut value: Principal) -> Self {
+        Self {
+            id: value.id(),
+            typ: value.typ(),
+            quota: value.quota(),
+            name: value.take_str(PrincipalField::Name).unwrap_or_default(),
+            secrets: value
+                .take_str_array(PrincipalField::Secrets)
+                .unwrap_or_default(),
+            emails: value
+                .take_str_array(PrincipalField::Emails)
+                .unwrap_or_default(),
+            member_of: value
+                .take_str_array(PrincipalField::MemberOf)
+                .unwrap_or_default(),
+            roles: value
+                .take_str_array(PrincipalField::Roles)
+                .unwrap_or_default(),
+            lists: value
+                .take_str_array(PrincipalField::Lists)
+                .unwrap_or_default(),
+            description: value.take_str(PrincipalField::Description),
+        }
+    }
+}
+
+impl From<TestPrincipal> for Principal {
+    fn from(value: TestPrincipal) -> Self {
+        Principal::new(value.id, value.typ)
+            .with_field(PrincipalField::Name, value.name)
+            .with_field(PrincipalField::Quota, value.quota)
+            .with_field(PrincipalField::Secrets, value.secrets)
+            .with_field(PrincipalField::Emails, value.emails)
+            .with_field(PrincipalField::MemberOf, value.member_of)
+            .with_field(PrincipalField::Lists, value.lists)
+            .with_opt_field(PrincipalField::Description, value.description)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Item {
     IsAccount(String),
@@ -529,124 +639,56 @@ impl core::fmt::Debug for Item {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn lookup_local() {
-    const LOOKUP_CONFIG: &str = r#"
-    [store."local/regex"]
-    type = "memory"
-    format = "regex"
-    values = ["^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
-             "^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"]
-    
-    [store."local/glob"]
-    type = "memory"
-    format = "glob"
-    values = ["*@example.org", "test@*", "localhost", "*+*@*.domain.net"]
-    
-    [store."local/list"]
-    type = "memory"
-    format = "list"
-    values = ["abc", "xyz", "123"]
-
-    [store."local/suffix"]
-    type = "memory"
-    format = "glob"
-    comment = "//"
-    values = ["https://publicsuffix.org/list/public_suffix_list.dat", "fallback+file://%PATH%/public_suffix_list.dat.gz"]
-    "#;
-
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .finish(),
-    )
-    .unwrap();*/
-
-    let lookups = utils::config::Config::new(
-        &LOOKUP_CONFIG.replace(
-            "%PATH%",
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .to_path_buf()
-                .join("resources")
-                .join("config")
-                .join("lists")
-                .to_str()
-                .unwrap(),
-        ),
-    )
-    .unwrap()
-    .parse_stores()
-    .await
-    .unwrap()
-    .lookup_stores;
-
-    for (lookup, item, expect) in [
-        ("glob", "user@example.org", true),
-        ("glob", "test@otherdomain.org", true),
-        ("glob", "localhost", true),
-        ("glob", "john+doe@doefamily.domain.net", true),
-        ("glob", "john@domain.net", false),
-        ("glob", "example.org", false),
-        ("list", "abc", true),
-        ("list", "xyz", true),
-        ("list", "zzz", false),
-        ("regex", "user@domain.com", true),
-        ("regex", "127.0.0.1", true),
-        ("regex", "hello", false),
-        ("suffix", "co.uk", true),
-        ("suffix", "coco", false),
-    ] {
-        assert_eq!(
-            Lookup::from(lookups.get(&format!("local/{lookup}")).unwrap().clone())
-                .contains(item)
-                .await
-                .unwrap(),
-            expect,
-            "failed for {lookup}, item {item}"
-        );
-    }
-}
-
-#[test]
-fn address_mappings() {
+#[tokio::test]
+async fn address_mappings() {
     const MAPPINGS: &str = r#"
     [enable]
     catch-all = true
     subaddressing = true
     expected-sub = "john.doe@example.org"
+    expected-sub-nomatch = "jane@example.org"
     expected-catch = "@example.org"
 
     [disable]
     catch-all = false
     subaddressing = false
     expected-sub = "john.doe+alias@example.org"
+    expected-sub-nomatch = "jane@example.org"
     expected-catch = false
 
     [custom]
-    catch-all = { map = "(.+)@(.+)$", to = "info@${2}" }
-    subaddressing = { map = "^([^.]+)\.([^.]+)@(.+)$", to = "${2}@${3}" }
+    catch-all = [{if = "matches('(.+)@(.+)$', address)", then = "'info@' + $2"}, {else = false}]
+    subaddressing = [{ if = "matches('^([^.]+)\\.([^.]+)@(.+)$', address)", then = "$2 + '@' + $3" }, {else = false}]
     expected-sub = "doe+alias@example.org"
+    expected-sub-nomatch = "jane@example.org"
     expected-catch = "info@example.org"
     "#;
 
-    let config = utils::config::Config::new(MAPPINGS).unwrap();
+    let mut config = utils::config::Config::new(MAPPINGS).unwrap();
     const ADDR: &str = "john.doe+alias@example.org";
+    const ADDR_NO_MATCH: &str = "jane@example.org";
+    let core = Server::default();
 
     for test in ["enable", "disable", "custom"] {
-        let catch_all = AddressMapping::from_config(&config, (test, "catch-all")).unwrap();
-        let subaddressing = AddressMapping::from_config(&config, (test, "subaddressing")).unwrap();
+        let catch_all = AddressMapping::parse(&mut config, (test, "catch-all"));
+        let subaddressing = AddressMapping::parse(&mut config, (test, "subaddressing"));
 
         assert_eq!(
-            subaddressing.to_subaddress(ADDR),
+            subaddressing.to_subaddress(&core, ADDR, 0).await,
             config.value_require((test, "expected-sub")).unwrap(),
             "failed subaddress for {test:?}"
         );
 
         assert_eq!(
-            catch_all.to_catch_all(ADDR),
+            subaddressing.to_subaddress(&core, ADDR_NO_MATCH, 0).await,
+            config
+                .value_require((test, "expected-sub-nomatch"))
+                .unwrap(),
+            "failed subaddress no match for {test:?}"
+        );
+
+        assert_eq!(
+            catch_all.to_catch_all(&core, ADDR, 0).await,
             config
                 .property_require::<Option<String>>((test, "expected-catch"))
                 .unwrap()
@@ -659,19 +701,15 @@ fn address_mappings() {
 async fn map_account_ids(store: &Store, names: Vec<impl AsRef<str>>) -> Vec<u32> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
-        ids.push(store.get_account_id(name.as_ref()).await.unwrap().unwrap());
+        ids.push(map_account_id(store, name).await);
     }
     ids
 }
 
-trait IntoSortedPrincipal: Sized {
-    fn into_sorted(self) -> Self;
-}
-
-impl IntoSortedPrincipal for Principal<u32> {
-    fn into_sorted(mut self) -> Self {
-        self.member_of.sort_unstable();
-        self.emails.sort_unstable();
-        self
-    }
+async fn map_account_id(store: &Store, name: impl AsRef<str>) -> u32 {
+    store
+        .get_principal_id(name.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
 }

@@ -1,59 +1,22 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{
-    borrow::Cow,
-    fs,
-    net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use store::{
-    backend::memory::{LookupList, MemoryStore},
-    config::ConfigStore,
-    LookupStore,
+use common::{
+    config::{
+        server::{Listener, Listeners, ServerProtocol, TcpListener},
+        smtp::{throttle::parse_throttle, *},
+    },
+    expr::{functions::ResolveVariable, if_block::*, tokenizer::TokenMap, *},
+    Server,
 };
 use tokio::net::TcpSocket;
 
-use utils::{
-    config::{
-        ipmask::IpAddrMask, Config, DynValue, KeyLookup, Listener, Rate, Server, ServerProtocol,
-    },
-    listener::TcpAcceptor,
-};
-
-use ahash::AHashMap;
-
-use smtp::{
-    config::{
-        condition::ConfigCondition, if_block::ConfigIf, throttle::ConfigThrottle, Condition,
-        ConditionMatch, Conditions, ConfigContext, EnvelopeKey, IfBlock, IfThen, StringMatch,
-        Throttle, THROTTLE_AUTH_AS, THROTTLE_REMOTE_IP, THROTTLE_SENDER_DOMAIN,
-    },
-    core::Lookup,
-};
+use utils::config::{Config, Rate};
 
 use super::add_test_certs;
 
@@ -67,132 +30,8 @@ struct TestEnvelope {
     pub helo_domain: String,
     pub authenticated_as: String,
     pub mx: String,
-    pub listener_id: u16,
+    pub listener_id: String,
     pub priority: i16,
-}
-
-#[test]
-fn parse_conditions() {
-    let mut file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    file.push("resources");
-    file.push("smtp");
-    file.push("config");
-    file.push("rules.toml");
-
-    let config = Config::new(&fs::read_to_string(file).unwrap()).unwrap();
-    let servers = vec![Server {
-        id: "smtp".to_string(),
-        internal_id: 123,
-        ..Default::default()
-    }];
-    let mut context = ConfigContext::new(&servers);
-    let list = LookupStore::Query(Arc::new(store::QueryStore {
-        store: MemoryStore::List(LookupList::default()).into(),
-        query: "abc".into(),
-    }));
-    context
-        .stores
-        .lookup_stores
-        .insert("test-list".to_string(), list.clone());
-
-    let mut conditions = config.parse_conditions(&context).unwrap();
-    let expected_rules = AHashMap::from_iter([
-        (
-            "simple".to_string(),
-            Conditions {
-                conditions: vec![Condition::Match {
-                    key: EnvelopeKey::Listener,
-                    value: ConditionMatch::UInt(123),
-                    not: false,
-                }],
-            },
-        ),
-        (
-            "is-authenticated".to_string(),
-            Conditions {
-                conditions: vec![Condition::Match {
-                    key: EnvelopeKey::AuthenticatedAs,
-                    value: ConditionMatch::String(StringMatch::Equal("".to_string())),
-                    not: true,
-                }],
-            },
-        ),
-        (
-            "expanded".to_string(),
-            Conditions {
-                conditions: vec![
-                    Condition::Match {
-                        key: EnvelopeKey::SenderDomain,
-                        value: ConditionMatch::String(StringMatch::StartsWith(
-                            "example".to_string(),
-                        )),
-                        not: false,
-                    },
-                    Condition::JumpIfFalse { positions: 1 },
-                    Condition::Match {
-                        key: EnvelopeKey::Sender,
-                        value: ConditionMatch::Lookup(list.into()),
-                        not: false,
-                    },
-                ],
-            },
-        ),
-        (
-            "my-nested-rule".to_string(),
-            Conditions {
-                conditions: vec![
-                    Condition::Match {
-                        key: EnvelopeKey::RecipientDomain,
-                        value: ConditionMatch::String(StringMatch::Equal(
-                            "example.org".to_string(),
-                        )),
-                        not: false,
-                    },
-                    Condition::JumpIfTrue { positions: 9 },
-                    Condition::Match {
-                        key: EnvelopeKey::RemoteIp,
-                        value: ConditionMatch::IpAddrMask(IpAddrMask::V4 {
-                            addr: "192.168.0.0".parse().unwrap(),
-                            mask: u32::MAX << (32 - 24),
-                        }),
-                        not: false,
-                    },
-                    Condition::JumpIfTrue { positions: 7 },
-                    Condition::Match {
-                        key: EnvelopeKey::Recipient,
-                        value: ConditionMatch::String(StringMatch::StartsWith(
-                            "no-reply@".to_string(),
-                        )),
-                        not: false,
-                    },
-                    Condition::JumpIfFalse { positions: 5 },
-                    Condition::Match {
-                        key: EnvelopeKey::Sender,
-                        value: ConditionMatch::String(StringMatch::EndsWith(
-                            "@domain.org".to_string(),
-                        )),
-                        not: false,
-                    },
-                    Condition::JumpIfFalse { positions: 3 },
-                    Condition::Match {
-                        key: EnvelopeKey::Priority,
-                        value: ConditionMatch::Int(1),
-                        not: true,
-                    },
-                    Condition::JumpIfTrue { positions: 1 },
-                    Condition::Match {
-                        key: EnvelopeKey::Priority,
-                        value: ConditionMatch::Int(-2),
-                        not: false,
-                    },
-                ],
-            },
-        ),
-    ]);
-
-    for (key, rule) in expected_rules {
-        assert_eq!(Some(rule), conditions.remove(&key), "failed for {key}");
-    }
 }
 
 #[test]
@@ -203,210 +42,233 @@ fn parse_if_blocks() {
     file.push("config");
     file.push("if-blocks.toml");
 
-    let config = Config::new(&fs::read_to_string(file).unwrap()).unwrap();
+    let mut config = Config::new(fs::read_to_string(file).unwrap()).unwrap();
 
     // Create context and add some conditions
-    let context = ConfigContext::new(&[]);
-    let available_keys = vec![
-        EnvelopeKey::Recipient,
-        EnvelopeKey::RecipientDomain,
-        EnvelopeKey::Sender,
-        EnvelopeKey::SenderDomain,
-        EnvelopeKey::AuthenticatedAs,
-        EnvelopeKey::Listener,
-        EnvelopeKey::RemoteIp,
-        EnvelopeKey::LocalIp,
-        EnvelopeKey::Priority,
-    ];
+
+    let token_map = TokenMap::default().with_variables(&[
+        V_RECIPIENT,
+        V_RECIPIENT_DOMAIN,
+        V_SENDER,
+        V_SENDER_DOMAIN,
+        V_AUTHENTICATED_AS,
+        V_LISTENER,
+        V_REMOTE_IP,
+        V_LOCAL_IP,
+        V_PRIORITY,
+    ]);
 
     assert_eq!(
-        config
-            .parse_if_block::<Option<Duration>>("durations", &context, &available_keys)
-            .unwrap()
-            .unwrap(),
+        IfBlock::try_parse(&mut config, "durations", &token_map).unwrap(),
         IfBlock {
+            key: "durations".to_string(),
             if_then: vec![
                 IfThen {
-                    conditions: Conditions {
-                        conditions: vec![Condition::Match {
-                            key: EnvelopeKey::Sender,
-                            value: ConditionMatch::String(StringMatch::Equal("jdoe".to_string())),
-                            not: false
-                        }]
-                    },
-                    then: Duration::from_secs(5 * 86400).into()
-                },
-                IfThen {
-                    conditions: Conditions {
-                        conditions: vec![
-                            Condition::Match {
-                                key: EnvelopeKey::Priority,
-                                value: ConditionMatch::Int(-1),
-                                not: false
-                            },
-                            Condition::JumpIfTrue { positions: 1 },
-                            Condition::Match {
-                                key: EnvelopeKey::Recipient,
-                                value: ConditionMatch::String(StringMatch::StartsWith(
-                                    "jane".to_string()
-                                )),
-                                not: false
-                            }
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_SENDER),
+                            ExpressionItem::Constant(Constant::String("jdoe".to_string())),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq)
                         ]
                     },
-                    then: Duration::from_secs(3600).into()
+                    then: Expression {
+                        items: vec![ExpressionItem::Constant(Constant::Integer(432000000))]
+                    }
+                },
+                IfThen {
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_PRIORITY),
+                            ExpressionItem::Constant(Constant::Integer(1)),
+                            ExpressionItem::UnaryOperator(UnaryOperator::Minus),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq),
+                            ExpressionItem::JmpIf { val: true, pos: 4 },
+                            ExpressionItem::Variable(V_RECIPIENT),
+                            ExpressionItem::Constant(Constant::String("jane".to_string())),
+                            ExpressionItem::Function {
+                                id: 29,
+                                num_args: 2
+                            },
+                            ExpressionItem::BinaryOperator(BinaryOperator::Or)
+                        ]
+                    },
+                    then: Expression {
+                        items: vec![ExpressionItem::Constant(Constant::Integer(3600000))]
+                    }
                 }
             ],
-            default: None
+            default: Expression {
+                items: vec![ExpressionItem::Constant(Constant::Integer(0))]
+            }
         }
     );
 
     assert_eq!(
-        config
-            .parse_if_block::<Vec<String>>("string-list", &context, &available_keys)
-            .unwrap()
-            .unwrap(),
+        IfBlock::try_parse(&mut config, "string-list", &token_map).unwrap(),
         IfBlock {
+            key: "string-list".to_string(),
             if_then: vec![
                 IfThen {
-                    conditions: Conditions {
-                        conditions: vec![Condition::Match {
-                            key: EnvelopeKey::Sender,
-                            value: ConditionMatch::String(StringMatch::Equal("jdoe".to_string())),
-                            not: false
-                        }]
-                    },
-                    then: vec!["From".to_string(), "To".to_string(), "Date".to_string()]
-                },
-                IfThen {
-                    conditions: Conditions {
-                        conditions: vec![
-                            Condition::Match {
-                                key: EnvelopeKey::Priority,
-                                value: ConditionMatch::Int(-1),
-                                not: false
-                            },
-                            Condition::JumpIfTrue { positions: 1 },
-                            Condition::Match {
-                                key: EnvelopeKey::Recipient,
-                                value: ConditionMatch::String(StringMatch::StartsWith(
-                                    "jane".to_string()
-                                )),
-                                not: false
-                            }
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_SENDER),
+                            ExpressionItem::Constant(Constant::String("jdoe".to_string())),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq)
                         ]
                     },
-                    then: vec!["Other-ID".to_string()]
+                    then: Expression {
+                        items: vec![
+                            ExpressionItem::Constant(Constant::String("From".to_string())),
+                            ExpressionItem::Constant(Constant::String("To".to_string())),
+                            ExpressionItem::Constant(Constant::String("Date".to_string())),
+                            ExpressionItem::ArrayBuild(3)
+                        ]
+                    }
+                },
+                IfThen {
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_PRIORITY),
+                            ExpressionItem::Constant(Constant::Integer(1)),
+                            ExpressionItem::UnaryOperator(UnaryOperator::Minus),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq),
+                            ExpressionItem::JmpIf { val: true, pos: 4 },
+                            ExpressionItem::Variable(V_RECIPIENT),
+                            ExpressionItem::Constant(Constant::String("jane".to_string())),
+                            ExpressionItem::Function {
+                                id: 29,
+                                num_args: 2
+                            },
+                            ExpressionItem::BinaryOperator(BinaryOperator::Or)
+                        ]
+                    },
+                    then: Expression {
+                        items: vec![ExpressionItem::Constant(Constant::String(
+                            "Other-ID".to_string()
+                        ))]
+                    }
                 }
             ],
-            default: vec![]
+            default: Expression {
+                items: vec![ExpressionItem::ArrayBuild(0)]
+            }
         }
     );
 
     assert_eq!(
-        config
-            .parse_if_block::<Vec<String>>("string-list-bis", &context, &available_keys)
-            .unwrap()
-            .unwrap(),
+        IfBlock::try_parse(&mut config, "string-list-bis", &token_map).unwrap(),
         IfBlock {
+            key: "string-list-bis".to_string(),
             if_then: vec![
                 IfThen {
-                    conditions: Conditions {
-                        conditions: vec![Condition::Match {
-                            key: EnvelopeKey::Sender,
-                            value: ConditionMatch::String(StringMatch::Equal("jdoe".to_string())),
-                            not: false
-                        }]
-                    },
-                    then: vec!["From".to_string(), "To".to_string(), "Date".to_string()]
-                },
-                IfThen {
-                    conditions: Conditions {
-                        conditions: vec![
-                            Condition::Match {
-                                key: EnvelopeKey::Priority,
-                                value: ConditionMatch::Int(-1),
-                                not: false
-                            },
-                            Condition::JumpIfTrue { positions: 1 },
-                            Condition::Match {
-                                key: EnvelopeKey::Recipient,
-                                value: ConditionMatch::String(StringMatch::StartsWith(
-                                    "jane".to_string()
-                                )),
-                                not: false
-                            }
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_SENDER),
+                            ExpressionItem::Constant(Constant::String("jdoe".to_string())),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq)
                         ]
                     },
-                    then: vec![]
+                    then: Expression {
+                        items: vec![
+                            ExpressionItem::Constant(Constant::String("From".to_string())),
+                            ExpressionItem::Constant(Constant::String("To".to_string())),
+                            ExpressionItem::Constant(Constant::String("Date".to_string())),
+                            ExpressionItem::ArrayBuild(3)
+                        ]
+                    }
+                },
+                IfThen {
+                    expr: Expression {
+                        items: vec![
+                            ExpressionItem::Variable(V_PRIORITY),
+                            ExpressionItem::Constant(Constant::Integer(1)),
+                            ExpressionItem::UnaryOperator(UnaryOperator::Minus),
+                            ExpressionItem::BinaryOperator(BinaryOperator::Eq),
+                            ExpressionItem::JmpIf { val: true, pos: 4 },
+                            ExpressionItem::Variable(V_RECIPIENT),
+                            ExpressionItem::Constant(Constant::String("jane".to_string())),
+                            ExpressionItem::Function {
+                                id: 29,
+                                num_args: 2
+                            },
+                            ExpressionItem::BinaryOperator(BinaryOperator::Or)
+                        ]
+                    },
+                    then: Expression {
+                        items: vec![ExpressionItem::ArrayBuild(0)]
+                    }
                 }
             ],
-            default: vec!["ID-Bis".to_string()]
+            default: Expression {
+                items: vec![
+                    ExpressionItem::Constant(Constant::String("ID-Bis".to_string())),
+                    ExpressionItem::ArrayBuild(1)
+                ]
+            }
         }
     );
 
     assert_eq!(
-        config
-            .parse_if_block::<String>("single-value", &context, &available_keys)
-            .unwrap()
-            .unwrap(),
+        IfBlock::try_parse(&mut config, "single-value", &token_map).unwrap(),
         IfBlock {
+            key: "single-value".to_string(),
             if_then: vec![],
-            default: "hello world".to_string()
+            default: Expression {
+                items: vec![ExpressionItem::Constant(Constant::String(
+                    "hello world".to_string()
+                ))]
+            }
         }
     );
 
     for bad_rule in [
-        "bad-multi-value",
         "bad-if-without-then",
         "bad-if-without-else",
         "bad-multiple-else",
     ] {
-        if let Ok(value) = config.parse_if_block::<u32>(bad_rule, &context, &available_keys) {
+        if let Some(value) = IfBlock::try_parse(&mut config, bad_rule, &token_map) {
             panic!("Condition {bad_rule:?} had unexpected result {value:?}");
         }
     }
 }
 
 #[test]
-fn parse_throttle() {
+fn parse_throttles() {
     let mut file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     file.push("resources");
     file.push("smtp");
     file.push("config");
     file.push("throttle.toml");
 
-    let available_keys = vec![
-        EnvelopeKey::Recipient,
-        EnvelopeKey::RecipientDomain,
-        EnvelopeKey::Sender,
-        EnvelopeKey::SenderDomain,
-        EnvelopeKey::AuthenticatedAs,
-        EnvelopeKey::Listener,
-        EnvelopeKey::RemoteIp,
-        EnvelopeKey::LocalIp,
-        EnvelopeKey::Priority,
-    ];
-
-    let config = Config::new(&fs::read_to_string(file).unwrap()).unwrap();
-    let context = ConfigContext::new(&[]);
-    let throttle = config
-        .parse_throttle("throttle", &context, &available_keys, u16::MAX)
-        .unwrap();
+    let mut config = Config::new(fs::read_to_string(file).unwrap()).unwrap();
+    let throttle = parse_throttle(
+        &mut config,
+        "throttle",
+        &TokenMap::default().with_variables(&[
+            V_RECIPIENT,
+            V_RECIPIENT_DOMAIN,
+            V_SENDER,
+            V_SENDER_DOMAIN,
+            V_AUTHENTICATED_AS,
+            V_LISTENER,
+            V_REMOTE_IP,
+            V_LOCAL_IP,
+            V_PRIORITY,
+        ]),
+        u16::MAX,
+    );
 
     assert_eq!(
         throttle,
         vec![
             Throttle {
-                conditions: Conditions {
-                    conditions: vec![Condition::Match {
-                        key: EnvelopeKey::RemoteIp,
-                        value: ConditionMatch::IpAddrMask(IpAddrMask::V4 {
-                            addr: "127.0.0.1".parse().unwrap(),
-                            mask: u32::MAX
-                        }),
-                        not: false
-                    }]
+                id: "0000".to_string(),
+                expr: Expression {
+                    items: vec![
+                        ExpressionItem::Variable(8),
+                        ExpressionItem::Constant(Constant::String("127.0.0.1".to_string())),
+                        ExpressionItem::BinaryOperator(BinaryOperator::Eq)
+                    ]
                 },
                 keys: THROTTLE_REMOTE_IP | THROTTLE_AUTH_AS,
                 concurrency: 100.into(),
@@ -417,7 +279,8 @@ fn parse_throttle() {
                 .into()
             },
             Throttle {
-                conditions: Conditions { conditions: vec![] },
+                id: "0001".to_string(),
+                expr: Expression::default(),
                 keys: THROTTLE_SENDER_DOMAIN,
                 concurrency: 10000.into(),
                 rate: None
@@ -437,16 +300,14 @@ fn parse_servers() {
     let toml = add_test_certs(&fs::read_to_string(file).unwrap());
 
     // Parse servers
-    let config = Config::new(&toml).unwrap();
-    let servers = config.parse_servers().unwrap().inner;
+    let mut config = Config::new(toml).unwrap();
+    let servers = Listeners::parse(&mut config).servers;
+    let id_generator = Arc::new(utils::snowflake::SnowflakeIdGenerator::new());
     let expected_servers = vec![
-        Server {
+        Listener {
             id: "smtp".to_string(),
-            internal_id: 0,
-            hostname: "mx.example.org".to_string(),
-            data: "Stalwart SMTP - hi there!".to_string(),
             protocol: ServerProtocol::Smtp,
-            listeners: vec![Listener {
+            listeners: vec![TcpListener {
                 socket: TcpSocket::new_v4().unwrap(),
                 addr: "127.0.0.1:9925".parse().unwrap(),
                 ttl: 3600.into(),
@@ -454,20 +315,15 @@ fn parse_servers() {
                 linger: None,
                 nodelay: true,
             }],
-            acceptor: TcpAcceptor::Plain,
-            tls_implicit: false,
             max_connections: 8192,
             proxy_networks: vec![],
-            blocked_ips: Arc::new(Default::default()),
+            span_id_gen: id_generator.clone(),
         },
-        Server {
+        Listener {
             id: "smtps".to_string(),
-            internal_id: 1,
-            hostname: "mx.example.org".to_string(),
-            data: "Stalwart SMTP - hi there!".to_string(),
             protocol: ServerProtocol::Smtp,
             listeners: vec![
-                Listener {
+                TcpListener {
                     socket: TcpSocket::new_v4().unwrap(),
                     addr: "127.0.0.1:9465".parse().unwrap(),
                     ttl: 4096.into(),
@@ -475,7 +331,7 @@ fn parse_servers() {
                     linger: None,
                     nodelay: true,
                 },
-                Listener {
+                TcpListener {
                     socket: TcpSocket::new_v4().unwrap(),
                     addr: "127.0.0.1:9466".parse().unwrap(),
                     ttl: 4096.into(),
@@ -484,19 +340,14 @@ fn parse_servers() {
                     nodelay: true,
                 },
             ],
-            acceptor: TcpAcceptor::Plain,
-            tls_implicit: true,
             max_connections: 1024,
             proxy_networks: vec![],
-            blocked_ips: Arc::new(Default::default()),
+            span_id_gen: id_generator.clone(),
         },
-        Server {
+        Listener {
             id: "submission".to_string(),
-            internal_id: 2,
-            hostname: "submit.example.org".to_string(),
-            data: "Stalwart SMTP submission at your service".to_string(),
             protocol: ServerProtocol::Smtp,
-            listeners: vec![Listener {
+            listeners: vec![TcpListener {
                 socket: TcpSocket::new_v4().unwrap(),
                 addr: "127.0.0.1:9991".parse().unwrap(),
                 ttl: 3600.into(),
@@ -504,11 +355,9 @@ fn parse_servers() {
                 linger: None,
                 nodelay: true,
             }],
-            acceptor: TcpAcceptor::Plain,
-            tls_implicit: true,
             max_connections: 8192,
             proxy_networks: vec![],
-            blocked_ips: Arc::new(Default::default()),
+            span_id_gen: id_generator.clone(),
         },
     ];
 
@@ -519,27 +368,7 @@ fn parse_servers() {
             expected_server.id
         );
         assert_eq!(
-            server.internal_id, expected_server.internal_id,
-            "failed for {}",
-            expected_server.id
-        );
-        assert_eq!(
-            server.hostname, expected_server.hostname,
-            "failed for {}",
-            expected_server.id
-        );
-        assert_eq!(
-            server.data, expected_server.data,
-            "failed for {}",
-            expected_server.id
-        );
-        assert_eq!(
             server.protocol, expected_server.protocol,
-            "failed for {}",
-            expected_server.id
-        );
-        assert_eq!(
-            server.tls_implicit, expected_server.tls_implicit,
             "failed for {}",
             expected_server.id
         );
@@ -573,39 +402,46 @@ async fn eval_if() {
     file.push("config");
     file.push("rules-eval.toml");
 
-    let config = Config::new(&fs::read_to_string(file).unwrap()).unwrap();
-    let servers = vec![
-        Server {
-            id: "smtp".to_string(),
-            internal_id: 123,
-            ..Default::default()
-        },
-        Server {
-            id: "smtps".to_string(),
-            internal_id: 456,
-            ..Default::default()
-        },
-    ];
-    let mut context = ConfigContext::new(&servers);
-    context.stores = config.parse_stores().await.unwrap();
-    let conditions = config.parse_conditions(&context).unwrap();
+    let mut config = Config::new(fs::read_to_string(file).unwrap()).unwrap();
+    let envelope = TestEnvelope::from_config(&mut config);
+    let token_map = TokenMap::default().with_variables(&[
+        V_RECIPIENT,
+        V_RECIPIENT_DOMAIN,
+        V_SENDER,
+        V_SENDER_DOMAIN,
+        V_AUTHENTICATED_AS,
+        V_LISTENER,
+        V_REMOTE_IP,
+        V_LOCAL_IP,
+        V_PRIORITY,
+        V_MX,
+    ]);
+    let core = Server::default();
 
-    let envelope = TestEnvelope::from_config(&config);
+    for (key, _) in config.keys.clone() {
+        if !key.starts_with("rule.") {
+            continue;
+        }
 
-    for (key, conditions) in conditions {
         //println!("============= Testing {:?} ==================", key);
         let (_, expected_result) = key.rsplit_once('-').unwrap();
         assert_eq!(
-            IfBlock {
-                if_then: vec![IfThen {
-                    conditions,
-                    then: true
-                }],
-                default: false,
-            }
-            .eval(&envelope)
-            .await,
-            &expected_result.parse::<bool>().unwrap(),
+            core.eval_if::<Variable, _>(
+                &IfBlock {
+                    key: key.to_string(),
+                    if_then: vec![IfThen {
+                        expr: Expression::try_parse(&mut config, key.as_str(), &token_map).unwrap(),
+                        then: Expression::from(true),
+                    }],
+                    default: Expression::from(false),
+                },
+                &envelope,
+                0
+            )
+            .await
+            .unwrap()
+            .to_bool(),
+            expected_result.parse::<bool>().unwrap(),
             "failed for {key:?}"
         );
     }
@@ -619,132 +455,71 @@ async fn eval_dynvalue() {
     file.push("config");
     file.push("rules-dynvalue.toml");
 
-    let config = Config::new(&fs::read_to_string(file).unwrap()).unwrap();
-    let mut context = ConfigContext::new(&[]);
-    context.stores = config.parse_stores().await.unwrap();
+    let mut config = Config::new(fs::read_to_string(file).unwrap()).unwrap();
+    let envelope = TestEnvelope::from_config(&mut config);
+    let token_map = TokenMap::default().with_variables(&[
+        V_RECIPIENT,
+        V_RECIPIENT_DOMAIN,
+        V_SENDER,
+        V_SENDER_DOMAIN,
+        V_AUTHENTICATED_AS,
+        V_LISTENER,
+        V_REMOTE_IP,
+        V_LOCAL_IP,
+        V_PRIORITY,
+        V_MX,
+    ]);
+    let core = Server::default();
 
-    let envelope = TestEnvelope::from_config(&config);
-
-    for test_name in config.sub_keys("eval", "") {
+    for test_name in config
+        .sub_keys("eval", "")
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+    {
         //println!("============= Testing {:?} ==================", key);
-        let if_block = config
-            .parse_if_block::<Option<DynValue<EnvelopeKey>>>(
-                ("eval", test_name, "test"),
-                &context,
-                &[
-                    EnvelopeKey::Recipient,
-                    EnvelopeKey::RecipientDomain,
-                    EnvelopeKey::Sender,
-                    EnvelopeKey::SenderDomain,
-                    EnvelopeKey::AuthenticatedAs,
-                    EnvelopeKey::Listener,
-                    EnvelopeKey::RemoteIp,
-                    EnvelopeKey::LocalIp,
-                    EnvelopeKey::Priority,
-                    EnvelopeKey::Mx,
-                ],
-            )
-            .unwrap()
-            .unwrap();
+        let if_block = IfBlock::try_parse(
+            &mut config,
+            ("eval", test_name.as_str(), "test"),
+            &token_map,
+        )
+        .unwrap();
         let expected = config
-            .property_require::<Option<String>>(("eval", test_name, "expect"))
-            .unwrap()
-            .map(Cow::Owned);
+            .property_require::<Option<String>>(("eval", test_name.as_str(), "expect"))
+            .unwrap_or_else(|| panic!("Missing expect for test {test_name:?}"));
 
         assert_eq!(
-            if_block
-                .eval_and_capture(&envelope)
-                .await
-                .into_value(&envelope),
+            core.eval_if::<String, _>(&if_block, &envelope, 0).await,
             expected,
             "failed for test {test_name:?}"
         );
     }
-    let wrapped_stores = context
-        .stores
-        .lookup_stores
-        .iter()
-        .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
-        .collect::<AHashMap<_, _>>();
-
-    for test_name in config.sub_keys("maybe-eval", "") {
-        //println!("============= Testing {:?} ==================", key);
-        let if_block = config
-            .parse_if_block::<Option<DynValue<EnvelopeKey>>>(
-                ("maybe-eval", test_name, "test"),
-                &context,
-                &[
-                    EnvelopeKey::Recipient,
-                    EnvelopeKey::RecipientDomain,
-                    EnvelopeKey::Sender,
-                    EnvelopeKey::SenderDomain,
-                    EnvelopeKey::AuthenticatedAs,
-                    EnvelopeKey::Listener,
-                    EnvelopeKey::RemoteIp,
-                    EnvelopeKey::LocalIp,
-                    EnvelopeKey::Priority,
-                    EnvelopeKey::Mx,
-                ],
-            )
-            .unwrap()
-            .unwrap()
-            .map_if_block(&wrapped_stores, ("maybe-eval", test_name, "test"), "test")
-            .unwrap();
-        let expected = config
-            .value_require(("maybe-eval", test_name, "expect"))
-            .unwrap();
-
-        let lookup: Lookup = if_block
-            .eval_and_capture(&envelope)
-            .await
-            .into_value(&envelope)
-            .unwrap()
-            .as_ref()
-            .clone()
-            .into();
-
-        assert!(lookup.contains(expected).await.unwrap());
-    }
 }
 
-impl KeyLookup for TestEnvelope {
-    type Key = EnvelopeKey;
-
-    fn key(&self, key: &Self::Key) -> std::borrow::Cow<'_, str> {
-        match key {
-            EnvelopeKey::Recipient => self.rcpt.as_str().into(),
-            EnvelopeKey::RecipientDomain => self.rcpt_domain.as_str().into(),
-            EnvelopeKey::Sender => self.sender.as_str().into(),
-            EnvelopeKey::SenderDomain => self.sender_domain.as_str().into(),
-            EnvelopeKey::AuthenticatedAs => self.authenticated_as.as_str().into(),
-            EnvelopeKey::Listener => self.listener_id.to_string().into(),
-            EnvelopeKey::RemoteIp => self.remote_ip.to_string().into(),
-            EnvelopeKey::LocalIp => self.local_ip.to_string().into(),
-            EnvelopeKey::Priority => self.priority.to_string().into(),
-            EnvelopeKey::Mx => self.mx.as_str().into(),
-            EnvelopeKey::HeloDomain => self.helo_domain.as_str().into(),
+impl ResolveVariable for TestEnvelope {
+    fn resolve_variable(&self, variable: u32) -> Variable<'_> {
+        match variable {
+            V_RECIPIENT => self.rcpt.as_str().into(),
+            V_RECIPIENT_DOMAIN => self.rcpt_domain.as_str().into(),
+            V_SENDER => self.sender.as_str().into(),
+            V_SENDER_DOMAIN => self.sender_domain.as_str().into(),
+            V_AUTHENTICATED_AS => self.authenticated_as.as_str().into(),
+            V_LISTENER => self.listener_id.to_string().into(),
+            V_REMOTE_IP => self.remote_ip.to_string().into(),
+            V_LOCAL_IP => self.local_ip.to_string().into(),
+            V_PRIORITY => self.priority.to_string().into(),
+            V_MX => self.mx.as_str().into(),
+            V_HELO_DOMAIN => self.helo_domain.as_str().into(),
+            _ => Default::default(),
         }
     }
 
-    fn key_as_int(&self, key: &Self::Key) -> i32 {
-        match key {
-            EnvelopeKey::Priority => self.priority as i32,
-            EnvelopeKey::Listener => self.listener_id as i32,
-            _ => unreachable!(),
-        }
-    }
-
-    fn key_as_ip(&self, key: &Self::Key) -> IpAddr {
-        match key {
-            EnvelopeKey::RemoteIp => self.remote_ip,
-            EnvelopeKey::LocalIp => self.local_ip,
-            _ => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        }
+    fn resolve_global(&self, _: &str) -> Variable<'_> {
+        Variable::Integer(0)
     }
 }
 
 impl TestEnvelope {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &mut Config) -> Self {
         Self {
             local_ip: config.property_require("envelope.local-ip").unwrap(),
             remote_ip: config.property_require("envelope.remote-ip").unwrap(),

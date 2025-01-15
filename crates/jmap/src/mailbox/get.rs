@@ -1,46 +1,75 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{acl::Acl, collection::Collection, keyword::Keyword, property::Property, value::Value},
 };
 use store::{ahash::AHashSet, query::Filter, roaring::RoaringBitmap};
+use trc::AddContext;
 
 use crate::{
-    auth::{acl::EffectiveAcl, AccessToken},
-    JMAP,
+    auth::acl::{AclMethods, EffectiveAcl},
+    changes::state::StateManager,
+    email::cache::ThreadCache,
+    JmapMethods,
 };
 
-impl JMAP {
-    pub async fn mailbox_get(
+use super::{set::MailboxSet, INBOX_ID};
+use std::future::Future;
+
+pub trait MailboxGet: Sync + Send {
+    fn mailbox_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn mailbox_count_threads(
+        &self,
+        account_id: u32,
+        document_ids: Option<RoaringBitmap>,
+    ) -> impl Future<Output = trc::Result<usize>> + Send;
+
+    fn mailbox_unread_tags(
+        &self,
+        account_id: u32,
+        document_id: u32,
+        message_ids: &Option<RoaringBitmap>,
+    ) -> impl Future<Output = trc::Result<Option<RoaringBitmap>>> + Send;
+
+    fn mailbox_expand_path<'x>(
+        &self,
+        account_id: u32,
+        path: &'x str,
+        exact_match: bool,
+    ) -> impl Future<Output = trc::Result<Option<ExpandPath<'x>>>> + Send;
+
+    fn mailbox_get_by_name(
+        &self,
+        account_id: u32,
+        path: &str,
+    ) -> impl Future<Output = trc::Result<Option<u32>>> + Send;
+
+    fn mailbox_get_by_role(
+        &self,
+        account_id: u32,
+        role: &str,
+    ) -> impl Future<Output = trc::Result<Option<u32>>> + Send;
+}
+
+impl MailboxGet for Server {
+    async fn mailbox_get(
         &self,
         mut request: GetRequest<RequestArguments>,
         access_token: &AccessToken,
-    ) -> Result<GetResponse, MethodError> {
-        let ids = request.unwrap_ids(self.config.get_max_objects)?;
+    ) -> trc::Result<GetResponse> {
+        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
             Property::Name,
@@ -67,7 +96,7 @@ impl JMAP {
         } else {
             mailbox_ids
                 .iter()
-                .take(self.config.get_max_objects)
+                .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
                 .collect::<Vec<_>>()
         };
@@ -258,33 +287,28 @@ impl JMAP {
         &self,
         account_id: u32,
         document_ids: Option<RoaringBitmap>,
-    ) -> Result<usize, MethodError> {
+    ) -> trc::Result<usize> {
         if let Some(document_ids) = document_ids {
             let mut thread_ids = AHashSet::default();
-            self.get_properties::<u32>(
-                account_id,
-                Collection::Email,
-                document_ids.into_iter(),
-                Property::ThreadId,
-            )
-            .await?
-            .into_iter()
-            .flatten()
-            .for_each(|thread_id| {
-                thread_ids.insert(thread_id);
-            });
+            self.get_cached_thread_ids(account_id, document_ids.into_iter())
+                .await
+                .caused_by(trc::location!())?
+                .into_iter()
+                .for_each(|(_, thread_id)| {
+                    thread_ids.insert(thread_id);
+                });
             Ok(thread_ids.len())
         } else {
             Ok(0)
         }
     }
 
-    pub async fn mailbox_unread_tags(
+    async fn mailbox_unread_tags(
         &self,
         account_id: u32,
         document_id: u32,
         message_ids: &Option<RoaringBitmap>,
-    ) -> Result<Option<RoaringBitmap>, MethodError> {
+    ) -> trc::Result<Option<RoaringBitmap>> {
         if let (Some(message_ids), Some(mailbox_message_ids)) = (
             message_ids,
             self.get_tag(
@@ -319,12 +343,12 @@ impl JMAP {
         }
     }
 
-    pub async fn mailbox_expand_path<'x>(
+    async fn mailbox_expand_path<'x>(
         &self,
         account_id: u32,
         path: &'x str,
         exact_match: bool,
-    ) -> Result<Option<ExpandPath<'x>>, MethodError> {
+    ) -> trc::Result<Option<ExpandPath<'x>>> {
         let path = path
             .split('/')
             .filter_map(|p| {
@@ -336,21 +360,32 @@ impl JMAP {
                 }
             })
             .collect::<Vec<_>>();
-        if path.is_empty() || path.len() > self.config.mailbox_max_depth {
+        if path.is_empty() || path.len() > self.core.jmap.mailbox_max_depth {
             return Ok(None);
         }
 
         let mut filter = Vec::with_capacity(path.len() + 2);
+        let mut has_inbox = false;
         filter.push(Filter::Or);
-        for &item in &path {
-            filter.push(Filter::eq(Property::Name, item));
+        for (pos, item) in path.iter().enumerate() {
+            if pos == 0 && item.eq_ignore_ascii_case("inbox") {
+                has_inbox = true;
+            } else {
+                filter.push(Filter::eq(Property::Name, *item));
+            }
         }
         filter.push(Filter::End);
 
-        let document_ids = self
-            .filter(account_id, Collection::Mailbox, filter)
-            .await?
-            .results;
+        let mut document_ids = if filter.len() > 2 {
+            self.filter(account_id, Collection::Mailbox, filter)
+                .await?
+                .results
+        } else {
+            RoaringBitmap::new()
+        };
+        if has_inbox {
+            document_ids.insert(INBOX_ID);
+        }
         if exact_match && (document_ids.len() as usize) < path.len() {
             return Ok(None);
         }
@@ -387,19 +422,19 @@ impl JMAP {
         Ok(Some(ExpandPath { path, found_names }))
     }
 
-    pub async fn mailbox_get_by_name(
-        &self,
-        account_id: u32,
-        path: &str,
-    ) -> Result<Option<u32>, MethodError> {
+    async fn mailbox_get_by_name(&self, account_id: u32, path: &str) -> trc::Result<Option<u32>> {
         Ok(self
             .mailbox_expand_path(account_id, path, true)
             .await?
             .and_then(|ep| {
                 let mut next_parent_id = 0;
-                'outer: for name in ep.path {
+                'outer: for (pos, name) in ep.path.iter().enumerate() {
+                    let is_inbox = pos == 0 && name.eq_ignore_ascii_case("inbox");
+
                     for (part, parent_id, document_id) in &ep.found_names {
-                        if part.eq(name) && *parent_id == next_parent_id {
+                        if (part.eq(name) || (is_inbox && part.eq_ignore_ascii_case("inbox")))
+                            && *parent_id == next_parent_id
+                        {
                             next_parent_id = *document_id;
                             continue 'outer;
                         }
@@ -410,11 +445,7 @@ impl JMAP {
             }))
     }
 
-    pub async fn mailbox_get_by_role(
-        &self,
-        account_id: u32,
-        role: &str,
-    ) -> Result<Option<u32>, MethodError> {
+    async fn mailbox_get_by_role(&self, account_id: u32, role: &str) -> trc::Result<Option<u32>> {
         self.filter(
             account_id,
             Collection::Mailbox,

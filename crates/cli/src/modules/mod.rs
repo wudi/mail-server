@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::{collections::HashMap, fmt::Display, io::Read};
 
@@ -55,7 +38,7 @@ pub struct Principal {
 
     #[serde(rename = "usedQuota")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub used_quota: Option<u32>,
+    pub used_quota: Option<u64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -117,6 +100,18 @@ pub enum PrincipalField {
     Members,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct List<T> {
+    pub items: Vec<T>,
+    pub total: u64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct Response<T> {
+    pub items: T,
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PrincipalUpdate {
     action: PrincipalAction,
@@ -139,7 +134,7 @@ pub enum PrincipalAction {
 pub enum PrincipalValue {
     String(String),
     StringList(Vec<String>),
-    Integer(u32),
+    Integer(u64),
 }
 
 impl PrincipalUpdate {
@@ -196,10 +191,6 @@ impl<T, E: Display> UnwrapResult<T> for Result<T, E> {
     }
 }
 
-trait TableName {
-    fn table_name(&self) -> &'static str;
-}
-
 pub fn read_file(path: &str) -> Vec<u8> {
     if path == "-" {
         let mut stdin = std::io::stdin().lock();
@@ -247,7 +238,7 @@ pub async fn name_to_id(client: &Client, name: &str) -> String {
 pub fn is_localhost(url: &str) -> bool {
     url.split_once("://")
         .map(|(_, url)| url.split_once('/').map_or(url, |(host, _)| host))
-        .map_or(false, |host| {
+        .is_some_and(|host| {
             let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
             host == "localhost" || host == "127.0.0.1" || host == "[::1]"
         })

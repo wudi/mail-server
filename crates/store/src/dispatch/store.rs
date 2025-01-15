@@ -1,44 +1,42 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::ops::{BitAndAssign, Range};
-
-use roaring::RoaringBitmap;
-
-use crate::{
-    write::{key::KeySerializer, AnyKey, Batch, BitmapClass, ValueClass},
-    BitmapKey, Deserialize, IterateParams, Key, Store, ValueKey, SUBSPACE_BITMAPS,
-    SUBSPACE_INDEXES, SUBSPACE_LOGS, U32_LEN,
+use std::{
+    ops::{BitAndAssign, Range},
+    time::Instant,
 };
 
+use roaring::RoaringBitmap;
+use trc::{AddContext, StoreEvent};
+
+use crate::{
+    write::{
+        key::{DeserializeBigEndian, KeySerializer},
+        now, AnyClass, AnyKey, AssignedIds, Batch, BatchBuilder, BitmapClass, BitmapHash,
+        Operation, ReportClass, ValueClass, ValueOp,
+    },
+    BitmapKey, Deserialize, IterateParams, Key, QueryResult, Store, Value, ValueKey,
+    SUBSPACE_BITMAP_ID, SUBSPACE_BITMAP_TAG, SUBSPACE_BITMAP_TEXT, SUBSPACE_INDEXES, SUBSPACE_LOGS,
+    U32_LEN,
+};
+
+use super::DocumentSet;
+
 #[cfg(feature = "test_mode")]
-lazy_static::lazy_static! {
-pub static ref BITMAPS: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashSet<u32>>>> =
-                    std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-}
+#[allow(clippy::type_complexity)]
+static BITMAPS: std::sync::LazyLock<
+    std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashSet<u32>>>,
+    >,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+});
 
 impl Store {
-    pub async fn get_value<U>(&self, key: impl Key) -> crate::Result<Option<U>>
+    pub async fn get_value<U>(&self, key: impl Key) -> trc::Result<Option<U>>
     where
         U: Deserialize + 'static,
     {
@@ -53,26 +51,17 @@ impl Store {
             Self::MySQL(store) => store.get_value(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_value(key).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_value(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
-    }
-
-    pub async fn get_values<U>(&self, key: Vec<impl Key>) -> crate::Result<Vec<Option<U>>>
-    where
-        U: Deserialize + 'static,
-    {
-        let mut results = Vec::with_capacity(key.len());
-
-        for key in key {
-            results.push(self.get_value(key).await?);
-        }
-
-        Ok(results)
+        .caused_by(trc::location!())
     }
 
     pub async fn get_bitmap(
         &self,
-        key: BitmapKey<BitmapClass>,
-    ) -> crate::Result<Option<RoaringBitmap>> {
+        key: BitmapKey<BitmapClass<u32>>,
+    ) -> trc::Result<Option<RoaringBitmap>> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_bitmap(key).await,
@@ -84,16 +73,20 @@ impl Store {
             Self::MySQL(store) => store.get_bitmap(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_bitmap(key).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_bitmap(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
     pub async fn get_bitmaps_intersection(
         &self,
-        keys: Vec<BitmapKey<BitmapClass>>,
-    ) -> crate::Result<Option<RoaringBitmap>> {
+        keys: Vec<BitmapKey<BitmapClass<u32>>>,
+    ) -> trc::Result<Option<RoaringBitmap>> {
         let mut result: Option<RoaringBitmap> = None;
         for key in keys {
-            if let Some(bitmap) = self.get_bitmap(key).await? {
+            if let Some(bitmap) = self.get_bitmap(key).await.caused_by(trc::location!())? {
                 if let Some(result) = &mut result {
                     result.bitand_assign(&bitmap);
                     if result.is_empty() {
@@ -112,9 +105,10 @@ impl Store {
     pub async fn iterate<T: Key>(
         &self,
         params: IterateParams<T>,
-        cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> crate::Result<bool> + Sync + Send,
-    ) -> crate::Result<()> {
-        match self {
+        cb: impl for<'x> FnMut(&'x [u8], &'x [u8]) -> trc::Result<bool> + Sync + Send,
+    ) -> trc::Result<()> {
+        let start_time = Instant::now();
+        let result = match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.iterate(params, cb).await,
             #[cfg(feature = "foundation")]
@@ -125,13 +119,24 @@ impl Store {
             Self::MySQL(store) => store.iterate(params, cb).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.iterate(params, cb).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.iterate(params, cb).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!());
+
+        trc::event!(
+            Store(StoreEvent::DataIterate),
+            Elapsed = start_time.elapsed(),
+        );
+
+        result
     }
 
     pub async fn get_counter(
         &self,
-        key: impl Into<ValueKey<ValueClass>> + Sync + Send,
-    ) -> crate::Result<i64> {
+        key: impl Into<ValueKey<ValueClass<u32>>> + Sync + Send,
+    ) -> trc::Result<i64> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_counter(key).await,
@@ -143,18 +148,49 @@ impl Store {
             Self::MySQL(store) => store.get_counter(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_counter(key).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_counter(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn write(&self, batch: Batch) -> crate::Result<()> {
+    #[allow(unreachable_patterns)]
+    #[allow(unused_variables)]
+    pub async fn sql_query<T: QueryResult + std::fmt::Debug>(
+        &self,
+        query: &str,
+        params: Vec<Value<'_>>,
+    ) -> trc::Result<T> {
+        let result = match self {
+            #[cfg(feature = "sqlite")]
+            Self::SQLite(store) => store.query(query, &params).await,
+            #[cfg(feature = "postgres")]
+            Self::PostgreSQL(store) => store.query(query, &params).await,
+            #[cfg(feature = "mysql")]
+            Self::MySQL(store) => store.query(query, &params).await,
+            _ => Err(trc::StoreEvent::NotSupported.into_err()),
+        };
+
+        trc::event!(
+            Store(trc::StoreEvent::SqlQuery),
+            Details = query.to_string(),
+            Value = params.as_slice(),
+            Result = &result,
+        );
+
+        result.caused_by(trc::location!())
+    }
+
+    pub async fn write(&self, batch: Batch) -> trc::Result<AssignedIds> {
         #[cfg(feature = "test_mode")]
-        if std::env::var("PARANOID_WRITE").map_or(false, |v| v == "1") {
-            use crate::write::Operation;
+        if std::env::var("PARANOID_WRITE").is_ok_and(|v| v == "1") {
             let mut account_id = u32::MAX;
             let mut collection = u8::MAX;
             let mut document_id = u32::MAX;
 
             let mut bitmaps = Vec::new();
+            let mut result = AssignedIds::default();
 
             for op in &batch.ops {
                 match op {
@@ -174,13 +210,19 @@ impl Store {
                         document_id = *document_id_;
                     }
                     Operation::Bitmap { class, set } => {
-                        let key = BitmapKey {
+                        if *set && matches!(class, BitmapClass::DocumentIds) {
+                            let id = result.document_ids.len() as u32;
+                            result.document_ids.push(id);
+                        }
+
+                        let key = class.serialize(
                             account_id,
                             collection,
-                            block_num: 0,
-                            class,
-                        }
-                        .serialize(0);
+                            document_id,
+                            0,
+                            (&result).into(),
+                        );
+
                         bitmaps.push((key, class.clone(), document_id, *set));
                     }
                     _ => {}
@@ -198,7 +240,11 @@ impl Store {
                 Self::MySQL(store) => store.write(batch).await,
                 #[cfg(feature = "rocks")]
                 Self::RocksDb(store) => store.write(batch).await,
-            }?;
+                #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+                Self::SQLReadReplica(store) => store.write(batch).await,
+                Self::None => Err(trc::StoreEvent::NotConfigured.into()),
+            }
+            .caused_by(trc::location!())?;
 
             for (key, class, document_id, set) in bitmaps {
                 let mut bitmaps = BITMAPS.lock();
@@ -224,10 +270,13 @@ impl Store {
                 }
             }
 
-            return Ok(());
+            return Ok(AssignedIds::default());
         }
 
-        match self {
+        let start_time = Instant::now();
+        let ops = batch.ops.len();
+
+        let result = match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.write(batch).await,
             #[cfg(feature = "foundation")]
@@ -238,24 +287,70 @@ impl Store {
             Self::MySQL(store) => store.write(batch).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.write(batch).await,
-        }
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.write(batch).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
+        };
+
+        trc::event!(
+            Store(StoreEvent::DataWrite),
+            Elapsed = start_time.elapsed(),
+            Total = ops,
+        );
+
+        result
     }
 
-    pub async fn purge_bitmaps(&self) -> crate::Result<()> {
+    pub async fn purge_store(&self) -> trc::Result<()> {
+        // Delete expired reports
+        let now = now();
+        self.delete_range(
+            ValueKey::from(ValueClass::Report(ReportClass::Dmarc { id: 0, expires: 0 })),
+            ValueKey::from(ValueClass::Report(ReportClass::Dmarc {
+                id: u64::MAX,
+                expires: now,
+            })),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        self.delete_range(
+            ValueKey::from(ValueClass::Report(ReportClass::Tls { id: 0, expires: 0 })),
+            ValueKey::from(ValueClass::Report(ReportClass::Tls {
+                id: u64::MAX,
+                expires: now,
+            })),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        self.delete_range(
+            ValueKey::from(ValueClass::Report(ReportClass::Arf { id: 0, expires: 0 })),
+            ValueKey::from(ValueClass::Report(ReportClass::Arf {
+                id: u64::MAX,
+                expires: now,
+            })),
+        )
+        .await
+        .caused_by(trc::location!())?;
+
         match self {
             #[cfg(feature = "sqlite")]
-            Self::SQLite(store) => store.purge_bitmaps().await,
+            Self::SQLite(store) => store.purge_store().await,
             #[cfg(feature = "foundation")]
-            Self::FoundationDb(store) => store.purge_bitmaps().await,
+            Self::FoundationDb(store) => store.purge_store().await,
             #[cfg(feature = "postgres")]
-            Self::PostgreSQL(store) => store.purge_bitmaps().await,
+            Self::PostgreSQL(store) => store.purge_store().await,
             #[cfg(feature = "mysql")]
-            Self::MySQL(store) => store.purge_bitmaps().await,
+            Self::MySQL(store) => store.purge_store().await,
             #[cfg(feature = "rocks")]
-            Self::RocksDb(store) => store.purge_bitmaps().await,
+            Self::RocksDb(store) => store.purge_store().await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.purge_store().await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
-    pub(crate) async fn delete_range(&self, from: impl Key, to: impl Key) -> crate::Result<()> {
+
+    pub async fn delete_range(&self, from: impl Key, to: impl Key) -> trc::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.delete_range(from, to).await,
@@ -267,11 +362,100 @@ impl Store {
             Self::MySQL(store) => store.delete_range(from, to).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.delete_range(from, to).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.delete_range(from, to).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn purge_account(&self, account_id: u32) -> crate::Result<()> {
-        for subspace in [SUBSPACE_BITMAPS, SUBSPACE_LOGS, SUBSPACE_INDEXES] {
+    pub async fn delete_documents(
+        &self,
+        subspace: u8,
+        account_id: u32,
+        collection: u8,
+        collection_offset: Option<usize>,
+        document_ids: &impl DocumentSet,
+    ) -> trc::Result<()> {
+        // Serialize keys
+        let (from_key, to_key) = if collection_offset.is_some() {
+            (
+                KeySerializer::new(U32_LEN + 2)
+                    .write(account_id)
+                    .write(collection),
+                KeySerializer::new(U32_LEN + 2)
+                    .write(account_id)
+                    .write(collection + 1),
+            )
+        } else {
+            (
+                KeySerializer::new(U32_LEN).write(account_id),
+                KeySerializer::new(U32_LEN).write(account_id + 1),
+            )
+        };
+
+        // Find keys to delete
+        let mut delete_keys = Vec::new();
+        self.iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace,
+                    key: from_key.finalize(),
+                },
+                AnyKey {
+                    subspace,
+                    key: to_key.finalize(),
+                },
+            )
+            .no_values(),
+            |key, _| {
+                if collection_offset.map_or(true, |offset| {
+                    key.get(key.len() - U32_LEN - offset).copied() == Some(collection)
+                }) {
+                    let document_id = key.deserialize_be_u32(key.len() - U32_LEN)?;
+                    if document_ids.contains(document_id) {
+                        delete_keys.push(key.to_vec());
+                    }
+                }
+
+                Ok(true)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+
+        // Remove keys
+        let mut batch = BatchBuilder::new();
+
+        for key in delete_keys {
+            if batch.ops.len() >= 1000 {
+                self.write(std::mem::take(&mut batch).build())
+                    .await
+                    .caused_by(trc::location!())?;
+            }
+            batch.ops.push(Operation::Value {
+                class: ValueClass::Any(AnyClass { subspace, key }),
+                op: ValueOp::Clear,
+            });
+        }
+
+        if !batch.is_empty() {
+            self.write(batch.build())
+                .await
+                .caused_by(trc::location!())?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn purge_account(&self, account_id: u32) -> trc::Result<()> {
+        for subspace in [
+            SUBSPACE_BITMAP_ID,
+            SUBSPACE_BITMAP_TAG,
+            SUBSPACE_BITMAP_TEXT,
+            SUBSPACE_LOGS,
+            SUBSPACE_INDEXES,
+        ] {
             self.delete_range(
                 AnyKey {
                     subspace,
@@ -282,14 +466,23 @@ impl Store {
                     key: KeySerializer::new(U32_LEN).write(account_id + 1).finalize(),
                 },
             )
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
         }
 
         for (from_class, to_class) in [
             (ValueClass::Acl(account_id), ValueClass::Acl(account_id + 1)),
-            (ValueClass::ReservedId, ValueClass::ReservedId),
             (ValueClass::Property(0), ValueClass::Property(0)),
-            (ValueClass::TermIndex, ValueClass::TermIndex),
+            (
+                ValueClass::FtsIndex(BitmapHash {
+                    hash: [0u8; 8],
+                    len: 0,
+                }),
+                ValueClass::FtsIndex(BitmapHash {
+                    hash: [u8::MAX; 8],
+                    len: u8::MAX,
+                }),
+            ),
         ] {
             self.delete_range(
                 ValueKey {
@@ -305,13 +498,32 @@ impl Store {
                     class: to_class,
                 },
             )
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
         }
+
+        // Delete property counters (TODO: make this more elegant)
+        self.delete_range(
+            ValueKey {
+                account_id,
+                collection: 1,
+                document_id: 0,
+                class: ValueClass::Property(84),
+            },
+            ValueKey {
+                account_id,
+                collection: 1,
+                document_id: u32::MAX,
+                class: ValueClass::Property(84),
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
 
         Ok(())
     }
 
-    pub async fn get_blob(&self, key: &[u8], range: Range<u32>) -> crate::Result<Option<Vec<u8>>> {
+    pub async fn get_blob(&self, key: &[u8], range: Range<usize>) -> trc::Result<Option<Vec<u8>>> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.get_blob(key, range).await,
@@ -323,10 +535,14 @@ impl Store {
             Self::MySQL(store) => store.get_blob(key, range).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.get_blob(key, range).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.get_blob(key, range).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn put_blob(&self, key: &[u8], data: &[u8]) -> crate::Result<()> {
+    pub async fn put_blob(&self, key: &[u8], data: &[u8]) -> trc::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.put_blob(key, data).await,
@@ -338,10 +554,14 @@ impl Store {
             Self::MySQL(store) => store.put_blob(key, data).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.put_blob(key, data).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.put_blob(key, data).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn delete_blob(&self, key: &[u8]) -> crate::Result<bool> {
+    pub async fn delete_blob(&self, key: &[u8]) -> trc::Result<bool> {
         match self {
             #[cfg(feature = "sqlite")]
             Self::SQLite(store) => store.delete_blob(key).await,
@@ -353,20 +573,42 @@ impl Store {
             Self::MySQL(store) => store.delete_blob(key).await,
             #[cfg(feature = "rocks")]
             Self::RocksDb(store) => store.delete_blob(key).await,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(store) => store.delete_blob(key).await,
+            Self::None => Err(trc::StoreEvent::NotConfigured.into()),
         }
+        .caused_by(trc::location!())
     }
 
     #[cfg(feature = "test_mode")]
     pub async fn destroy(&self) {
-        use crate::{SUBSPACE_BLOBS, SUBSPACE_COUNTERS, SUBSPACE_VALUES};
+        use crate::*;
 
         for subspace in [
-            SUBSPACE_VALUES,
-            SUBSPACE_LOGS,
-            SUBSPACE_BITMAPS,
+            SUBSPACE_ACL,
+            SUBSPACE_BITMAP_ID,
+            SUBSPACE_BITMAP_TAG,
+            SUBSPACE_BITMAP_TEXT,
+            SUBSPACE_DIRECTORY,
+            SUBSPACE_TASK_QUEUE,
             SUBSPACE_INDEXES,
-            SUBSPACE_COUNTERS,
+            SUBSPACE_BLOB_RESERVE,
+            SUBSPACE_BLOB_LINK,
+            SUBSPACE_LOGS,
+            SUBSPACE_IN_MEMORY_VALUE,
+            SUBSPACE_COUNTER,
+            SUBSPACE_PROPERTY,
+            SUBSPACE_SETTINGS,
             SUBSPACE_BLOBS,
+            SUBSPACE_QUEUE_MESSAGE,
+            SUBSPACE_QUEUE_EVENT,
+            SUBSPACE_QUOTA,
+            SUBSPACE_REPORT_OUT,
+            SUBSPACE_REPORT_IN,
+            SUBSPACE_FTS_INDEX,
+            SUBSPACE_TELEMETRY_SPAN,
+            SUBSPACE_TELEMETRY_METRIC,
+            SUBSPACE_TELEMETRY_INDEX,
         ] {
             self.delete_range(
                 AnyKey {
@@ -395,10 +637,9 @@ impl Store {
 
     #[cfg(feature = "test_mode")]
     pub async fn blob_expire_all(&self) {
-        use crate::{
-            write::{key::DeserializeBigEndian, BatchBuilder, BlobOp, Operation, ValueOp},
-            BlobHash, BLOB_HASH_LEN, U64_LEN,
-        };
+        use utils::{BlobHash, BLOB_HASH_LEN};
+
+        use crate::{write::BlobOp, U64_LEN};
 
         // Delete all temporary hashes
         let from_key = ValueKey {
@@ -424,7 +665,7 @@ impl Store {
         self.iterate(
             IterateParams::new(from_key, to_key).ascending().no_values(),
             |key, _| {
-                let account_id = key.deserialize_be_u32(1)?;
+                let account_id = key.deserialize_be_u32(0).caused_by(trc::location!())?;
                 if account_id != last_account_id {
                     last_account_id = account_id;
                     batch.with_account_id(account_id);
@@ -433,10 +674,12 @@ impl Store {
                 batch.ops.push(Operation::Value {
                     class: ValueClass::Blob(BlobOp::Reserve {
                         hash: BlobHash::try_from_hash_slice(
-                            key.get(1 + U32_LEN..1 + U32_LEN + BLOB_HASH_LEN).unwrap(),
+                            key.get(U32_LEN..U32_LEN + BLOB_HASH_LEN).unwrap(),
                         )
                         .unwrap(),
-                        until: key.deserialize_be_u64(key.len() - U64_LEN)?,
+                        until: key
+                            .deserialize_be_u64(key.len() - U64_LEN)
+                            .caused_by(trc::location!())?,
                     }),
                     op: ValueOp::Clear,
                 });
@@ -450,26 +693,108 @@ impl Store {
     }
 
     #[cfg(feature = "test_mode")]
-    #[allow(unused_variables)]
+    pub async fn lookup_expire_all(&self) {
+        use crate::write::InMemoryClass;
 
+        // Delete all temporary counters
+        let from_key = ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![0u8])));
+        let to_key = ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![u8::MAX; 10])));
+
+        let mut expired_keys = Vec::new();
+        let mut expired_counters = Vec::new();
+
+        self.iterate(IterateParams::new(from_key, to_key), |key, value| {
+            let expiry = value.deserialize_be_u64(0).caused_by(trc::location!())?;
+            if expiry == 0 {
+                expired_counters.push(key.to_vec());
+            } else if expiry != u64::MAX {
+                expired_keys.push(key.to_vec());
+            }
+            Ok(true)
+        })
+        .await
+        .unwrap();
+
+        if !expired_keys.is_empty() {
+            let mut batch = BatchBuilder::new();
+            for key in expired_keys {
+                batch.ops.push(Operation::Value {
+                    class: ValueClass::InMemory(InMemoryClass::Key(key)),
+                    op: ValueOp::Clear,
+                });
+                if batch.ops.len() >= 1000 {
+                    self.write(batch.build()).await.unwrap();
+                    batch = BatchBuilder::new();
+                }
+            }
+            if !batch.ops.is_empty() {
+                self.write(batch.build()).await.unwrap();
+            }
+        }
+
+        if !expired_counters.is_empty() {
+            let mut batch = BatchBuilder::new();
+            for key in expired_counters {
+                batch.ops.push(Operation::Value {
+                    class: ValueClass::InMemory(InMemoryClass::Counter(key.clone())),
+                    op: ValueOp::Clear,
+                });
+                batch.ops.push(Operation::Value {
+                    class: ValueClass::InMemory(InMemoryClass::Key(key)),
+                    op: ValueOp::Clear,
+                });
+                if batch.ops.len() >= 1000 {
+                    self.write(batch.build()).await.unwrap();
+                    batch = BatchBuilder::new();
+                }
+            }
+            if !batch.ops.is_empty() {
+                self.write(batch.build()).await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "test_mode")]
+    #[allow(unused_variables)]
     pub async fn assert_is_empty(&self, blob_store: crate::BlobStore) {
         use utils::codec::leb128::Leb128Iterator;
 
-        use crate::{SUBSPACE_BLOBS, SUBSPACE_COUNTERS, SUBSPACE_VALUES};
+        use crate::*;
 
         self.blob_expire_all().await;
+        self.lookup_expire_all().await;
         self.purge_blobs(blob_store).await.unwrap();
-        self.purge_bitmaps().await.unwrap();
+        self.purge_store().await.unwrap();
 
         let store = self.clone();
         let mut failed = false;
 
         for (subspace, with_values) in [
-            (SUBSPACE_VALUES, true),
-            (SUBSPACE_COUNTERS, false),
+            (SUBSPACE_ACL, true),
+            //(SUBSPACE_DIRECTORY, true),
+            (SUBSPACE_TASK_QUEUE, true),
+            (SUBSPACE_IN_MEMORY_VALUE, true),
+            (SUBSPACE_IN_MEMORY_COUNTER, false),
+            (SUBSPACE_PROPERTY, true),
+            (SUBSPACE_SETTINGS, true),
+            (SUBSPACE_QUEUE_MESSAGE, true),
+            (SUBSPACE_QUEUE_EVENT, true),
+            (SUBSPACE_REPORT_OUT, true),
+            (SUBSPACE_REPORT_IN, true),
+            (SUBSPACE_FTS_INDEX, true),
+            (SUBSPACE_BLOB_RESERVE, true),
+            (SUBSPACE_BLOB_LINK, true),
             (SUBSPACE_BLOBS, true),
-            (SUBSPACE_BITMAPS, false),
+            (SUBSPACE_COUNTER, false),
+            (SUBSPACE_QUOTA, false),
+            (SUBSPACE_BLOBS, true),
+            (SUBSPACE_BITMAP_ID, false),
+            (SUBSPACE_BITMAP_TAG, false),
+            (SUBSPACE_BITMAP_TEXT, false),
             (SUBSPACE_INDEXES, false),
+            (SUBSPACE_TELEMETRY_SPAN, true),
+            (SUBSPACE_TELEMETRY_METRIC, true),
+            (SUBSPACE_TELEMETRY_INDEX, true),
         ] {
             let from_key = crate::write::AnyKey {
                 subspace,
@@ -484,15 +809,8 @@ impl Store {
                 IterateParams::new(from_key, to_key).set_values(with_values),
                 |key, value| {
                     match subspace {
-                        SUBSPACE_BITMAPS => {
+                        SUBSPACE_BITMAP_ID | SUBSPACE_BITMAP_TAG | SUBSPACE_BITMAP_TEXT => {
                             if key.get(0..4).unwrap_or_default() == u32::MAX.to_be_bytes() {
-                                return Ok(true);
-                            }
-
-                            #[cfg(feature = "rocks")]
-                            if matches!(store, Self::RocksDb(_))
-                                && RoaringBitmap::deserialize(value).unwrap().is_empty()
-                            {
                                 return Ok(true);
                             }
 
@@ -504,31 +822,31 @@ impl Store {
 
                             match key[5] {
                                 BM_DOCUMENT_IDS => {
-                                    eprint!("Found document ids bitmap");
+                                    print!("Found document ids bitmap");
                                 }
                                 BM_TAG => {
-                                    eprint!(
+                                    print!(
                                         "Found tagged id {} bitmap",
                                         key[7..].iter().next_leb128::<u32>().unwrap()
                                     );
                                 }
                                 TAG_TEXT => {
-                                    eprint!(
+                                    print!(
                                         "Found tagged text {:?} bitmap",
                                         String::from_utf8_lossy(&key[7..])
                                     );
                                 }
                                 TAG_STATIC => {
-                                    eprint!("Found tagged static {} bitmap", key[7]);
+                                    print!("Found tagged static {} bitmap", key[7]);
                                 }
                                 other => {
                                     if other & BM_TEXT == BM_TEXT {
-                                        eprint!(
+                                        print!(
                                             "Found text hash {:?} bitmap",
                                             String::from_utf8_lossy(&key[7..])
                                         );
                                     } else {
-                                        eprint!("Found unknown bitmap");
+                                        print!("Found unknown bitmap");
                                     }
                                 }
                             }
@@ -546,18 +864,6 @@ impl Store {
                                 value
                             );
                         }
-                        SUBSPACE_VALUES
-                            if key[0] == 3
-                                || key[0] >= 20
-                                || key.get(1..5).unwrap_or_default() == u32::MAX.to_be_bytes() =>
-                        {
-                            // Ignore lastId counter and ID mappings
-                            return Ok(true);
-                        }
-                        SUBSPACE_COUNTERS if key.len() <= 4 => {
-                            // Ignore named keys
-                            return Ok(true);
-                        }
                         SUBSPACE_INDEXES => {
                             println!(
                                 concat!(
@@ -574,10 +880,12 @@ impl Store {
                         }
                         _ => {
                             println!(
-                                "Found key in {:?}: {:?} {:?}",
+                                "Found key in {:?}: {:?} ({:?}) = {:?} ({:?})",
                                 char::from(subspace),
                                 key,
-                                value
+                                String::from_utf8_lossy(key),
+                                value,
+                                String::from_utf8_lossy(value)
                             );
                         }
                     }

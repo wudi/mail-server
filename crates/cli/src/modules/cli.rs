@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2020-2023, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jmap_client::client::Credentials;
@@ -46,21 +29,21 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Manage user accounts
-    #[clap(subcommand)]
-    Account(AccountCommands),
+    /* #[clap(subcommand)]
+        Account(AccountCommands),
 
-    /// Manage domains
-    #[clap(subcommand)]
-    Domain(DomainCommands),
+        /// Manage domains
+        #[clap(subcommand)]
+        Domain(DomainCommands),
 
-    /// Manage mailing lists
-    #[clap(subcommand)]
-    List(ListCommands),
+        /// Manage mailing lists
+        #[clap(subcommand)]
+        List(ListCommands),
 
-    /// Manage groups
-    #[clap(subcommand)]
-    Group(GroupCommands),
-
+        /// Manage groups
+        #[clap(subcommand)]
+        Group(GroupCommands),
+    */
     /// Import JMAP accounts and Maildir/mbox mailboxes
     #[clap(subcommand)]
     Import(ImportCommands),
@@ -128,7 +111,7 @@ pub enum AccountCommands {
         description: Option<String>,
         /// Update quota in bytes
         #[clap(short, long)]
-        quota: Option<u32>,
+        quota: Option<u64>,
         /// Whether the account is an administrator
         #[clap(short, long)]
         is_admin: Option<bool>,
@@ -190,10 +173,12 @@ pub enum AccountCommands {
 
     /// List all user accounts
     List {
-        /// Starting point for listing accounts
-        from: Option<String>,
+        /// Filter accounts by keywords
+        filter: Option<String>,
         /// Maximum number of accounts to list
         limit: Option<usize>,
+        /// Page number
+        page: Option<usize>,
     },
 }
 
@@ -255,10 +240,12 @@ pub enum ListCommands {
 
     /// List all mailing lists
     List {
-        /// Starting point for listing mailing lists
-        from: Option<String>,
+        /// Filter mailing lists by keywords
+        filter: Option<String>,
         /// Maximum number of mailing lists to list
         limit: Option<usize>,
+        /// Page number
+        page: Option<usize>,
     },
 }
 
@@ -320,10 +307,12 @@ pub enum GroupCommands {
 
     /// List all groups
     List {
-        /// Starting point for listing groups
-        from: Option<String>,
+        /// Filter groups by keywords
+        filter: Option<String>,
         /// Maximum number of groups to list
         limit: Option<usize>,
+        /// Page number
+        page: Option<usize>,
     },
 }
 
@@ -338,6 +327,12 @@ pub enum DomainCommands {
     /// Delete an existing domain
     Delete {
         /// Domain name to delete
+        name: String,
+    },
+
+    /// List DNS records for domain
+    DNSRecords {
+        /// Domain name to list DNS records for
         name: String,
     },
 

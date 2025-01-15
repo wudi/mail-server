@@ -1,38 +1,23 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{borrow::Cow, collections::BTreeSet, fmt::Display, io::Cursor, net::IpAddr};
+use std::{
+    borrow::Cow, collections::BTreeSet, fmt::Display, future::Future, io::Cursor, sync::Arc,
+};
 
 use crate::{
-    api::{http::ToHttpResponse, HtmlResponse, HttpRequest, HttpResponse},
-    auth::oauth::FormData,
-    JMAP,
+    api::{http::ToHttpResponse, HttpResponse, JsonResponse},
+    JmapMethods,
 };
 use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
-use directory::AuthResult;
+use common::{auth::AccessToken, Server};
+use directory::backend::internal::manage;
 use jmap_proto::types::{collection::Collection, property::Property};
 use mail_builder::{encoders::base64::base64_encode_mime, mime::make_boundary};
-use mail_parser::{decoders::base64::base64_decode, Message, MessageParser, MimeHeaders};
+use mail_parser::{decoders::base64::base64_decode, Message, MessageParser, MimeHeaders, PartType};
 use openpgp::{
     parse::Parse,
     serialize::stream,
@@ -49,17 +34,11 @@ use rasn_cms::{
 };
 use rsa::{pkcs1::DecodeRsaPublicKey, Pkcs1v15Encrypt, RsaPublicKey};
 use sequoia_openpgp as openpgp;
+use serde_json::json;
 use store::{
-    write::{BatchBuilder, ToBitmaps, F_CLEAR, F_VALUE},
+    write::{BatchBuilder, Bincode, ToBitmaps, F_CLEAR, F_VALUE},
     Deserialize, Serialize,
 };
-
-const CRYPT_HTML_HEADER: &str = include_str!("../../../../resources/htx/crypto_header.htx");
-const CRYPT_HTML_FOOTER: &str = include_str!("../../../../resources/htx/crypto_footer.htx");
-const CRYPT_HTML_FORM: &str = include_str!("../../../../resources/htx/crypto_form.htx");
-const CRYPT_HTML_SUCCESS: &str = include_str!("../../../../resources/htx/crypto_success.htx");
-const CRYPT_HTML_DISABLED: &str = include_str!("../../../../resources/htx/crypto_disabled.htx");
-const CRYPT_HTML_ERROR: &str = include_str!("../../../../resources/htx/crypto_error.htx");
 
 const P: openpgp::policy::StandardPolicy<'static> = openpgp::policy::StandardPolicy::new();
 
@@ -86,6 +65,22 @@ pub struct EncryptionParams {
     pub method: EncryptionMethod,
     pub algo: Algorithm,
     pub certs: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
+pub enum EncryptionType {
+    PGP {
+        algo: Algorithm,
+        certs: String,
+    },
+    SMIME {
+        algo: Algorithm,
+        certs: String,
+    },
+    #[default]
+    Disabled,
 }
 
 #[allow(async_fn_in_trait)]
@@ -178,7 +173,7 @@ impl EncryptMessage for Message<'_> {
                             .supported()
                             .alive()
                             .revoked(false)
-                            .key_flags(&KeyFlags::empty().set_transport_encryption())
+                            .key_flags(KeyFlags::empty().set_transport_encryption())
                         {
                             keys.push(key);
                         }
@@ -377,7 +372,7 @@ impl EncryptMessage for Message<'_> {
     }
 
     fn is_encrypted(&self) -> bool {
-        self.content_type().map_or(false, |ct| {
+        if self.content_type().is_some_and(|ct| {
             let main_type = ct.c_type.as_ref();
             let sub_type = ct
                 .c_subtype
@@ -389,14 +384,43 @@ impl EncryptMessage for Message<'_> {
                 && (sub_type.eq_ignore_ascii_case("pkcs7-mime")
                     || sub_type.eq_ignore_ascii_case("pkcs7-signature")
                     || (sub_type.eq_ignore_ascii_case("octet-stream")
-                        && self.attachment_name().map_or(false, |name| {
-                            name.rsplit_once('.').map_or(false, |(_, ext)| {
-                                ["p7m", "p7s", "p7c", "p7z"].contains(&ext)
-                            })
+                        && self.attachment_name().is_some_and(|name| {
+                            name.rsplit_once('.')
+                                .is_some_and(|(_, ext)| ["p7m", "p7s", "p7c", "p7z"].contains(&ext))
                         }))))
                 || (main_type.eq_ignore_ascii_case("multipart")
                     && sub_type.eq_ignore_ascii_case("encrypted"))
-        })
+        }) {
+            return true;
+        }
+
+        if self.parts.len() <= 2 {
+            let mut text_part = None;
+            let mut is_multipart = false;
+
+            for part in &self.parts {
+                match &part.body {
+                    PartType::Text(text) => {
+                        text_part = Some(text.as_ref());
+                    }
+                    PartType::Multipart(_) => {
+                        is_multipart = true;
+                    }
+                    _ => (),
+                }
+            }
+
+            match text_part {
+                Some(text) if self.parts.len() == 1 || is_multipart => {
+                    if text.trim_start().starts_with("-----BEGIN PGP MESSAGE-----") {
+                        return true;
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        false
     }
 }
 
@@ -425,20 +449,29 @@ impl Algorithm {
     }
 }
 
-pub fn try_parse_certs(bytes: Vec<u8>) -> Result<(EncryptionMethod, Vec<Vec<u8>>), String> {
+pub fn try_parse_certs(
+    expected_method: EncryptionMethod,
+    cert: Vec<u8>,
+) -> Result<Vec<Vec<u8>>, Cow<'static, str>> {
     // Check if it's a PEM file
-    if let Some(result) = try_parse_pem(&bytes)? {
-        Ok(result)
-    } else if rasn::der::decode::<rasn_pkix::Certificate>(&bytes[..]).is_ok() {
-        Ok((EncryptionMethod::SMIME, vec![bytes]))
-    } else if let Ok(cert) = openpgp::Cert::from_bytes(&bytes[..]) {
-        if !has_pgp_keys(cert) {
-            Ok((EncryptionMethod::PGP, vec![bytes]))
+    let (method, certs) = if let Some(result) = try_parse_pem(&cert)? {
+        result
+    } else if rasn::der::decode::<rasn_pkix::Certificate>(&cert[..]).is_ok() {
+        (EncryptionMethod::SMIME, vec![cert])
+    } else if let Ok(cert_) = openpgp::Cert::from_bytes(&cert[..]) {
+        if !has_pgp_keys(cert_) {
+            (EncryptionMethod::PGP, vec![cert])
         } else {
-            Err("Could not find any suitable keys in certificate".to_string())
+            return Err("Could not find any suitable keys in certificate".into());
         }
     } else {
-        Err("Could not find any valid certificates".to_string())
+        return Err("Could not find any valid certificates".into());
+    };
+
+    if method == expected_method {
+        Ok(certs)
+    } else {
+        Err("No valid certificates found for the selected encryption".into())
     }
 }
 
@@ -448,13 +481,28 @@ fn has_pgp_keys(cert: openpgp::Cert) -> bool {
         .supported()
         .alive()
         .revoked(false)
-        .key_flags(&KeyFlags::empty().set_transport_encryption())
+        .key_flags(KeyFlags::empty().set_transport_encryption())
         .next()
         .is_some()
 }
 
 #[allow(clippy::type_complexity)]
-fn try_parse_pem(bytes_: &[u8]) -> Result<Option<(EncryptionMethod, Vec<Vec<u8>>)>, String> {
+fn try_parse_pem(
+    bytes_: &[u8],
+) -> Result<Option<(EncryptionMethod, Vec<Vec<u8>>)>, Cow<'static, str>> {
+    if let Some(internal) = std::str::from_utf8(bytes_)
+        .ok()
+        .and_then(|cert| cert.strip_prefix("-----STALWART CERTIFICATE-----"))
+    {
+        return base64_decode(internal.as_bytes())
+            .ok_or(Cow::from("Failed to decode base64"))
+            .and_then(|bytes| {
+                Bincode::<EncryptionParams>::deserialize(&bytes)
+                    .map_err(|_| Cow::from("Failed to deserialize internal certificate"))
+            })
+            .map(|params| Some((params.inner.method, params.inner.certs)));
+    }
+
     let mut bytes = bytes_.iter().enumerate();
     let mut buf = vec![];
     let mut method = None;
@@ -495,14 +543,14 @@ fn try_parse_pem(bytes_: &[u8]) -> Result<Option<(EncryptionMethod, Vec<Vec<u8>>
         // Find type
         let tag = std::str::from_utf8(&buf).unwrap();
         if tag.contains("CERTIFICATE") {
-            if method.map_or(false, |m| m == EncryptionMethod::PGP) {
-                return Err("Cannot mix OpenPGP and S/MIME certificates".to_string());
+            if method.is_some_and(|m| m == EncryptionMethod::PGP) {
+                return Err("Cannot mix OpenPGP and S/MIME certificates".into());
             } else {
                 method = Some(EncryptionMethod::SMIME);
             }
         } else if tag.contains("PGP") {
-            if method.map_or(false, |m| m == EncryptionMethod::SMIME) {
-                return Err("Cannot mix OpenPGP and S/MIME certificates".to_string());
+            if method.is_some_and(|m| m == EncryptionMethod::SMIME) {
+                return Err("Cannot mix OpenPGP and S/MIME certificates".into());
             } else {
                 method = Some(EncryptionMethod::PGP);
             }
@@ -544,15 +592,13 @@ fn try_parse_pem(bytes_: &[u8]) -> Result<Option<(EncryptionMethod, Vec<Vec<u8>>
         }
 
         // Decode base64
-        let cert = base64_decode(&buf)
-            .ok_or_else(|| "Failed to decode base64 certificate.".to_string())?;
+        let cert =
+            base64_decode(&buf).ok_or_else(|| Cow::from("Failed to decode base64 certificate."))?;
         match method.unwrap() {
             EncryptionMethod::PGP => match openpgp::Cert::from_bytes(bytes_) {
                 Ok(cert) => {
                     if !has_pgp_keys(cert) {
-                        return Err(
-                            "Could not find any suitable keys in OpenPGP public key".to_string()
-                        );
+                        return Err("Could not find any suitable keys in OpenPGP public key".into());
                     }
                     certs.push(
                         bytes_
@@ -561,11 +607,13 @@ fn try_parse_pem(bytes_: &[u8]) -> Result<Option<(EncryptionMethod, Vec<Vec<u8>>
                             .to_vec(),
                     );
                 }
-                Err(err) => return Err(format!("Failed to decode OpenPGP public key: {}", err)),
+                Err(err) => {
+                    return Err(format!("Failed to decode OpenPGP public key: {err}").into())
+                }
             },
             EncryptionMethod::SMIME => {
                 if let Err(err) = rasn::der::decode::<rasn_pkix::Certificate>(&cert) {
-                    return Err(format!("Failed to decode X509 certificate: {}", err));
+                    return Err(format!("Failed to decode X509 certificate: {err}").into());
                 }
                 certs.push(cert);
             }
@@ -587,24 +635,21 @@ impl Serialize for &EncryptionParams {
 }
 
 impl Deserialize for EncryptionParams {
-    fn deserialize(bytes: &[u8]) -> store::Result<Self> {
-        let version = *bytes.first().ok_or_else(|| {
-            store::Error::InternalError(
-                "Failed to read version while deserializing encryption params".to_string(),
-            )
-        })?;
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self> {
+        let version = *bytes
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.caused_by(trc::location!()))?;
         match version {
             1 if bytes.len() > 1 => bincode::deserialize(&bytes[1..]).map_err(|err| {
-                store::Error::InternalError(format!(
-                    "Failed to deserialize encryption params: {}",
-                    err
-                ))
+                trc::EventType::Store(trc::StoreEvent::DeserializeError)
+                    .from_bincode_error(err)
+                    .caused_by(trc::location!())
             }),
 
-            _ => Err(store::Error::InternalError(format!(
-                "Unknown encryption params version: {}",
-                version
-            ))),
+            _ => Err(trc::StoreEvent::DeserializeError
+                .into_err()
+                .caused_by(trc::location!())
+                .ctx(trc::Key::Value, version as u64)),
         }
     }
 }
@@ -615,143 +660,121 @@ impl ToBitmaps for &EncryptionParams {
     }
 }
 
-impl JMAP {
-    // Code authorization flow, handles an authorization request
-    pub async fn handle_crypto_update(
+pub trait CryptoHandler: Sync + Send {
+    fn handle_crypto_get(
         &self,
-        req: &mut HttpRequest,
-        remote_addr: IpAddr,
-    ) -> HttpResponse {
-        let mut response = String::with_capacity(
-            CRYPT_HTML_HEADER.len() + CRYPT_HTML_FOOTER.len() + CRYPT_HTML_FORM.len(),
-        );
-        response.push_str(&CRYPT_HTML_HEADER.replace("@@@", "/crypto"));
+        access_token: Arc<AccessToken>,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
 
-        match *req.method() {
-            hyper::Method::POST => {
-                // Parse form
-                let form = match FormData::from_request(req, 1024 * 1024).await {
-                    Ok(form) => form,
-                    Err(err) => return err,
-                };
+    fn handle_crypto_post(
+        &self,
+        access_token: Arc<AccessToken>,
+        body: Option<Vec<u8>>,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
 
-                match self.validate_form(form, remote_addr).await {
-                    Ok(Some(params)) => {
-                        response.push_str(
-                            &CRYPT_HTML_SUCCESS
-                                .replace(
-                                    "$$$",
-                                    format!("{} ({})", params.method, params.algo).as_str(),
-                                )
-                                .replace("@@@", params.certs.len().to_string().as_str()),
-                        );
-                    }
-                    Ok(None) => {
-                        response.push_str(CRYPT_HTML_DISABLED);
-                    }
-                    Err(error) => {
-                        response.push_str(&CRYPT_HTML_ERROR.replace("@@@", &error));
-                    }
+impl CryptoHandler for Server {
+    async fn handle_crypto_get(&self, access_token: Arc<AccessToken>) -> trc::Result<HttpResponse> {
+        let params = self
+            .get_property::<EncryptionParams>(
+                access_token.primary_id(),
+                Collection::Principal,
+                0,
+                Property::Parameters,
+            )
+            .await?;
+        let ec = params
+            .map(|params| {
+                let method = params.method;
+                let algo = params.algo;
+                let mut certs = Vec::new();
+                certs.extend_from_slice(b"-----STALWART CERTIFICATE-----\r\n");
+                let _ = base64_encode_mime(&Bincode::new(params).serialize(), &mut certs, false);
+                certs.extend_from_slice(b"\r\n");
+                let certs = String::from_utf8(certs).unwrap_or_default();
+
+                match method {
+                    EncryptionMethod::PGP => EncryptionType::PGP { algo, certs },
+                    EncryptionMethod::SMIME => EncryptionType::SMIME { algo, certs },
                 }
-            }
+            })
+            .unwrap_or(EncryptionType::Disabled);
 
-            hyper::Method::GET => {
-                response.push_str(CRYPT_HTML_FORM);
-            }
-            _ => unreachable!(),
-        };
-
-        response.push_str(CRYPT_HTML_FOOTER);
-
-        HtmlResponse::new(response).into_http_response()
+        Ok(JsonResponse::new(json!({
+            "data": ec,
+        }))
+        .into_http_response())
     }
 
-    async fn validate_form(
+    async fn handle_crypto_post(
         &self,
-        mut form: FormData,
-        remote_addr: IpAddr,
-    ) -> Result<Option<EncryptionParams>, Cow<str>> {
-        let certificate = form.remove_bytes("certificate");
-        if let (Some(email), Some(password), Some(encryption)) = (
-            form.get("email"),
-            form.get("password"),
-            form.get("encryption"),
-        ) {
-            // Validate fields
-            if email.is_empty() || password.is_empty() {
-                return Err(Cow::from("Please enter your login and password"));
-            } else if encryption != "disable" && certificate.as_ref().map_or(true, |c| c.is_empty())
-            {
-                return Err(Cow::from("Please select one or more certificates"));
-            }
+        access_token: Arc<AccessToken>,
+        body: Option<Vec<u8>>,
+    ) -> trc::Result<HttpResponse> {
+        let request = serde_json::from_slice::<EncryptionType>(body.as_deref().unwrap_or_default())
+            .map_err(|err| trc::ResourceEvent::BadParameters.into_err().reason(err))?;
 
-            // Authenticate
-            let token = if let AuthResult::Success(token) =
-                self.authenticate_plain(email, password, remote_addr).await
-            {
-                token
-            } else {
-                return Err(Cow::from("Invalid login or password"));
-            };
-
-            if encryption != "disable" {
-                let (method, certs) =
-                    try_parse_certs(certificate.unwrap_or_default()).map_err(Cow::from)?;
-                let algo = match (encryption, method) {
-                    ("pgp-256", EncryptionMethod::PGP) => Algorithm::Aes256,
-                    ("pgp-128", EncryptionMethod::PGP) => Algorithm::Aes128,
-                    ("smime-256", EncryptionMethod::SMIME) => Algorithm::Aes256,
-                    ("smime-128", EncryptionMethod::SMIME) => Algorithm::Aes128,
-                    _ => {
-                        return Err(Cow::from(
-                            "No valid certificates found for the selected encryption",
-                        ));
-                    }
-                };
-                let params = EncryptionParams {
-                    method,
-                    algo,
-                    certs,
-                };
-
-                // Try a test encryption
-                if let Err(EncryptMessageError::Error(message)) = MessageParser::new()
-                    .parse("Subject: test\r\ntest\r\n".as_bytes())
-                    .unwrap()
-                    .encrypt(&params)
-                    .await
-                {
-                    return Err(Cow::from(message));
-                }
-
-                // Save encryption params
+        let (method, algo, mut certs) = match request {
+            EncryptionType::PGP { algo, certs } => (EncryptionMethod::PGP, algo, certs),
+            EncryptionType::SMIME { algo, certs } => (EncryptionMethod::SMIME, algo, certs),
+            EncryptionType::Disabled => {
+                // Disable encryption at rest
                 let mut batch = BatchBuilder::new();
                 batch
-                    .with_account_id(token.primary_id())
-                    .with_collection(Collection::Principal)
-                    .update_document(0)
-                    .value(Property::Parameters, &params, F_VALUE);
-                self.write_batch(batch).await.map_err(|_| {
-                    Cow::from("Failed to save encryption parameters, please try again later")
-                })?;
-
-                Ok(Some(params))
-            } else {
-                // Remove encryption params
-                let mut batch = BatchBuilder::new();
-                batch
-                    .with_account_id(token.primary_id())
+                    .with_account_id(access_token.primary_id())
                     .with_collection(Collection::Principal)
                     .update_document(0)
                     .value(Property::Parameters, (), F_VALUE | F_CLEAR);
-                self.write_batch(batch).await.map_err(|_| {
-                    Cow::from("Failed to save encryption parameters, please try again later")
-                })?;
-                Ok(None)
+                self.core.storage.data.write(batch.build()).await?;
+                return Ok(JsonResponse::new(json!({
+                    "data": (),
+                }))
+                .into_http_response());
             }
-        } else {
-            Err(Cow::from("Missing form parameters"))
+        };
+        if !certs.ends_with("\n") {
+            certs.push('\n');
         }
+
+        // Make sure Encryption is enabled
+        if !self.core.jmap.encrypt {
+            return Err(manage::unsupported(
+                "Encryption-at-rest has been disabled by the system administrator",
+            ));
+        }
+
+        // Parse certificates
+        let params = EncryptionParams {
+            method,
+            algo,
+            certs: try_parse_certs(method, certs.into_bytes())
+                .map_err(|err| manage::error(err, None::<u32>))?,
+        };
+
+        // Try a test encryption
+        if let Err(EncryptMessageError::Error(message)) = MessageParser::new()
+            .parse("Subject: test\r\ntest\r\n".as_bytes())
+            .unwrap()
+            .encrypt(&params)
+            .await
+        {
+            return Err(manage::error(message, None::<u32>));
+        }
+
+        // Save encryption params
+        let num_certs = params.certs.len();
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(access_token.primary_id())
+            .with_collection(Collection::Principal)
+            .update_document(0)
+            .value(Property::Parameters, &params, F_VALUE);
+        self.core.storage.data.write(batch.build()).await?;
+
+        Ok(JsonResponse::new(json!({
+            "data": num_certs,
+        }))
+        .into_http_response())
     }
 }
 

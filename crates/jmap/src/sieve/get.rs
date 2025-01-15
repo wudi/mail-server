@@ -1,30 +1,13 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::sync::Arc;
 
+use common::Server;
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse, RequestArguments},
     object::Object,
     types::{collection::Collection, property::Property, value::Value},
@@ -32,22 +15,56 @@ use jmap_proto::{
 use sieve::Sieve;
 use store::{
     query::Filter,
-    write::{assert::HashedValue, BatchBuilder, BlobOp},
-    Deserialize, Serialize,
+    write::{assert::HashedValue, BatchBuilder, Bincode, BlobOp},
+    BlobClass, Deserialize, Serialize,
 };
 
-use crate::{sieve::SeenIds, Bincode, JMAP};
+use crate::{
+    blob::{download::BlobDownload, upload::BlobUpload},
+    changes::state::StateManager,
+    sieve::SeenIds,
+    JmapMethods,
+};
 
 use super::ActiveScript;
+use std::future::Future;
 
-impl JMAP {
-    pub async fn sieve_script_get(
+pub trait SieveScriptGet: Sync + Send {
+    fn sieve_script_get(
+        &self,
+        request: GetRequest<RequestArguments>,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+
+    fn sieve_script_get_active(
+        &self,
+        account_id: u32,
+    ) -> impl Future<Output = trc::Result<Option<ActiveScript>>> + Send;
+
+    fn sieve_script_get_by_name(
+        &self,
+        account_id: u32,
+        name: &str,
+    ) -> impl Future<Output = trc::Result<Option<Sieve>>> + Send;
+
+    fn sieve_script_compile(
+        &self,
+        account_id: u32,
+        document_id: u32,
+    ) -> impl Future<Output = trc::Result<(Sieve, Object<Value>)>> + Send;
+}
+
+impl SieveScriptGet for Server {
+    async fn sieve_script_get(
         &self,
         mut request: GetRequest<RequestArguments>,
-    ) -> Result<GetResponse, MethodError> {
-        let ids = request.unwrap_ids(self.config.get_max_objects)?;
-        let properties =
-            request.unwrap_properties(&[Property::Id, Property::Name, Property::BlobId]);
+    ) -> trc::Result<GetResponse> {
+        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
+        let properties = request.unwrap_properties(&[
+            Property::Id,
+            Property::Name,
+            Property::BlobId,
+            Property::IsActive,
+        ]);
         let account_id = request.account_id.document_id();
         let push_ids = self
             .get_document_ids(account_id, Collection::SieveScript)
@@ -58,7 +75,7 @@ impl JMAP {
         } else {
             push_ids
                 .iter()
-                .take(self.config.get_max_objects)
+                .take(self.core.jmap.get_max_objects)
                 .map(Into::into)
                 .collect::<Vec<_>>()
         };
@@ -99,8 +116,24 @@ impl JMAP {
                     Property::Id => {
                         result.append(Property::Id, Value::Id(id));
                     }
-                    Property::Name | Property::BlobId | Property::IsActive => {
+                    Property::Name | Property::IsActive => {
                         result.append(property.clone(), push.remove(property));
+                    }
+                    Property::BlobId => {
+                        result.append(
+                            Property::BlobId,
+                            match push.remove(&Property::BlobId) {
+                                Value::BlobId(mut blob_id) => {
+                                    blob_id.class = BlobClass::Linked {
+                                        account_id,
+                                        collection: Collection::SieveScript.into(),
+                                        document_id,
+                                    };
+                                    Value::BlobId(blob_id)
+                                }
+                                other => other,
+                            },
+                        );
                     }
                     property => {
                         result.append(property.clone(), Value::Null);
@@ -113,10 +146,7 @@ impl JMAP {
         Ok(response)
     }
 
-    pub async fn sieve_script_get_active(
-        &self,
-        account_id: u32,
-    ) -> Result<Option<ActiveScript>, MethodError> {
+    async fn sieve_script_get_active(&self, account_id: u32) -> trc::Result<Option<ActiveScript>> {
         // Find the currently active script
         if let Some(document_id) = self
             .filter(
@@ -154,11 +184,11 @@ impl JMAP {
         }
     }
 
-    pub async fn sieve_script_get_by_name(
+    async fn sieve_script_get_by_name(
         &self,
         account_id: u32,
         name: &str,
-    ) -> Result<Option<Sieve>, MethodError> {
+    ) -> trc::Result<Option<Sieve>> {
         // Find the script by name
         if let Some(document_id) = self
             .filter(
@@ -178,11 +208,12 @@ impl JMAP {
         }
     }
 
+    #[allow(clippy::blocks_in_conditions)]
     async fn sieve_script_compile(
         &self,
         account_id: u32,
         document_id: u32,
-    ) -> Result<(Sieve, Object<Value>), MethodError> {
+    ) -> trc::Result<(Sieve, Object<Value>)> {
         // Obtain script object
         let script_object = self
             .get_property::<HashedValue<Object<Value>>>(
@@ -193,15 +224,10 @@ impl JMAP {
             )
             .await?
             .ok_or_else(|| {
-                tracing::warn!(
-                    context = "sieve_script_compile",
-                    event = "error",
-                    account_id = account_id,
-                    document_id = document_id,
-                    "Failed to obtain sieve script object"
-                );
-
-                MethodError::ServerPartialFail
+                trc::StoreEvent::NotFound
+                    .into_err()
+                    .caused_by(trc::location!())
+                    .document_id(document_id)
             })?;
 
         // Obtain the sieve script length
@@ -212,22 +238,22 @@ impl JMAP {
             .and_then(|v| v.as_blob_id())
             .and_then(|v| (v.section.as_ref()?.size, v).into())
             .ok_or_else(|| {
-                tracing::warn!(
-                    context = "sieve_script_compile",
-                    event = "error",
-                    account_id = account_id,
-                    document_id = document_id,
-                    "Failed to obtain sieve script blobId"
-                );
-
-                MethodError::ServerPartialFail
+                trc::StoreEvent::NotFound
+                    .into_err()
+                    .caused_by(trc::location!())
+                    .document_id(document_id)
             })?;
 
         // Obtain the sieve script blob
         let script_bytes = self
-            .get_blob(&blob_id.hash, 0..u32::MAX)
+            .get_blob(&blob_id.hash, 0..usize::MAX)
             .await?
-            .ok_or(MethodError::ServerPartialFail)?;
+            .ok_or_else(|| {
+                trc::StoreEvent::NotFound
+                    .into_err()
+                    .caused_by(trc::location!())
+                    .document_id(document_id)
+            })?;
 
         // Obtain the precompiled script
         if let Some(sieve) = script_bytes
@@ -237,19 +263,14 @@ impl JMAP {
             Ok((sieve.inner, script_object.inner))
         } else {
             // Deserialization failed, probably because the script compiler version changed
-            match self
-                .sieve_compiler
-                .compile(script_bytes.get(0..script_offset).ok_or_else(|| {
-                    tracing::warn!(
-                        context = "sieve_script_compile",
-                        event = "error",
-                        account_id = account_id,
-                        document_id = document_id,
-                        "Invalid sieve script offset"
-                    );
-
-                    MethodError::ServerPartialFail
-                })?) {
+            match self.core.sieve.untrusted_compiler.compile(
+                script_bytes.get(0..script_offset).ok_or_else(|| {
+                    trc::StoreEvent::NotFound
+                        .into_err()
+                        .caused_by(trc::location!())
+                        .document_id(document_id)
+                })?,
+            ) {
                 Ok(sieve) => {
                     // Store updated compiled sieve script
                     let sieve = Bincode::new(sieve);
@@ -289,16 +310,10 @@ impl JMAP {
 
                     Ok((sieve.inner, new_script_object))
                 }
-                Err(error) => {
-                    tracing::warn!(
-                            context = "sieve_script_compile",
-                            event = "error",
-                            account_id = account_id,
-                            document_id = document_id,
-                            reason = %error,
-                            "Failed to compile sieve script");
-                    Err(MethodError::ServerPartialFail)
-                }
+                Err(error) => Err(trc::StoreEvent::UnexpectedError
+                    .caused_by(trc::location!())
+                    .reason(error)
+                    .details("Failed to compile Sieve script")),
             }
         }
     }

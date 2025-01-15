@@ -1,59 +1,60 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
-use crate::smtp::{session::TestSession, ParseTestConfig, TestConfig};
-use smtp::{
-    config::ConfigContext,
-    core::{Session, SessionAddress, SMTP},
-};
+use crate::smtp::{session::TestSession, TempDir, TestSMTP};
+use common::Core;
+use smtp::core::{Session, SessionAddress};
+use store::Stores;
+use utils::config::Config;
+
+const CONFIG: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/data.db"
+
+[[session.throttle]]
+match = "remote_ip = '10.0.0.1'"
+key = 'remote_ip'
+concurrency = 2
+rate = '3/1s'
+enable = true
+
+[[session.throttle]]
+key = 'sender'
+rate = '2/1s'
+enable = true
+
+[[session.throttle]]
+key = ['remote_ip', 'rcpt']
+rate = '2/1s'
+enable = true
+
+"#;
 
 #[tokio::test]
 async fn throttle_inbound() {
-    let mut core = SMTP::test();
-    let config = &mut core.session.config;
-    config.throttle.connect = r"[[throttle]]
-    match = {if = 'remote-ip', eq = '10.0.0.1'}
-    key = 'remote-ip'
-    concurrency = 2
-    rate = '3/1s'
-    "
-    .parse_throttle(&ConfigContext::new(&[]));
-    config.throttle.mail_from = r"[[throttle]]
-    key = 'sender'
-    rate = '2/1s'
-    "
-    .parse_throttle(&ConfigContext::new(&[]));
-    config.throttle.rcpt_to = r"[[throttle]]
-    key = ['remote-ip', 'rcpt']
-    rate = '2/1s'
-    "
-    .parse_throttle(&ConfigContext::new(&[]));
+    // Enable logging
+    crate::enable_logging();
+
+    let tmp_dir = TempDir::new("smtp_inbound_throttle", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
 
     // Test connection concurrency limit
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     assert!(
         session.is_allowed().await,
         "Concurrency limiter too strict."
@@ -108,6 +109,6 @@ async fn throttle_inbound() {
     assert!(session.is_allowed().await, "Rate limiter too strict.");
     assert!(session.is_allowed().await, "Rate limiter too strict.");
     assert!(!session.is_allowed().await, "Rate limiter failed.");
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.2".to_string();
     assert!(session.is_allowed().await, "Rate limiter too strict.");
 }

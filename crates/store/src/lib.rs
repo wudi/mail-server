@@ -1,27 +1,10 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{borrow::Cow, fmt::Display, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 pub mod backend;
 pub mod config;
@@ -32,11 +15,12 @@ pub mod write;
 
 pub use ahash;
 use ahash::AHashMap;
-use backend::{fs::FsStore, memory::MemoryStore};
+use backend::{fs::FsStore, http::HttpStore, memory::StaticMemoryStore};
 pub use blake3;
 pub use parking_lot;
 pub use rand;
 pub use roaring;
+use utils::config::cron::SimpleCron;
 use write::{BitmapClass, ValueClass};
 
 #[cfg(feature = "s3")]
@@ -63,8 +47,11 @@ use backend::elastic::ElasticSearchStore;
 #[cfg(feature = "redis")]
 use backend::redis::RedisStore;
 
+#[cfg(feature = "azure")]
+use backend::azure::AzureStore;
+
 pub trait Deserialize: Sized + Sync + Send {
-    fn deserialize(bytes: &[u8]) -> crate::Result<Self>;
+    fn deserialize(bytes: &[u8]) -> trc::Result<Self>;
 }
 
 pub trait Serialize {
@@ -73,19 +60,18 @@ pub trait Serialize {
 
 // Key serialization flags
 pub(crate) const WITH_SUBSPACE: u32 = 1;
-pub(crate) const WITHOUT_BLOCK_NUM: u32 = 1 << 1;
 
-pub trait Key: Sync + Send {
+pub trait Key: Sync + Send + Clone {
     fn serialize(&self, flags: u32) -> Vec<u8>;
     fn subspace(&self) -> u8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BitmapKey<T: AsRef<BitmapClass>> {
+pub struct BitmapKey<T: AsRef<BitmapClass<u32>>> {
     pub account_id: u32,
     pub collection: u8,
     pub class: T,
-    pub block_num: u32,
+    pub document_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -105,7 +91,7 @@ pub struct IndexKeyPrefix {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ValueKey<T: AsRef<ValueClass>> {
+pub struct ValueKey<T: AsRef<ValueClass<u32>>> {
     pub account_id: u32,
     pub collection: u8,
     pub document_id: u32,
@@ -119,14 +105,8 @@ pub struct LogKey {
     pub change_id: u64,
 }
 
-pub const BLOB_HASH_LEN: usize = 32;
 pub const U64_LEN: usize = std::mem::size_of::<u64>();
 pub const U32_LEN: usize = std::mem::size_of::<u32>();
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BlobHash([u8; BLOB_HASH_LEN]);
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BlobClass {
@@ -150,36 +130,35 @@ impl Default for BlobClass {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-    InternalError(String),
-    AssertValueFailed,
-}
-
-impl std::error::Error for Error {}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::InternalError(msg) => write!(f, "Internal Error: {}", msg),
-            Error::AssertValueFailed => write!(f, "Transaction failed: Hash mismatch"),
-        }
-    }
-}
-
-impl From<String> for Error {
-    fn from(msg: String) -> Self {
-        Error::InternalError(msg)
-    }
-}
-
-pub const SUBSPACE_BITMAPS: u8 = b'b';
-pub const SUBSPACE_VALUES: u8 = b'v';
-pub const SUBSPACE_LOGS: u8 = b'l';
+pub const SUBSPACE_ACL: u8 = b'a';
+pub const SUBSPACE_BITMAP_ID: u8 = b'b';
+pub const SUBSPACE_BITMAP_TAG: u8 = b'c';
+pub const SUBSPACE_BITMAP_TEXT: u8 = b'v';
+pub const SUBSPACE_DIRECTORY: u8 = b'd';
+pub const SUBSPACE_TASK_QUEUE: u8 = b'f';
 pub const SUBSPACE_INDEXES: u8 = b'i';
+pub const SUBSPACE_BLOB_RESERVE: u8 = b'j';
+pub const SUBSPACE_BLOB_LINK: u8 = b'k';
 pub const SUBSPACE_BLOBS: u8 = b't';
-pub const SUBSPACE_COUNTERS: u8 = b'c';
+pub const SUBSPACE_LOGS: u8 = b'l';
+pub const SUBSPACE_COUNTER: u8 = b'n';
+pub const SUBSPACE_IN_MEMORY_VALUE: u8 = b'm';
+pub const SUBSPACE_IN_MEMORY_COUNTER: u8 = b'y';
+pub const SUBSPACE_PROPERTY: u8 = b'p';
+pub const SUBSPACE_SETTINGS: u8 = b's';
+pub const SUBSPACE_QUEUE_MESSAGE: u8 = b'e';
+pub const SUBSPACE_QUEUE_EVENT: u8 = b'q';
+pub const SUBSPACE_QUOTA: u8 = b'u';
+pub const SUBSPACE_REPORT_OUT: u8 = b'h';
+pub const SUBSPACE_REPORT_IN: u8 = b'r';
+pub const SUBSPACE_FTS_INDEX: u8 = b'g';
+pub const SUBSPACE_TELEMETRY_SPAN: u8 = b'o';
+pub const SUBSPACE_TELEMETRY_INDEX: u8 = b'w';
+pub const SUBSPACE_TELEMETRY_METRIC: u8 = b'x';
 
+pub const SUBSPACE_RESERVED_2: u8 = b'z';
+
+#[derive(Clone)]
 pub struct IterateParams<T: Key> {
     begin: T,
     end: T,
@@ -193,10 +172,11 @@ pub struct Stores {
     pub stores: AHashMap<String, Store>,
     pub blob_stores: AHashMap<String, BlobStore>,
     pub fts_stores: AHashMap<String, FtsStore>,
-    pub lookup_stores: AHashMap<String, LookupStore>,
+    pub in_memory_stores: AHashMap<String, InMemoryStore>,
+    pub purge_schedules: Vec<PurgeSchedule>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Store {
     #[cfg(feature = "sqlite")]
     SQLite(Arc<SqliteStore>),
@@ -208,14 +188,34 @@ pub enum Store {
     MySQL(Arc<MysqlStore>),
     #[cfg(feature = "rocks")]
     RocksDb(Arc<RocksDbStore>),
+    #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+    SQLReadReplica(Arc<backend::composite::read_replica::SQLReadReplica>),
+    #[default]
+    None,
 }
 
 #[derive(Clone)]
-pub enum BlobStore {
+pub struct BlobStore {
+    pub backend: BlobBackend,
+    pub compression: CompressionAlgo,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum CompressionAlgo {
+    None,
+    Lz4,
+}
+
+#[derive(Clone)]
+pub enum BlobBackend {
     Store(Store),
     Fs(Arc<FsStore>),
     #[cfg(feature = "s3")]
     S3(Arc<S3Store>),
+    #[cfg(feature = "azure")]
+    Azure(Arc<AzureStore>),
+    #[cfg(feature = "enterprise")]
+    Sharded(Arc<backend::composite::sharded_blob::ShardedBlob>),
 }
 
 #[derive(Clone)]
@@ -225,18 +225,15 @@ pub enum FtsStore {
     ElasticSearch(Arc<ElasticSearchStore>),
 }
 
-#[derive(Clone)]
-pub enum LookupStore {
+#[derive(Clone, Debug)]
+pub enum InMemoryStore {
     Store(Store),
-    Query(Arc<QueryStore>),
-    Memory(Arc<MemoryStore>),
     #[cfg(feature = "redis")]
     Redis(Arc<RedisStore>),
-}
-
-pub struct QueryStore {
-    pub store: LookupStore,
-    pub query: String,
+    Http(Arc<HttpStore>),
+    Static(Arc<StaticMemoryStore>),
+    #[cfg(feature = "enterprise")]
+    Sharded(Arc<backend::composite::sharded_lookup::ShardedInMemory>),
 }
 
 #[cfg(feature = "sqlite")]
@@ -276,14 +273,30 @@ impl From<RocksDbStore> for Store {
 
 impl From<FsStore> for BlobStore {
     fn from(store: FsStore) -> Self {
-        Self::Fs(Arc::new(store))
+        BlobStore {
+            backend: BlobBackend::Fs(Arc::new(store)),
+            compression: CompressionAlgo::None,
+        }
     }
 }
 
 #[cfg(feature = "s3")]
 impl From<S3Store> for BlobStore {
     fn from(store: S3Store) -> Self {
-        Self::S3(Arc::new(store))
+        BlobStore {
+            backend: BlobBackend::S3(Arc::new(store)),
+            compression: CompressionAlgo::None,
+        }
+    }
+}
+
+#[cfg(feature = "azure")]
+impl From<AzureStore> for BlobStore {
+    fn from(store: AzureStore) -> Self {
+        BlobStore {
+            backend: BlobBackend::Azure(Arc::new(store)),
+            compression: CompressionAlgo::None,
+        }
     }
 }
 
@@ -295,7 +308,7 @@ impl From<ElasticSearchStore> for FtsStore {
 }
 
 #[cfg(feature = "redis")]
-impl From<RedisStore> for LookupStore {
+impl From<RedisStore> for InMemoryStore {
     fn from(store: RedisStore) -> Self {
         Self::Redis(Arc::new(store))
     }
@@ -309,33 +322,52 @@ impl From<Store> for FtsStore {
 
 impl From<Store> for BlobStore {
     fn from(store: Store) -> Self {
-        Self::Store(store)
+        BlobStore {
+            backend: BlobBackend::Store(store),
+            compression: CompressionAlgo::None,
+        }
     }
 }
 
-impl From<Store> for LookupStore {
+impl From<Store> for InMemoryStore {
     fn from(store: Store) -> Self {
         Self::Store(store)
     }
 }
 
-impl From<MemoryStore> for LookupStore {
-    fn from(store: MemoryStore) -> Self {
-        Self::Memory(Arc::new(store))
+impl Default for BlobStore {
+    fn default() -> Self {
+        Self {
+            backend: BlobBackend::Store(Store::None),
+            compression: CompressionAlgo::None,
+        }
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum LookupKey {
-    Key(Vec<u8>),
-    Counter(Vec<u8>),
+impl Default for InMemoryStore {
+    fn default() -> Self {
+        Self::Store(Store::None)
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LookupValue<T> {
-    Value { value: T, expires: u64 },
-    Counter { num: i64 },
-    None,
+impl Default for FtsStore {
+    fn default() -> Self {
+        Self::Store(Store::None)
+    }
+}
+
+#[derive(Clone)]
+pub enum PurgeStore {
+    Data(Store),
+    Blobs { store: Store, blob_store: BlobStore },
+    Lookup(InMemoryStore),
+}
+
+#[derive(Clone)]
+pub struct PurgeSchedule {
+    pub cron: SimpleCron,
+    pub store_id: String,
+    pub store: PurgeStore,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,16 +392,6 @@ impl<'x> Value<'x> {
             Value::Blob(b) => String::from_utf8_lossy(b.as_ref()),
             Value::Null => Cow::Borrowed(""),
         }
-    }
-}
-
-impl From<LookupKey> for String {
-    fn from(value: LookupKey) -> Self {
-        let key = match value {
-            LookupKey::Key(key) | LookupKey::Counter(key) => key,
-        };
-        String::from_utf8(key)
-            .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
     }
 }
 
@@ -528,7 +550,7 @@ impl<'x> From<&'x str> for Value<'x> {
     }
 }
 
-impl<'x> From<String> for Value<'x> {
+impl From<String> for Value<'_> {
     fn from(value: String) -> Self {
         Self::Text(value.into())
     }
@@ -546,31 +568,41 @@ impl<'x> From<Cow<'x, str>> for Value<'x> {
     }
 }
 
-impl<'x> From<bool> for Value<'x> {
+impl From<bool> for Value<'_> {
     fn from(value: bool) -> Self {
         Self::Bool(value)
     }
 }
 
-impl<'x> From<i64> for Value<'x> {
+impl From<i64> for Value<'_> {
     fn from(value: i64) -> Self {
         Self::Integer(value)
     }
 }
 
-impl<'x> From<u64> for Value<'x> {
+impl From<Value<'static>> for i64 {
+    fn from(value: Value<'static>) -> Self {
+        if let Value::Integer(value) = value {
+            value
+        } else {
+            0
+        }
+    }
+}
+
+impl From<u64> for Value<'_> {
     fn from(value: u64) -> Self {
         Self::Integer(value as i64)
     }
 }
 
-impl<'x> From<u32> for Value<'x> {
+impl From<u32> for Value<'_> {
     fn from(value: u32) -> Self {
         Self::Integer(value as i64)
     }
 }
 
-impl<'x> From<f64> for Value<'x> {
+impl From<f64> for Value<'_> {
     fn from(value: f64) -> Self {
         Self::Float(value)
     }
@@ -582,13 +614,13 @@ impl<'x> From<&'x [u8]> for Value<'x> {
     }
 }
 
-impl<'x> From<Vec<u8>> for Value<'x> {
+impl From<Vec<u8>> for Value<'_> {
     fn from(value: Vec<u8>) -> Self {
         Self::Blob(value.into())
     }
 }
 
-impl<'x> Value<'x> {
+impl Value<'_> {
     pub fn into_string(self) -> String {
         match self {
             Value::Text(s) => s.into_owned(),
@@ -651,6 +683,50 @@ impl From<Rows> for Vec<u32> {
     }
 }
 
+impl Store {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn is_sql(&self) -> bool {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Store::SQLite(_) => true,
+            #[cfg(feature = "postgres")]
+            Store::PostgreSQL(_) => true,
+            #[cfg(feature = "mysql")]
+            Store::MySQL(_) => true,
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Store::SQLReadReplica(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_pg_or_mysql(&self) -> bool {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Store::SQLite(_) => true,
+            #[cfg(feature = "postgres")]
+            Store::PostgreSQL(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    pub fn is_enterprise_store(&self) -> bool {
+        match self {
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            Store::SQLReadReplica(_) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    pub fn is_enterprise_store(&self) -> bool {
+        false
+    }
+}
+
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -664,73 +740,35 @@ impl std::fmt::Debug for Store {
             Self::MySQL(_) => f.debug_tuple("MySQL").finish(),
             #[cfg(feature = "rocks")]
             Self::RocksDb(_) => f.debug_tuple("RocksDb").finish(),
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(_) => f.debug_tuple("SQLReadReplica").finish(),
+            Self::None => f.debug_tuple("None").finish(),
         }
     }
 }
 
-#[cfg(feature = "test_mode")]
-impl Default for Store {
-    fn default() -> Self {
-        #[cfg(feature = "sqlite")]
-        {
-            Self::SQLite(Arc::new(SqliteStore::open_memory().unwrap()))
-        }
-        #[cfg(not(feature = "sqlite"))]
-        {
-            unreachable!("No default store available")
+impl From<Value<'_>> for trc::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Integer(v) => trc::Value::Int(v),
+            Value::Bool(v) => trc::Value::Bool(v),
+            Value::Float(v) => trc::Value::Float(v),
+            Value::Text(v) => trc::Value::String(v.into_owned()),
+            Value::Blob(v) => trc::Value::Bytes(v.into_owned()),
+            Value::Null => trc::Value::None,
         }
     }
 }
 
 impl Stores {
-    pub fn get_store(
-        &self,
-        config: &utils::config::Config,
-        key: &str,
-    ) -> utils::config::Result<Store> {
-        self.stores
-            .get(config.value_require(key)?)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Unable to find data store '{}' defined in key '{}'",
-                    config.value_require(key).unwrap(),
-                    key
-                )
-            })
-    }
-
-    pub fn get_blob_store(
-        &self,
-        config: &utils::config::Config,
-        key: &str,
-    ) -> utils::config::Result<BlobStore> {
-        self.blob_stores
-            .get(config.value_require(key)?)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Unable to find blob store '{}' defined in key '{}'",
-                    config.value_require(key).unwrap(),
-                    key
-                )
-            })
-    }
-
-    pub fn get_fts_store(
-        &self,
-        config: &utils::config::Config,
-        key: &str,
-    ) -> utils::config::Result<FtsStore> {
-        self.fts_stores
-            .get(config.value_require(key)?)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "Unable to find FTS store '{}' defined in key '{}'",
-                    config.value_require(key).unwrap(),
-                    key
-                )
-            })
+    pub fn disable_enterprise_only(&mut self) {
+        #[cfg(feature = "enterprise")]
+        {
+            #[cfg(any(feature = "postgres", feature = "mysql"))]
+            self.stores
+                .retain(|_, store| !matches!(store, Store::SQLReadReplica(_)));
+            self.blob_stores
+                .retain(|_, store| !matches!(store.backend, BlobBackend::Sharded(_)));
+        }
     }
 }

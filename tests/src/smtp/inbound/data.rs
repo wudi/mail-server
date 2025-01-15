@@ -1,41 +1,38 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::core::config::ConfigDirectory;
-use store::{Store, Stores};
-use utils::config::{Config, Servers};
+use common::Core;
+use store::Stores;
+use utils::config::Config;
 
-use crate::smtp::{
-    inbound::{TestMessage, TestQueueEvent},
-    session::{load_test_message, TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig, TestSMTP,
+use crate::{
+    smtp::{
+        inbound::TestMessage,
+        session::{load_test_message, TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
-use smtp::{
-    config::{ConfigContext, IfBlock, MaybeDynValue},
-    core::{Session, SMTP},
-};
+use smtp::core::Session;
 
-const DIRECTORY: &str = r#"
+const CONFIG: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+directory = "local"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/queue.db"
+
+[spam-filter]
+enable = false
+
 [directory."local"]
 type = "memory"
 
@@ -63,65 +60,64 @@ description = "Mike Foobar"
 secret = "p4ssw0rd"
 email = "mike@test.com"
 
+[session.rcpt]
+directory = "'local'"
+
+[session.data.limits]
+messages = [{if = "remote_ip = '10.0.0.1'", then = 1},
+            {else = 100}]
+received-headers = 3
+
+[session.data.add-headers]
+received = [{if = "remote_ip = '10.0.0.3'", then = true},
+            {else = false}]
+received-spf =  [{if = "remote_ip = '10.0.0.3'", then = true},
+            {else = false}]
+auth-results =  [{if = "remote_ip = '10.0.0.3'", then = true},
+            {else = false}]
+message-id =  [{if = "remote_ip = '10.0.0.3'", then = true},
+               {else = false}]
+date = [{if = "remote_ip = '10.0.0.3'", then = true},
+        {else = false}]
+return-path =  [{if = "remote_ip = '10.0.0.3'", then = true},
+            {else = false}]
+
+[[queue.quota]]
+match = "sender = 'john@doe.org'"
+key = ['sender']
+messages = 1
+
+[[queue.quota]]
+match = "rcpt_domain = 'foobar.org'"
+key = ['rcpt_domain']
+size = 450
+enable = true
+
+[[queue.quota]]
+match = "rcpt = 'jane@domain.net'"
+key = ['rcpt']
+size = 450
+enable = true
+
 "#;
 
 #[tokio::test]
 async fn data() {
     // Enable logging
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
-            .finish(),
-    )
-    .unwrap();*/
-    let mut core = SMTP::test();
+    crate::enable_logging();
 
     // Create temp dir for queue
-    let mut qr = core.init_test_queue("smtp_data_test");
-    let directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    let config = &mut core.session.config.rcpt;
-    config.directory = IfBlock::new(Some(MaybeDynValue::Static(
-        directory.directories.get("local").unwrap().clone(),
-    )));
-
-    let config = &mut core.session.config;
-    config.data.add_auth_results = "[{if = 'remote-ip', eq = '10.0.0.3', then = true},
-    {else = false}]"
-        .parse_if(&ConfigContext::new(&[]));
-    config.data.add_date = config.data.add_auth_results.clone();
-    config.data.add_message_id = config.data.add_auth_results.clone();
-    config.data.add_received = config.data.add_auth_results.clone();
-    config.data.add_return_path = config.data.add_auth_results.clone();
-    config.data.add_received_spf = config.data.add_auth_results.clone();
-    config.data.max_received_headers = IfBlock::new(3);
-    config.data.max_messages = r"[{if = 'remote-ip', eq = '10.0.0.1', then = 1},
-    {else = 100}]"
-        .parse_if(&ConfigContext::new(&[]));
-
-    core.queue.config.quota = r"[[queue.quota]]
-    match = {if = 'sender', eq = 'john@doe.org'}
-    key = ['sender']
-    messages = 1
-
-    [[queue.quota]]
-    match = {if = 'rcpt-domain', eq = 'foobar.org'}
-    key = ['rcpt-domain']
-    size = 450
-
-    [[queue.quota]]
-    match = {if = 'rcpt', eq = 'jane@domain.net'}
-    key = ['rcpt']
-    size = 450
-    "
-    .parse_quota(&ConfigContext::new(&[]));
+    let tmp_dir = TempDir::new("smtp_data_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
     // Test queue message builder
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let test = TestSMTP::from_core(core);
+    let mut qr = test.queue_receiver;
+    let mut session = Session::test(test.server.clone());
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.test_builder().await;
 
@@ -132,12 +128,7 @@ async fn data() {
 
     // Send broken message
     session
-        .send_message(
-            "john@doe.org",
-            &["bill@foobar.org"],
-            "From: john",
-            "550 5.7.7",
-        )
+        .send_message("john@doe.org", &["bill@foobar.org"], "invalid", "550 5.7.7")
         .await;
 
     // Naive Loop detection
@@ -152,10 +143,10 @@ async fn data() {
 
     // No headers should be added to messages from 10.0.0.1
     session
-        .send_message("john@doe.org", &["bill@foobar.org"], "test:no_msgid", "250")
+        .send_message("john@test.org", &["mike@test.com"], "test:no_msgid", "250")
         .await;
     assert_eq!(
-        qr.read_event().await.unwrap_message().read_message(),
+        qr.expect_message().await.read_message(&qr).await,
         load_test_message("no_msgid", "messages")
     );
 
@@ -167,15 +158,15 @@ async fn data() {
     session.rset().await;
 
     // Headers should be added to messages from 10.0.0.3
-    session.data.remote_ip = "10.0.0.3".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.3".to_string();
     session.eval_session_params().await;
     session
-        .send_message("john@doe.org", &["mike@test.com"], "test:no_msgid", "250")
+        .send_message("bill@doe.org", &["mike@test.com"], "test:no_msgid", "250")
         .await;
-    qr.read_event()
+    qr.expect_message()
         .await
-        .unwrap_message()
-        .read_lines()
+        .read_lines(&qr)
+        .await
         .assert_contains("From: ")
         .assert_contains("To: ")
         .assert_contains("Subject: ")
@@ -187,13 +178,11 @@ async fn data() {
         .assert_contains("Received-SPF: ");
 
     // Only one message is allowed in the queue from john@doe.org
-    let mut queued_messages = vec![];
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.2".to_string();
     session.eval_session_params().await;
     session
         .send_message("john@doe.org", &["bill@foobar.org"], "test:no_dkim", "250")
         .await;
-    queued_messages.push(qr.read_event().await);
     session
         .send_message(
             "john@doe.org",
@@ -204,7 +193,7 @@ async fn data() {
         .await;
 
     // Release quota
-    queued_messages.clear();
+    qr.clear_queue(&test.server).await;
 
     // Only 1500 bytes are allowed in the queue to domain foobar.org
     session
@@ -215,7 +204,6 @@ async fn data() {
             "250",
         )
         .await;
-    queued_messages.push(qr.read_event().await);
     session
         .send_message(
             "jane@foobar.org",
@@ -234,7 +222,6 @@ async fn data() {
             "250",
         )
         .await;
-    queued_messages.push(qr.read_event().await);
     session
         .send_message(
             "jane@foobar.org",
@@ -242,5 +229,12 @@ async fn data() {
             "test:no_dkim",
             "452 4.3.1",
         )
+        .await;
+
+    // Make sure store is empty
+    qr.clear_queue(&test.server).await;
+    test.server
+        .store()
+        .assert_is_empty(test.server.blob_store().clone())
         .await;
 }

@@ -1,53 +1,29 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use ahash::{AHashMap, HashMap, HashSet};
-use directory::core::config::ConfigDirectory;
+use common::config::server::ServerProtocol;
+
+use jmap::api::management::queue::Message;
 use mail_auth::MX;
 use mail_parser::DateTime;
-use reqwest::{header::AUTHORIZATION, StatusCode};
-use store::{Store, Stores};
-use utils::config::{Config, ServerProtocol, Servers};
+use reqwest::{header::AUTHORIZATION, Method, StatusCode};
 
-use crate::smtp::{
-    inbound::TestQueueEvent, management::send_manage_request, outbound::start_test_server,
-    session::TestSession, TestConfig, TestSMTP,
+use crate::{
+    jmap::ManagementApi,
+    smtp::{session::TestSession, DnsCache, TestSMTP},
 };
-use smtp::{
-    config::IfBlock,
-    core::{management::Message, Session, SMTP},
-    queue::{
-        manager::{Queue, SpawnQueue},
-        QueueId, Status,
-    },
-};
+use smtp::queue::{manager::SpawnQueue, QueueId, Status};
 
-const DIRECTORY: &str = r#"
+const LOCAL: &str = r#"
+[storage]
+directory = "local"
+
 [directory."local"]
 type = "memory"
 
@@ -56,29 +32,54 @@ name = "admin"
 type = "admin"
 description = "Superuser"
 secret = "secret"
-member-of = ["superusers"]
+class = "admin"
 
+[queue.schedule]
+retry = "1000s"
+notify = "2000s"
+expire = "3000s"
+
+[session.rcpt]
+relay = true
+max-recipients = 100
+
+[session.extensions]
+dsn = true
+future-release = "1h"
 "#;
+
+const REMOTE: &str = r#"
+[session.ehlo]
+reject-non-fqdn = false
+
+[session.rcpt]
+relay = true
+"#;
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+pub(super) struct List<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+}
 
 #[tokio::test]
 #[serial_test::serial]
 async fn manage_queue() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Start remote test server
-    let mut core = SMTP::test();
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    let mut remote_qr = core.init_test_queue("smtp_manage_queue_remote");
-    let _rx_remote = start_test_server(core.into(), &[ServerProtocol::Smtp]);
+    let mut remote = TestSMTP::new("smtp_manage_queue_remote", REMOTE).await;
+    let _rx = remote.start(&[ServerProtocol::Smtp]).await;
+    let remote_core = remote.build_smtp();
+
+    // Start local management interface
+    let local = TestSMTP::new("smtp_manage_queue_local", LOCAL).await;
 
     // Add mock DNS entries
-    let mut core = SMTP::test();
-    core.resolvers.dns.mx_add(
+    let core = local.build_smtp();
+    core.mx_add(
         "foobar.org",
         vec![MX {
             exchanges: vec!["mx1.foobar.org".to_string()],
@@ -87,30 +88,13 @@ async fn manage_queue() {
         Instant::now() + Duration::from_secs(10),
     );
 
-    core.resolvers.dns.ipv4_add(
+    core.ipv4_add(
         "mx1.foobar.org",
         vec!["127.0.0.1".parse().unwrap()],
         Instant::now() + Duration::from_secs(10),
     );
 
-    // Start local management interface
-    let directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    core.queue.config.directory = directory.directories.get("local").unwrap().clone();
-    core.session.config.rcpt.relay = IfBlock::new(true);
-    core.session.config.rcpt.max_recipients = IfBlock::new(100);
-    core.session.config.extensions.future_release = IfBlock::new(Some(Duration::from_secs(86400)));
-    core.session.config.extensions.dsn = IfBlock::new(true);
-    core.queue.config.retry = IfBlock::new(vec![Duration::from_secs(1000)]);
-    core.queue.config.notify = IfBlock::new(vec![Duration::from_secs(2000)]);
-    core.queue.config.expire = IfBlock::new(Duration::from_secs(3000));
-    let local_qr = core.init_test_queue("smtp_manage_queue_local");
-    let core = Arc::new(core);
-    local_qr.queue_rx.spawn(core.clone(), Queue::default());
-    let _rx_manage = start_test_server(core.clone(), &[ServerProtocol::Http]);
+    let _rx_manage = local.start(&[ServerProtocol::Http]).await;
 
     // Send test messages
     let envelopes = HashMap::from_iter([
@@ -149,8 +133,12 @@ async fn manage_queue() {
         ("e", ("bill5@foobar.net", vec!["john@foobar.org"])),
         ("f", ("", vec!["success@foobar.org", "delay@foobar.org"])),
     ]);
-    let mut session = Session::test(core.clone());
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    let mut session = local.new_session();
+    local
+        .queue_receiver
+        .queue_rx
+        .spawn(local.server.inner.clone());
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session.ehlo("foobar.net").await;
     for test_num in 0..6 {
@@ -174,10 +162,10 @@ async fn manage_queue() {
     // Expect delivery to success@foobar.org
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        remote_qr
-            .read_event()
+        remote
+            .queue_receiver
+            .consume_message(&remote_core)
             .await
-            .unwrap_message()
             .recipients
             .into_iter()
             .map(|r| r.address)
@@ -186,15 +174,18 @@ async fn manage_queue() {
     );
 
     // Fetch and validate messages
-    let ids = send_manage_request::<Vec<QueueId>>("/admin/queue/list")
+    let api = ManagementApi::default();
+    let ids = api
+        .request::<List<QueueId>>(Method::GET, "/api/queue/messages")
         .await
         .unwrap()
-        .unwrap_data();
+        .unwrap_data()
+        .items;
     assert_eq!(ids.len(), 6);
     let mut id_map = AHashMap::new();
     let mut id_map_rev = AHashMap::new();
     let mut test_search = String::new();
-    for (message, id) in get_messages(&ids).await.into_iter().zip(ids) {
+    for (message, id) in api.get_messages(&ids).await.into_iter().zip(ids) {
         let message = message.unwrap();
         let env_id = message.env_id.as_ref().unwrap().clone();
 
@@ -220,7 +211,9 @@ async fn manage_queue() {
         let expires = created + 3000 + hold_for;
         for domain in &message.domains {
             if env_id == "c" {
-                test_search = domain.next_retry.as_ref().unwrap().to_rfc3339();
+                let mut dt = *domain.next_retry.as_ref().unwrap();
+                dt.second -= 1;
+                test_search = dt.to_rfc3339();
             }
             if env_id != "f" {
                 assert_eq!(domain.retry_num, 0);
@@ -268,31 +261,33 @@ async fn manage_queue() {
     // Test list search
     for (query, expected_ids) in [
         (
-            "/admin/queue/list?from=bill1@foobar.net".to_string(),
+            "/api/queue/messages?from=bill1@foobar.net".to_string(),
             vec!["a"],
         ),
         (
-            "/admin/queue/list?to=foobar.org".to_string(),
+            "/api/queue/messages?to=foobar.org".to_string(),
             vec!["d", "e", "f"],
         ),
         (
-            "/admin/queue/list?from=bill3@foobar.net&to=rcpt5@example1.com".to_string(),
+            "/api/queue/messages?from=bill3@foobar.net&to=rcpt5@example1.com".to_string(),
             vec!["c"],
         ),
         (
-            format!("/admin/queue/list?before={test_search}"),
+            format!("/api/queue/messages?before={test_search}"),
             vec!["a", "b"],
         ),
         (
-            format!("/admin/queue/list?after={test_search}"),
+            format!("/api/queue/messages?after={test_search}"),
             vec!["d", "e", "f", "c"],
         ),
     ] {
         let expected_ids = HashSet::from_iter(expected_ids.into_iter().map(|s| s.to_string()));
-        let ids = send_manage_request::<Vec<QueueId>>(&query)
+        let ids = api
+            .request::<List<QueueId>>(Method::GET, &query)
             .await
             .unwrap()
             .unwrap_data()
+            .items
             .into_iter()
             .map(|id| id_map_rev.get(&id).unwrap().clone())
             .collect::<HashSet<_>>();
@@ -300,35 +295,32 @@ async fn manage_queue() {
     }
 
     // Retry delivery
-    assert_eq!(
-        send_manage_request::<Vec<bool>>(&format!(
-            "/admin/queue/retry?id={},{}",
-            id_map.get("e").unwrap(),
-            id_map.get("f").unwrap()
-        ))
+    for id in [id_map.get("e").unwrap(), id_map.get("f").unwrap()] {
+        assert!(api
+            .request::<bool>(Method::PATCH, &format!("/api/queue/messages/{id}",))
+            .await
+            .unwrap()
+            .unwrap_data(),);
+    }
+    assert!(api
+        .request::<bool>(
+            Method::PATCH,
+            &format!(
+                "/api/queue/messages/{}?filter=example1.org&at=2200-01-01T00:00:00Z",
+                id_map.get("a").unwrap(),
+            )
+        )
         .await
         .unwrap()
-        .unwrap_data(),
-        vec![true, true]
-    );
-    assert_eq!(
-        send_manage_request::<Vec<bool>>(&format!(
-            "/admin/queue/retry?id={}&filter=example1.org&at=2200-01-01T00:00:00Z",
-            id_map.get("a").unwrap(),
-        ))
-        .await
-        .unwrap()
-        .unwrap_data(),
-        vec![true]
-    );
+        .unwrap_data());
 
     // Expect delivery to john@foobar.org
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        remote_qr
-            .read_event()
+        remote
+            .queue_receiver
+            .consume_message(&remote_core)
             .await
-            .unwrap_message()
             .recipients
             .into_iter()
             .map(|r| r.address)
@@ -338,13 +330,14 @@ async fn manage_queue() {
 
     // Message 'e' should be gone, 'f' should have retry_num == 2
     // while 'a' should have a retry time of 2200-01-01T00:00:00Z for example1.org
-    let mut messages = get_messages(&[
-        *id_map.get("e").unwrap(),
-        *id_map.get("f").unwrap(),
-        *id_map.get("a").unwrap(),
-    ])
-    .await
-    .into_iter();
+    let mut messages = api
+        .get_messages(&[
+            *id_map.get("e").unwrap(),
+            *id_map.get("f").unwrap(),
+            *id_map.get("a").unwrap(),
+        ])
+        .await
+        .into_iter();
     assert_eq!(messages.next().unwrap(), None);
     assert_eq!(
         messages
@@ -375,37 +368,41 @@ async fn manage_queue() {
         ("c", "rcpt6@example2.com"),
         ("d", ""),
     ] {
-        assert_eq!(
-            send_manage_request::<Vec<bool>>(&format!(
-                "/admin/queue/cancel?id={}{}{}",
-                id_map.get(id).unwrap(),
-                if !filter.is_empty() { "&filter=" } else { "" },
-                filter
-            ))
+        assert!(
+            api.request::<bool>(
+                Method::DELETE,
+                &format!(
+                    "/api/queue/messages/{}{}{}",
+                    id_map.get(id).unwrap(),
+                    if !filter.is_empty() { "?filter=" } else { "" },
+                    filter
+                )
+            )
             .await
             .unwrap()
             .unwrap_data(),
-            vec![true],
             "failed for {id}: {filter}"
         );
     }
     assert_eq!(
-        send_manage_request::<Vec<QueueId>>("/admin/queue/list")
+        api.request::<List<QueueId>>(Method::GET, "/api/queue/messages")
             .await
             .unwrap()
             .unwrap_data()
+            .items
             .len(),
         3
     );
-    for (message, id) in get_messages(&[
-        *id_map.get("a").unwrap(),
-        *id_map.get("b").unwrap(),
-        *id_map.get("c").unwrap(),
-        *id_map.get("d").unwrap(),
-    ])
-    .await
-    .into_iter()
-    .zip(["a", "b", "c", "d"])
+    for (message, id) in api
+        .get_messages(&[
+            *id_map.get("a").unwrap(),
+            *id_map.get("b").unwrap(),
+            *id_map.get("c").unwrap(),
+            *id_map.get("d").unwrap(),
+        ])
+        .await
+        .into_iter()
+        .zip(["a", "b", "c", "d"])
     {
         if ["b", "d"].contains(&id) {
             assert_eq!(message, None);
@@ -418,7 +415,7 @@ async fn manage_queue() {
                         if domain.name == "example2.org" {
                             assert_eq!(&domain.status, &Status::Completed("".to_string()));
                             for rcpt in &domain.recipients {
-                                assert!(matches!(&rcpt.status, Status::Completed(_)));
+                                assert!(matches!(&rcpt.status, Status::PermanentFailure(_)));
                             }
                         } else {
                             assert_eq!(&domain.status, &Status::Scheduled);
@@ -432,7 +429,7 @@ async fn manage_queue() {
                         if domain.name == "example2.com" {
                             for rcpt in &domain.recipients {
                                 if rcpt.address == "rcpt6@example2.com" {
-                                    assert!(matches!(&rcpt.status, Status::Completed(_)));
+                                    assert!(matches!(&rcpt.status, Status::PermanentFailure(_)));
                                 } else {
                                     assert!(matches!(&rcpt.status, Status::Scheduled));
                                 }
@@ -449,6 +446,47 @@ async fn manage_queue() {
         }
     }
 
+    // Bulk cancel
+    assert_eq!(
+        api.request::<List<Message>>(Method::GET, "/api/queue/messages?values=1")
+            .await
+            .unwrap()
+            .unwrap_data()
+            .items
+            .len(),
+        3
+    );
+    assert!(api
+        .request::<bool>(Method::DELETE, "/api/queue/messages?text=example2.com")
+        .await
+        .unwrap()
+        .unwrap_data());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        api.request::<List<QueueId>>(Method::GET, "/api/queue/messages")
+            .await
+            .unwrap()
+            .unwrap_data()
+            .items
+            .len(),
+        2
+    );
+    assert!(api
+        .request::<bool>(Method::DELETE, "/api/queue/messages")
+        .await
+        .unwrap()
+        .unwrap_data());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        api.request::<List<QueueId>>(Method::GET, "/api/queue/messages")
+            .await
+            .unwrap()
+            .unwrap_data()
+            .items
+            .len(),
+        0
+    );
+
     // Test authentication error
     assert_eq!(
         reqwest::Client::builder()
@@ -456,7 +494,7 @@ async fn manage_queue() {
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap()
-            .get("https://127.0.0.1:9980/list")
+            .get("https://127.0.0.1:9980/api/queue/messages")
             .header(AUTHORIZATION, "Basic YWRtaW46aGVsbG93b3JsZA==")
             .send()
             .await
@@ -474,15 +512,19 @@ fn assert_timestamp(timestamp: &DateTime, expected: i64, ctx: &str, message: &Me
     }
 }
 
-async fn get_messages(ids: &[QueueId]) -> Vec<Option<Message>> {
-    send_manage_request(&format!(
-        "/admin/queue/status?id={}",
-        ids.iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
-    .await
-    .unwrap()
-    .unwrap_data()
+impl ManagementApi {
+    async fn get_messages(&self, ids: &[QueueId]) -> Vec<Option<Message>> {
+        let mut results = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let message = self
+                .request::<Message>(Method::GET, &format!("/api/queue/messages/{id}",))
+                .await
+                .unwrap()
+                .try_unwrap_data();
+            results.push(message);
+        }
+
+        results
+    }
 }

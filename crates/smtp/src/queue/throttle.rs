@@ -1,107 +1,112 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::time::{Duration, Instant};
+use std::future::Future;
 
+use common::{
+    config::smtp::Throttle,
+    expr::functions::ResolveVariable,
+    listener::limiter::{ConcurrencyLimiter, InFlight},
+    Server, KV_RATE_LIMIT_HASH,
+};
 use dashmap::mapref::entry::Entry;
-use utils::{
-    config::KeyLookup,
-    listener::limiter::{ConcurrencyLimiter, InFlight, RateLimiter},
-};
+use store::write::now;
 
-use crate::{
-    config::{EnvelopeKey, Throttle},
-    core::{throttle::Limiter, QueueCore},
-};
+use crate::core::throttle::NewKey;
 
 use super::{Domain, Status};
 
 #[derive(Debug)]
 pub enum Error {
     Concurrency { limiter: ConcurrencyLimiter },
-    Rate { retry_at: Instant },
+    Rate { retry_at: u64 },
 }
 
-impl QueueCore {
-    pub async fn is_allowed(
-        &self,
-        throttle: &Throttle,
-        envelope: &impl KeyLookup<Key = EnvelopeKey>,
+pub trait IsAllowed: Sync + Send {
+    fn is_allowed<'x>(
+        &'x self,
+        throttle: &'x Throttle,
+        envelope: &impl ResolveVariable,
         in_flight: &mut Vec<InFlight>,
-        span: &tracing::Span,
+        session_id: u64,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+impl IsAllowed for Server {
+    async fn is_allowed<'x>(
+        &'x self,
+        throttle: &'x Throttle,
+        envelope: &impl ResolveVariable,
+        in_flight: &mut Vec<InFlight>,
+        session_id: u64,
     ) -> Result<(), Error> {
-        if throttle.conditions.conditions.is_empty() || throttle.conditions.eval(envelope).await {
-            match self.throttle.entry(throttle.new_key(envelope)) {
-                Entry::Occupied(mut e) => {
-                    let limiter = e.get_mut();
-                    if let Some(limiter) = &limiter.concurrency {
+        if throttle.expr.is_empty()
+            || self
+                .eval_expr(&throttle.expr, envelope, "throttle", session_id)
+                .await
+                .unwrap_or(false)
+        {
+            let key = throttle.new_key(envelope);
+
+            if let Some(rate) = &throttle.rate {
+                match self
+                    .core
+                    .storage
+                    .lookup
+                    .is_rate_allowed(KV_RATE_LIMIT_HASH, key.as_ref(), rate, false)
+                    .await
+                {
+                    Ok(Some(next_refill)) => {
+                        trc::event!(
+                            Queue(trc::QueueEvent::RateLimitExceeded),
+                            SpanId = session_id,
+                            Id = throttle.id.clone(),
+                            Limit = vec![
+                                trc::Value::from(rate.requests),
+                                trc::Value::from(rate.period)
+                            ],
+                        );
+
+                        return Err(Error::Rate {
+                            retry_at: now() + next_refill,
+                        });
+                    }
+                    Err(err) => {
+                        trc::error!(err.span_id(session_id).caused_by(trc::location!()));
+                    }
+                    _ => (),
+                }
+            }
+
+            if let Some(concurrency) = &throttle.concurrency {
+                match self.inner.data.smtp_queue_throttle.entry(key) {
+                    Entry::Occupied(mut e) => {
+                        let limiter = e.get_mut();
                         if let Some(inflight) = limiter.is_allowed() {
                             in_flight.push(inflight);
                         } else {
-                            tracing::info!(
-                                parent: span,
-                                context = "throttle",
-                                event = "too-many-requests",
-                                max_concurrent = limiter.max_concurrent,
-                                "Queue concurrency limit exceeded."
+                            trc::event!(
+                                Queue(trc::QueueEvent::ConcurrencyLimitExceeded),
+                                SpanId = session_id,
+                                Id = throttle.id.clone(),
+                                Limit = limiter.max_concurrent,
                             );
+
                             return Err(Error::Concurrency {
                                 limiter: limiter.clone(),
                             });
                         }
                     }
-                    if let (Some(limiter), Some(rate)) = (&mut limiter.rate, &throttle.rate) {
-                        if !limiter.is_allowed(rate) {
-                            tracing::info!(
-                                parent: span,
-                                context = "throttle",
-                                event = "rate-limit-exceeded",
-                                max_requests = rate.requests,
-                                max_interval = rate.period.as_secs(),
-                                "Queue rate limit exceeded."
-                            );
-                            return Err(Error::Rate {
-                                retry_at: Instant::now()
-                                    + Duration::from_secs(limiter.secs_to_refill()),
-                            });
-                        }
-                    }
-                }
-                Entry::Vacant(e) => {
-                    let concurrency = throttle.concurrency.map(|concurrency| {
-                        let limiter = ConcurrencyLimiter::new(concurrency);
+                    Entry::Vacant(e) => {
+                        let limiter = ConcurrencyLimiter::new(*concurrency);
                         if let Some(inflight) = limiter.is_allowed() {
                             in_flight.push(inflight);
                         }
-                        limiter
-                    });
-                    let rate = throttle.rate.as_ref().map(|rate| {
-                        let r = RateLimiter::new(rate);
-                        r.is_allowed(rate);
-                        r
-                    });
-
-                    e.insert(Limiter { rate, concurrency });
+                        e.insert(limiter);
+                    }
                 }
             }
         }
@@ -122,6 +127,5 @@ impl Domain {
                 self.status = Status::TemporaryFailure(super::Error::RateLimited);
             }
         }
-        self.changed = true;
     }
 }

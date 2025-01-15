@@ -1,29 +1,18 @@
 /*
- * Copyright (c) 2020-2022, Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
+use crate::{
+    core::{SelectedMailbox, Session, SessionData},
+    spawn_op,
+};
 use ahash::AHashMap;
+use common::listener::SessionStream;
+use directory::Permission;
 use imap_proto::{
     parser::PushUnique,
     protocol::{
@@ -35,129 +24,123 @@ use imap_proto::{
         Flag,
     },
     receiver::Request,
-    Command, ResponseCode, StatusResponse,
+    Command, ResponseCode, ResponseType, StatusResponse,
 };
-use jmap::{email::metadata::MessageMetadata, Bincode};
-use jmap_proto::{
-    error::method::MethodError,
-    types::{
-        acl::Acl, collection::Collection, id::Id, keyword::Keyword, property::Property,
-        state::StateChange, type_state::DataType,
-    },
+use jmap::{
+    blob::download::BlobDownload,
+    changes::{get::ChangesLookup, write::ChangeLog},
+    email::metadata::MessageMetadata,
+    services::state::StateManager,
+    JmapMethods,
+};
+use jmap_proto::types::{
+    acl::Acl, collection::Collection, id::Id, keyword::Keyword, property::Property,
+    state::StateChange, type_state::DataType,
 };
 use mail_parser::{Address, GetHeader, HeaderName, Message, PartType};
 use store::{
     query::log::{Change, Query},
-    write::{assert::HashedValue, BatchBuilder, F_BITMAP, F_VALUE},
+    write::{assert::HashedValue, BatchBuilder, Bincode, F_BITMAP, F_VALUE},
 };
-use utils::listener::SessionStream;
 
-use crate::core::{SelectedMailbox, Session, SessionData};
-
-use super::FromModSeq;
+use super::{FromModSeq, ImapContext};
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_fetch(
         &mut self,
         request: Request<Command>,
         is_uid: bool,
-    ) -> crate::OpResult {
-        match request.parse_fetch() {
-            Ok(arguments) => {
-                let (data, mailbox) = self.state.select_data();
-                let is_qresync = self.is_qresync;
-                let is_rev2 = self.version.is_rev2();
+    ) -> trc::Result<()> {
+        // Validate access
+        self.assert_has_permission(Permission::ImapFetch)?;
 
-                let enabled_condstore = if !self.is_condstore && arguments.changed_since.is_some()
-                    || arguments.attributes.contains(&Attribute::ModSeq)
-                {
-                    self.is_condstore = true;
-                    true
-                } else {
-                    false
-                };
+        let op_start = Instant::now();
+        let arguments = request.parse_fetch()?;
 
-                tokio::spawn(async move {
-                    data.write_bytes(
-                        data.fetch(
-                            arguments,
-                            mailbox,
-                            is_uid,
-                            is_qresync,
-                            is_rev2,
-                            enabled_condstore,
-                        )
-                        .await
-                        .into_bytes(),
-                    )
-                    .await;
-                });
-                Ok(())
-            }
-            Err(response) => self.write_bytes(response.into_bytes()).await,
-        }
+        let (data, mailbox) = self.state.select_data();
+        let is_qresync = self.is_qresync;
+        let is_rev2 = self.version.is_rev2();
+
+        let enabled_condstore = if !self.is_condstore && arguments.changed_since.is_some()
+            || arguments.attributes.contains(&Attribute::ModSeq)
+        {
+            self.is_condstore = true;
+            true
+        } else {
+            false
+        };
+
+        spawn_op!(data, {
+            let response = data
+                .fetch(
+                    arguments,
+                    mailbox,
+                    is_uid,
+                    is_qresync,
+                    is_rev2,
+                    enabled_condstore,
+                    op_start,
+                )
+                .await?;
+            data.write_bytes(response.into_bytes()).await
+        })
     }
 }
 
 impl<T: SessionStream> SessionData<T> {
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch(
         &self,
         mut arguments: Arguments,
         mailbox: Arc<SelectedMailbox>,
         is_uid: bool,
         is_qresync: bool,
-        is_rev2: bool,
+        _is_rev2: bool,
         enabled_condstore: bool,
-    ) -> StatusResponse {
+        op_start: Instant,
+    ) -> trc::Result<StatusResponse> {
         // Validate VANISHED parameter
         if arguments.include_vanished {
             if !is_qresync {
-                return StatusResponse::bad("Enable QRESYNC first to use the VANISHED parameter.")
-                    .with_tag(arguments.tag);
+                return Err(trc::ImapEvent::Error
+                    .into_err()
+                    .details("Enable QRESYNC first to use the VANISHED parameter.")
+                    .ctx(trc::Key::Type, ResponseType::Bad)
+                    .id(arguments.tag));
             } else if !is_uid {
-                return StatusResponse::bad("VANISHED parameter is only available for UID FETCH.")
-                    .with_tag(arguments.tag);
+                return Err(trc::ImapEvent::Error
+                    .into_err()
+                    .details("VANISHED parameter is only available for UID FETCH.")
+                    .ctx(trc::Key::Type, ResponseType::Bad)
+                    .id(arguments.tag));
             }
         }
 
         // Resync messages if needed
         let account_id = mailbox.id.account_id;
-        let mut modseq = match self.synchronize_messages(&mailbox).await {
-            Ok(modseq) => modseq,
-            Err(response) => return response.with_tag(arguments.tag),
-        };
-        let recent_messages = if !is_rev2 {
-            self.get_recent(&mailbox.id).into()
-        } else {
-            None
-        };
+        let mut modseq = self
+            .synchronize_messages(&mailbox)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
 
         // Convert IMAP ids to JMAP ids.
-        let mut ids = match mailbox
+        let mut ids = mailbox
             .sequence_to_ids(&arguments.sequence_set, is_uid)
             .await
-        {
-            Ok(ids) => ids,
-            Err(response) => {
-                return response.with_tag(arguments.tag);
-            }
-        };
+            .imap_ctx(&arguments.tag, trc::location!())?;
 
         // Convert state to modseq
         if let Some(changed_since) = arguments.changed_since {
             // Obtain changes since the modseq.
-            let changelog = match self
-                .jmap
+            let changelog = self
+                .server
                 .changes_(
                     account_id,
                     Collection::Email,
                     Query::from_modseq(changed_since),
                 )
                 .await
-            {
-                Ok(changelog) => changelog,
-                Err(_) => return StatusResponse::database_failure().with_tag(arguments.tag),
-            };
+                .imap_ctx(&arguments.tag, trc::location!())?;
 
             // Process changes
             let mut changed_ids = AHashMap::new();
@@ -194,7 +177,7 @@ impl<T: SessionStream> SessionData<T> {
                         ids: vanished,
                     }
                     .serialize(&mut buf);
-                    self.write_bytes(buf).await;
+                    self.write_bytes(buf).await?;
                 }
             }
 
@@ -207,9 +190,20 @@ impl<T: SessionStream> SessionData<T> {
                             .with_code(ResponseCode::highest_modseq(modseq))
                             .into_bytes(),
                     )
-                    .await;
+                    .await?;
                 }
-                return StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag);
+
+                trc::event!(
+                    Imap(trc::ImapEvent::Fetch),
+                    SpanId = self.session_id,
+                    AccountId = account_id,
+                    MailboxId = mailbox.id.mailbox_id,
+                    Elapsed = op_start.elapsed()
+                );
+
+                return Ok(
+                    StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag)
+                );
             }
             ids = changed_ids;
             arguments.attributes.push_unique(Attribute::ModSeq);
@@ -222,11 +216,11 @@ impl<T: SessionStream> SessionData<T> {
 
         for attribute in &arguments.attributes {
             match attribute {
-                Attribute::Envelope
-                | Attribute::Rfc822Header
-                | Attribute::Body
-                | Attribute::BodyStructure
-                | Attribute::BinarySize { .. } => {
+                Attribute::BodySection { sections, .. }
+                    if sections.first().is_some_and(|s| {
+                        matches!(s, Section::Header | Section::HeaderFields { .. })
+                    }) => {}
+                Attribute::Body | Attribute::BodyStructure | Attribute::BinarySize { .. } => {
                     /*
                         Note that this did not result in \Seen being set, because
                         RFC822.HEADER response data occurs as a result of a FETCH
@@ -263,7 +257,7 @@ impl<T: SessionStream> SessionData<T> {
                     Acl::ModifyItems,
                 )
                 .await
-                .unwrap_or(false)
+                .imap_ctx(&arguments.tag, trc::location!())?
         {
             set_seen_flags = false;
         }
@@ -284,71 +278,85 @@ impl<T: SessionStream> SessionData<T> {
             .map(|(id, imap_id)| (imap_id.seqnum, imap_id.uid, id))
             .collect::<Vec<_>>();
         ids.sort_unstable_by_key(|(seqnum, _, _)| *seqnum);
+        let fetched_ids = ids
+            .iter()
+            .map(|id| trc::Value::from(id.2))
+            .collect::<Vec<_>>();
+
         for (seqnum, uid, id) in ids {
             // Obtain attributes and keywords
-            let (email, keywords) = if let (Ok(Some(email)), Ok(Some(keywords))) = (
-                self.jmap
+            let (email, keywords) = if let (Some(email), Some(keywords)) = (
+                self.server
                     .get_property::<Bincode<MessageMetadata>>(
                         account_id,
                         Collection::Email,
                         id,
                         &Property::BodyStructure,
                     )
-                    .await,
-                self.jmap
+                    .await
+                    .imap_ctx(&arguments.tag, trc::location!())?,
+                self.server
                     .get_property::<HashedValue<Vec<Keyword>>>(
                         account_id,
                         Collection::Email,
                         id,
                         &Property::Keywords,
                     )
-                    .await,
+                    .await
+                    .imap_ctx(&arguments.tag, trc::location!())?,
             ) {
                 (email.inner, keywords)
             } else {
-                tracing::debug!(
-                    event = "not-found",
-                    account_id = account_id,
-                    collection = ?Collection::Email,
-                    document_id = id,
-                    "Message metadata not found");
+                trc::event!(
+                    Store(trc::StoreEvent::NotFound),
+                    AccountId = account_id,
+                    DocumentId = id,
+                    Collection = Collection::Email,
+                    Details = "Message metadata not found.",
+                    CausedBy = trc::location!(),
+                );
                 continue;
             };
 
             // Fetch and parse blob
             let raw_message = if needs_blobs {
                 // Retrieve raw message if needed
-                match self.jmap.get_blob(&email.blob_hash, 0..u32::MAX).await {
-                    Ok(Some(raw_message)) => raw_message.into(),
-                    Ok(None) => {
-                        tracing::warn!(event = "not-found",
-                        account_id = account_id,
-                        collection = ?Collection::Email,
-                        document_id = id,
-                        blob_id = ?email.blob_hash,
-                        "Blob not found");
+                match self
+                    .server
+                    .get_blob(&email.blob_hash, 0..usize::MAX)
+                    .await
+                    .imap_ctx(&arguments.tag, trc::location!())?
+                {
+                    Some(raw_message) => raw_message,
+                    None => {
+                        trc::event!(
+                            Store(trc::StoreEvent::NotFound),
+                            AccountId = account_id,
+                            DocumentId = id,
+                            Collection = Collection::Email,
+                            BlobId = email.blob_hash.to_hex(),
+                            Details = "Blob not found.",
+                            CausedBy = trc::location!(),
+                        );
+
                         continue;
-                    }
-                    Err(_) => {
-                        return StatusResponse::database_failure().with_tag(arguments.tag);
                     }
                 }
             } else {
-                None
+                email.raw_headers
             };
-            let message = email
-                .contents
-                .into_message(raw_message.as_deref().unwrap_or_default());
+            let message = email.contents.into_message(&raw_message);
 
             // Build response
             let mut items = Vec::with_capacity(arguments.attributes.len());
             let set_seen_flag =
                 set_seen_flags && !keywords.inner.iter().any(|k| k == &Keyword::Seen);
             let thread_id = if needs_thread_id || set_seen_flag {
-                if let Ok(Some(thread_id)) = self
-                    .jmap
+                if let Some(thread_id) = self
+                    .server
                     .get_property::<u32>(account_id, Collection::Email, id, Property::ThreadId)
                     .await
+                    .imap_ctx(&arguments.tag, trc::location!())?
                 {
                     thread_id
                 } else {
@@ -372,12 +380,6 @@ impl<T: SessionStream> SessionData<T> {
                             .collect::<Vec<_>>();
                         if set_seen_flag {
                             flags.push(Flag::Seen);
-                        }
-                        if recent_messages
-                            .as_ref()
-                            .map_or(false, |recent| recent.contains(id))
-                        {
-                            flags.push(Flag::Recent);
                         }
                         items.push(DataItem::Flags { flags });
                     }
@@ -403,15 +405,13 @@ impl<T: SessionStream> SessionData<T> {
                     }
                     Attribute::Rfc822 => {
                         items.push(DataItem::Rfc822 {
-                            contents: raw_message.as_ref().unwrap().into(),
+                            contents: raw_message.as_slice().into(),
                         });
                     }
                     Attribute::Rfc822Header => {
                         let message = message.root_part();
-                        if let Some(header) = raw_message
-                            .as_ref()
-                            .unwrap()
-                            .get(message.offset_header..message.offset_body)
+                        if let Some(header) =
+                            raw_message.get(message.offset_header..message.offset_body)
                         {
                             items.push(DataItem::Rfc822Header {
                                 contents: header.into(),
@@ -419,16 +419,9 @@ impl<T: SessionStream> SessionData<T> {
                         }
                     }
                     Attribute::Rfc822Text => {
-                        let message = message.root_part();
-                        if let Some(text) = raw_message
-                            .as_ref()
-                            .unwrap()
-                            .get(message.offset_body..message.offset_end)
-                        {
-                            items.push(DataItem::Rfc822Text {
-                                contents: text.into(),
-                            });
-                        }
+                        items.push(DataItem::Rfc822Text {
+                            contents: raw_message.as_slice().into(),
+                        });
                     }
                     Attribute::Body => {
                         items.push(DataItem::Body {
@@ -463,20 +456,21 @@ impl<T: SessionStream> SessionData<T> {
                             });
                         }
                         Err(_) => {
-                            self.write_bytes(
-                                StatusResponse::no(format!(
-                                    "Failed to decode part {} of message {}.",
-                                    sections
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join("."),
-                                    if is_uid { uid } else { seqnum }
-                                ))
-                                .with_code(ResponseCode::UnknownCte)
-                                .into_bytes(),
+                            self.write_error(
+                                trc::ImapEvent::Error
+                                    .into_err()
+                                    .details(format!(
+                                        "Failed to decode part {} of message {}.",
+                                        sections
+                                            .iter()
+                                            .map(|s| s.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join("."),
+                                        if is_uid { uid } else { seqnum }
+                                    ))
+                                    .code(ResponseCode::UnknownCte),
                             )
-                            .await;
+                            .await?;
                             continue;
                         }
                         _ => (),
@@ -491,7 +485,7 @@ impl<T: SessionStream> SessionData<T> {
                     }
                     Attribute::ModSeq => {
                         if let Ok(Some(modseq)) = self
-                            .jmap
+                            .server
                             .get_property::<u64>(account_id, Collection::Email, id, Property::Cid)
                             .await
                         {
@@ -525,9 +519,7 @@ impl<T: SessionStream> SessionData<T> {
             // Serialize fetch item
             let mut buf = Vec::with_capacity(128);
             FetchItem { id: seqnum, items }.serialize(&mut buf);
-            if !self.write_bytes(buf).await {
-                return StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag);
-            }
+            self.write_bytes(buf).await?;
 
             // Add to set flags
             if set_seen_flag {
@@ -537,12 +529,11 @@ impl<T: SessionStream> SessionData<T> {
 
         // Set Seen ids
         if !set_seen_ids.is_empty() {
-            let mut changelog = match self.jmap.begin_changes(account_id).await {
-                Ok(changelog) => changelog,
-                Err(_) => {
-                    return StatusResponse::database_failure().with_tag(arguments.tag);
-                }
-            };
+            let mut changelog = self
+                .server
+                .begin_changes(account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?;
             for (id, mut keywords) in set_seen_ids {
                 keywords.inner.push(Keyword::Seen);
                 let mut batch = BatchBuilder::new();
@@ -554,32 +545,46 @@ impl<T: SessionStream> SessionData<T> {
                     .value(Property::Keywords, keywords.inner, F_VALUE)
                     .value(Property::Keywords, Keyword::Seen, F_BITMAP)
                     .value(Property::Cid, changelog.change_id, F_VALUE);
-                match self.jmap.write_batch(batch).await {
+                match self.server.write_batch(batch).await {
                     Ok(_) => {
                         changelog.log_update(Collection::Email, id);
                     }
-                    Err(MethodError::ServerUnavailable) => {}
-                    Err(_) => {
-                        return StatusResponse::database_failure().with_tag(arguments.tag);
+                    Err(err) => {
+                        if !err.is_assertion_failure() {
+                            return Err(err.id(arguments.tag));
+                        }
                     }
                 }
             }
             if !changelog.is_empty() {
                 // Write changes
-                let change_id = match self.jmap.commit_changes(account_id, changelog).await {
-                    Ok(change_id) => change_id,
-                    Err(_) => {
-                        return StatusResponse::database_failure().with_tag(arguments.tag);
-                    }
-                };
+                let change_id = self
+                    .server
+                    .commit_changes(account_id, changelog)
+                    .await
+                    .imap_ctx(&arguments.tag, trc::location!())?;
                 modseq = change_id.into();
-                self.jmap
+                self.server
                     .broadcast_state_change(
                         StateChange::new(account_id).with_change(DataType::Email, change_id),
                     )
                     .await;
             }
         }
+
+        trc::event!(
+            Imap(trc::ImapEvent::Fetch),
+            SpanId = self.session_id,
+            AccountId = account_id,
+            MailboxId = mailbox.id.mailbox_id,
+            DocumentId = fetched_ids,
+            Details = arguments
+                .attributes
+                .iter()
+                .map(|c| trc::Value::from(format!("{c:?}")))
+                .collect::<Vec<_>>(),
+            Elapsed = op_start.elapsed()
+        );
 
         // Condstore was enabled with this command
         if enabled_condstore {
@@ -588,10 +593,10 @@ impl<T: SessionStream> SessionData<T> {
                     .with_code(ResponseCode::highest_modseq(modseq))
                     .into_bytes(),
             )
-            .await;
+            .await?;
         }
 
-        StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag)
+        Ok(StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag))
     }
 }
 
@@ -1095,13 +1100,9 @@ impl<'x> AsImapDataItem<'x> for Message<'x> {
 #[inline(always)]
 fn get_partial_bytes(bytes: &[u8], partial: Option<(u32, u32)>) -> &[u8] {
     if let Some((start, end)) = partial {
-        if let Some(bytes) =
-            bytes.get(start as usize..std::cmp::min((start + end) as usize, bytes.len()))
-        {
-            bytes
-        } else {
-            &[]
-        }
+        bytes
+            .get(start as usize..std::cmp::min((start + end) as usize, bytes.len()))
+            .unwrap_or_default()
     } else {
         bytes
     }

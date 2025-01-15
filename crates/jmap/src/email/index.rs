@@ -1,25 +1,8 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::borrow::Cow;
 
@@ -34,13 +17,11 @@ use nlp::language::Language;
 use store::{
     backend::MAX_TOKEN_LENGTH,
     fts::{index::FtsDocument, Field},
-    write::{
-        BatchBuilder, BlobOp, DirectoryClass, IntoOperations, F_BITMAP, F_CLEAR, F_INDEX, F_VALUE,
-    },
-    BlobHash,
+    write::{BatchBuilder, Bincode, BlobOp, DirectoryClass, F_BITMAP, F_CLEAR, F_INDEX, F_VALUE},
 };
+use utils::BlobHash;
 
-use crate::{mailbox::UidMailbox, Bincode};
+use crate::mailbox::UidMailbox;
 
 use super::metadata::MessageMetadata;
 
@@ -57,8 +38,11 @@ pub struct SortedAddressBuilder {
 }
 
 pub(super) trait IndexMessage {
+    #[allow(clippy::too_many_arguments)]
     fn index_message(
         &mut self,
+        account_id: u32,
+        tenant_id: Option<u32>,
         message: Message,
         blob_hash: BlobHash,
         keywords: Vec<Keyword>,
@@ -76,6 +60,8 @@ pub trait IndexMessageText<'x>: Sized {
 impl IndexMessage for BatchBuilder {
     fn index_message(
         &mut self,
+        account_id: u32,
+        tenant_id: Option<u32>,
         message: Message,
         blob_hash: BlobHash,
         keywords: Vec<Keyword>,
@@ -89,12 +75,17 @@ impl IndexMessage for BatchBuilder {
         self.value(Property::MailboxIds, mailbox_ids, F_VALUE | F_BITMAP);
 
         // Index size
-        let account_id = self.last_account_id().unwrap();
         self.value(Property::Size, message.raw_message.len() as u32, F_INDEX)
             .add(
                 DirectoryClass::UsedQuota(account_id),
                 message.raw_message.len() as i64,
             );
+        if let Some(tenant_id) = tenant_id {
+            self.add(
+                DirectoryClass::UsedQuota(tenant_id),
+                message.raw_message.len() as i64,
+            );
+        }
 
         // Index receivedAt
         self.value(Property::ReceivedAt, received_at, F_INDEX);
@@ -160,11 +151,18 @@ impl IndexMessage for BatchBuilder {
         );
 
         // Store message metadata
+        let root_part = message.root_part();
         self.value(
             Property::BodyStructure,
             Bincode::new(MessageMetadata {
                 preview: preview.unwrap_or_default().into_owned(),
                 size: message.raw_message.len(),
+                raw_headers: message
+                    .raw_message
+                    .as_ref()
+                    .get(root_part.offset_header..root_part.offset_body)
+                    .unwrap_or_default()
+                    .to_vec(),
                 contents: message.into(),
                 received_at,
                 has_attachments,
@@ -408,8 +406,8 @@ impl<'x> EmailIndexBuilder<'x> {
     }
 }
 
-impl<'x> IntoOperations for EmailIndexBuilder<'x> {
-    fn build(self, batch: &mut BatchBuilder) {
+impl EmailIndexBuilder<'_> {
+    pub fn build(self, batch: &mut BatchBuilder, account_id: u32, tenant_id: Option<u32>) {
         let options = if self.set {
             // Serialize metadata
             batch.value(Property::BodyStructure, &self.inner, F_VALUE);
@@ -422,17 +420,18 @@ impl<'x> IntoOperations for EmailIndexBuilder<'x> {
         let metadata = &self.inner.inner;
 
         // Index properties
-        let account_id = batch.last_account_id().unwrap();
+        let quota = if self.set {
+            metadata.size as i64
+        } else {
+            -(metadata.size as i64)
+        };
         batch
             .value(Property::Size, metadata.size as u32, F_INDEX | options)
-            .add(
-                DirectoryClass::UsedQuota(account_id),
-                if self.set {
-                    metadata.size as i64
-                } else {
-                    -(metadata.size as i64)
-                },
-            );
+            .add(DirectoryClass::UsedQuota(account_id), quota);
+        if let Some(tenant_id) = tenant_id {
+            batch.add(DirectoryClass::UsedQuota(tenant_id), quota);
+        }
+
         batch.value(
             Property::ReceivedAt,
             metadata.received_at,

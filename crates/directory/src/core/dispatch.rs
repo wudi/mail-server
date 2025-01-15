@@ -1,83 +1,22 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::net::IpAddr;
-
-use mail_send::Credentials;
-use store::Store;
+use trc::AddContext;
 
 use crate::{
-    backend::internal::lookup::DirectoryStore, AuthResult, Directory, DirectoryInner, Principal,
-    QueryBy,
+    backend::{internal::lookup::DirectoryStore, RcptType},
+    Directory, DirectoryInner, Principal, QueryBy,
 };
 
 impl Directory {
-    pub async fn authenticate(
-        &self,
-        credentials: &Credentials<String>,
-        remote_ip: IpAddr,
-        return_member_of: bool,
-    ) -> crate::Result<AuthResult<Principal<u32>>> {
-        if let Some(principal) = self
-            .query(QueryBy::Credentials(credentials), return_member_of)
-            .await?
-        {
-            Ok(AuthResult::Success(principal))
-        } else if self.blocked_ips.has_fail2ban() {
-            let login = match credentials {
-                Credentials::Plain { username, .. }
-                | Credentials::XOauth2 { username, .. }
-                | Credentials::OAuthBearer { token: username } => username,
-            };
-            if let Some(banned) = self
-                .blocked_ips
-                .is_fail2banned(remote_ip, login.to_string())
-            {
-                tracing::info!(
-                    context = "directory",
-                    event = "fail2ban",
-                    remote_ip = ?remote_ip,
-                    login = ?login,
-                    "IP address blocked after too many failed login attempts",
-                );
-
-                // Write blocked address to config
-                self.store().config_set(vec![banned].into_iter()).await?;
-
-                Ok(AuthResult::Banned)
-            } else {
-                Ok(AuthResult::Failure)
-            }
-        } else {
-            Ok(AuthResult::Failure)
-        }
-    }
-
     pub async fn query(
         &self,
         by: QueryBy<'_>,
         return_member_of: bool,
-    ) -> crate::Result<Option<Principal<u32>>> {
+    ) -> trc::Result<Option<Principal>> {
         match &self.store {
             DirectoryInner::Internal(store) => store.query(by, return_member_of).await,
             DirectoryInner::Ldap(store) => store.query(by, return_member_of).await,
@@ -85,34 +24,27 @@ impl Directory {
             DirectoryInner::Imap(store) => store.query(by).await,
             DirectoryInner::Smtp(store) => store.query(by).await,
             DirectoryInner::Memory(store) => store.query(by).await,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.query(by, return_member_of).await,
         }
+        .caused_by(trc::location!())
     }
 
-    pub async fn email_to_ids(&self, email: &str) -> crate::Result<Vec<u32>> {
-        let mut address = self.subaddressing.to_subaddress(email);
-        for _ in 0..2 {
-            let result = match &self.store {
-                DirectoryInner::Internal(store) => store.email_to_ids(address.as_ref()).await,
-                DirectoryInner::Ldap(store) => store.email_to_ids(address.as_ref()).await,
-                DirectoryInner::Sql(store) => store.email_to_ids(address.as_ref()).await,
-                DirectoryInner::Imap(store) => store.email_to_ids(address.as_ref()).await,
-                DirectoryInner::Smtp(store) => store.email_to_ids(address.as_ref()).await,
-                DirectoryInner::Memory(store) => store.email_to_ids(address.as_ref()).await,
-            }?;
-
-            if !result.is_empty() {
-                return Ok(result);
-            } else if let Some(catch_all) = self.catch_all.to_catch_all(email) {
-                address = catch_all;
-            } else {
-                break;
-            }
+    pub async fn email_to_id(&self, address: &str) -> trc::Result<Option<u32>> {
+        match &self.store {
+            DirectoryInner::Internal(store) => store.email_to_id(address).await,
+            DirectoryInner::Ldap(store) => store.email_to_id(address).await,
+            DirectoryInner::Sql(store) => store.email_to_id(address).await,
+            DirectoryInner::Imap(store) => store.email_to_id(address).await,
+            DirectoryInner::Smtp(store) => store.email_to_id(address).await,
+            DirectoryInner::Memory(store) => store.email_to_id(address).await,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.email_to_id(address).await,
         }
-
-        Ok(vec![])
+        .caused_by(trc::location!())
     }
 
-    pub async fn is_local_domain(&self, domain: &str) -> crate::Result<bool> {
+    pub async fn is_local_domain(&self, domain: &str) -> trc::Result<bool> {
         // Check cache
         if let Some(cache) = &self.cache {
             if let Some(result) = cache.get_domain(domain) {
@@ -127,7 +59,10 @@ impl Directory {
             DirectoryInner::Imap(store) => store.is_local_domain(domain).await,
             DirectoryInner::Smtp(store) => store.is_local_domain(domain).await,
             DirectoryInner::Memory(store) => store.is_local_domain(domain).await,
-        }?;
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.is_local_domain(domain).await,
+        }
+        .caused_by(trc::location!())?;
 
         // Update cache
         if let Some(cache) = &self.cache {
@@ -137,86 +72,87 @@ impl Directory {
         Ok(result)
     }
 
-    pub async fn rcpt(&self, email: &str) -> crate::Result<bool> {
-        // Expand subaddress
-        let mut address = self.subaddressing.to_subaddress(email);
-
+    pub async fn rcpt(&self, email: &str) -> trc::Result<RcptType> {
         // Check cache
         if let Some(cache) = &self.cache {
-            if let Some(result) = cache.get_rcpt(address.as_ref()) {
+            if let Some(result) = cache.get_rcpt(email) {
                 return Ok(result);
             }
         }
 
-        for _ in 0..2 {
-            let result = match &self.store {
-                DirectoryInner::Internal(store) => store.rcpt(address.as_ref()).await,
-                DirectoryInner::Ldap(store) => store.rcpt(address.as_ref()).await,
-                DirectoryInner::Sql(store) => store.rcpt(address.as_ref()).await,
-                DirectoryInner::Imap(store) => store.rcpt(address.as_ref()).await,
-                DirectoryInner::Smtp(store) => store.rcpt(address.as_ref()).await,
-                DirectoryInner::Memory(store) => store.rcpt(address.as_ref()).await,
-            }?;
-
-            if result {
-                // Update cache
-                if let Some(cache) = &self.cache {
-                    cache.set_rcpt(address.as_ref(), true);
-                }
-                return Ok(true);
-            } else if let Some(catch_all) = self.catch_all.to_catch_all(email) {
-                // Check cache
-                if let Some(cache) = &self.cache {
-                    if let Some(result) = cache.get_rcpt(catch_all.as_ref()) {
-                        return Ok(result);
-                    }
-                }
-                address = catch_all;
-            } else {
-                break;
-            }
+        let result = match &self.store {
+            DirectoryInner::Internal(store) => store.rcpt(email).await,
+            DirectoryInner::Ldap(store) => store.rcpt(email).await,
+            DirectoryInner::Sql(store) => store.rcpt(email).await,
+            DirectoryInner::Imap(store) => store.rcpt(email).await,
+            DirectoryInner::Smtp(store) => store.rcpt(email).await,
+            DirectoryInner::Memory(store) => store.rcpt(email).await,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.rcpt(email).await,
         }
+        .caused_by(trc::location!())?;
 
         // Update cache
         if let Some(cache) = &self.cache {
-            cache.set_rcpt(address.as_ref(), false);
+            cache.set_rcpt(email, &result);
         }
 
-        Ok(false)
+        Ok(result)
     }
 
-    pub async fn vrfy(&self, address: &str) -> crate::Result<Vec<String>> {
-        let address = self.subaddressing.to_subaddress(address);
+    pub async fn vrfy(&self, address: &str) -> trc::Result<Vec<String>> {
         match &self.store {
-            DirectoryInner::Internal(store) => store.vrfy(address.as_ref()).await,
-            DirectoryInner::Ldap(store) => store.vrfy(address.as_ref()).await,
-            DirectoryInner::Sql(store) => store.vrfy(address.as_ref()).await,
-            DirectoryInner::Imap(store) => store.vrfy(address.as_ref()).await,
-            DirectoryInner::Smtp(store) => store.vrfy(address.as_ref()).await,
-            DirectoryInner::Memory(store) => store.vrfy(address.as_ref()).await,
+            DirectoryInner::Internal(store) => store.vrfy(address).await,
+            DirectoryInner::Ldap(store) => store.vrfy(address).await,
+            DirectoryInner::Sql(store) => store.vrfy(address).await,
+            DirectoryInner::Imap(store) => store.vrfy(address).await,
+            DirectoryInner::Smtp(store) => store.vrfy(address).await,
+            DirectoryInner::Memory(store) => store.vrfy(address).await,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.vrfy(address).await,
+        }
+        .caused_by(trc::location!())
+    }
+
+    pub async fn expn(&self, address: &str) -> trc::Result<Vec<String>> {
+        match &self.store {
+            DirectoryInner::Internal(store) => store.expn(address).await,
+            DirectoryInner::Ldap(store) => store.expn(address).await,
+            DirectoryInner::Sql(store) => store.expn(address).await,
+            DirectoryInner::Imap(store) => store.expn(address).await,
+            DirectoryInner::Smtp(store) => store.expn(address).await,
+            DirectoryInner::Memory(store) => store.expn(address).await,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(store) => store.expn(address).await,
+        }
+        .caused_by(trc::location!())
+    }
+
+    pub fn has_bearer_token_support(&self) -> bool {
+        match &self.store {
+            DirectoryInner::Internal(_)
+            | DirectoryInner::Ldap(_)
+            | DirectoryInner::Sql(_)
+            | DirectoryInner::Imap(_)
+            | DirectoryInner::Smtp(_)
+            | DirectoryInner::Memory(_) => false,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(_) => true,
         }
     }
+}
 
-    pub async fn expn(&self, address: &str) -> crate::Result<Vec<String>> {
-        let address = self.subaddressing.to_subaddress(address);
-        match &self.store {
-            DirectoryInner::Internal(store) => store.expn(address.as_ref()).await,
-            DirectoryInner::Ldap(store) => store.expn(address.as_ref()).await,
-            DirectoryInner::Sql(store) => store.expn(address.as_ref()).await,
-            DirectoryInner::Imap(store) => store.expn(address.as_ref()).await,
-            DirectoryInner::Smtp(store) => store.expn(address.as_ref()).await,
-            DirectoryInner::Memory(store) => store.expn(address.as_ref()).await,
-        }
-    }
-
-    fn store(&self) -> &Store {
-        match &self.store {
-            DirectoryInner::Internal(store) => store,
-            DirectoryInner::Ldap(store) => &store.data_store,
-            DirectoryInner::Sql(store) => &store.data_store,
-            DirectoryInner::Imap(store) => &store.data_store,
-            DirectoryInner::Smtp(store) => &store.data_store,
-            DirectoryInner::Memory(store) => &store.data_store,
+impl DirectoryInner {
+    pub fn is_enterprise_directory(&self) -> bool {
+        match self {
+            DirectoryInner::Internal(_)
+            | DirectoryInner::Ldap(_)
+            | DirectoryInner::Sql(_)
+            | DirectoryInner::Imap(_)
+            | DirectoryInner::Smtp(_)
+            | DirectoryInner::Memory(_) => false,
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(_) => true,
         }
     }
 }

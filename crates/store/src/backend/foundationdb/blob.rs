@@ -1,32 +1,16 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::ops::Range;
 
-use foundationdb::{options::StreamingMode, FdbError, KeySelector, RangeOption};
-use futures::StreamExt;
+use foundationdb::{options::StreamingMode, KeySelector, RangeOption};
+use futures::TryStreamExt;
+use utils::BLOB_HASH_LEN;
 
-use crate::{write::key::KeySerializer, Error, BLOB_HASH_LEN, SUBSPACE_BLOBS};
+use crate::{backend::foundationdb::into_error, write::key::KeySerializer, SUBSPACE_BLOBS};
 
 use super::{FdbStore, MAX_VALUE_SIZE};
 
@@ -34,11 +18,11 @@ impl FdbStore {
     pub(crate) async fn get_blob(
         &self,
         key: &[u8],
-        range: Range<u32>,
-    ) -> crate::Result<Option<Vec<u8>>> {
-        let block_start = range.start as usize / MAX_VALUE_SIZE;
-        let bytes_start = range.start as usize % MAX_VALUE_SIZE;
-        let block_end = (range.end as usize / MAX_VALUE_SIZE) + 1;
+        range: Range<usize>,
+    ) -> trc::Result<Option<Vec<u8>>> {
+        let block_start = range.start / MAX_VALUE_SIZE;
+        let bytes_start = range.start % MAX_VALUE_SIZE;
+        let block_end = (range.end / MAX_VALUE_SIZE) + 1;
 
         let begin = KeySerializer::new(key.len() + 3)
             .write(SUBSPACE_BLOBS)
@@ -51,8 +35,8 @@ impl FdbStore {
             .write(block_end as u16)
             .finalize();
         let key_len = begin.len();
-        let trx = self.db.create_trx()?;
-        let mut values = trx.get_ranges(
+        let trx = self.read_trx().await?;
+        let mut values = trx.get_ranges_keyvalues(
             RangeOption {
                 begin: KeySelector::first_greater_or_equal(begin),
                 end: KeySelector::first_greater_or_equal(end),
@@ -63,49 +47,44 @@ impl FdbStore {
             true,
         );
         let mut blob_data: Option<Vec<u8>> = None;
-        let blob_range = (range.end - range.start) as usize;
+        let blob_range = range.end - range.start;
 
-        'outer: while let Some(values) = values.next().await {
-            for value in values? {
-                let key = value.key();
-                if key.len() == key_len {
-                    let value = value.value();
-                    if let Some(blob_data) = &mut blob_data {
-                        blob_data.extend_from_slice(
-                            value
-                                .get(
-                                    ..std::cmp::min(
-                                        blob_range.saturating_sub(blob_data.len()),
-                                        value.len(),
-                                    ),
-                                )
-                                .unwrap_or(&[]),
-                        );
-                        if blob_data.len() == blob_range {
-                            break 'outer;
-                        }
-                    } else {
-                        let blob_size = if blob_range <= (5 * (1 << 20)) {
-                            blob_range
-                        } else if value.len() == MAX_VALUE_SIZE {
-                            MAX_VALUE_SIZE * 2
-                        } else {
-                            value.len()
-                        };
-                        let mut blob_data_ = Vec::with_capacity(blob_size);
-                        blob_data_.extend_from_slice(
-                            value
-                                .get(
-                                    bytes_start
-                                        ..std::cmp::min(bytes_start + blob_range, value.len()),
-                                )
-                                .unwrap_or(&[]),
-                        );
-                        if blob_data_.len() == blob_range {
-                            return Ok(Some(blob_data_));
-                        }
-                        blob_data = blob_data_.into();
+        'outer: while let Some(value) = values.try_next().await.map_err(into_error)? {
+            let key = value.key();
+            if key.len() == key_len {
+                let value = value.value();
+                if let Some(blob_data) = &mut blob_data {
+                    blob_data.extend_from_slice(
+                        value
+                            .get(
+                                ..std::cmp::min(
+                                    blob_range.saturating_sub(blob_data.len()),
+                                    value.len(),
+                                ),
+                            )
+                            .unwrap_or(&[]),
+                    );
+                    if blob_data.len() == blob_range {
+                        break 'outer;
                     }
+                } else {
+                    let blob_size = if blob_range <= (5 * (1 << 20)) {
+                        blob_range
+                    } else if value.len() == MAX_VALUE_SIZE {
+                        MAX_VALUE_SIZE * 2
+                    } else {
+                        value.len()
+                    };
+                    let mut blob_data_ = Vec::with_capacity(blob_size);
+                    blob_data_.extend_from_slice(
+                        value
+                            .get(bytes_start..std::cmp::min(bytes_start + blob_range, value.len()))
+                            .unwrap_or(&[]),
+                    );
+                    if blob_data_.len() == blob_range {
+                        return Ok(Some(blob_data_));
+                    }
+                    blob_data = blob_data_.into();
                 }
             }
         }
@@ -113,7 +92,7 @@ impl FdbStore {
         Ok(blob_data)
     }
 
-    pub(crate) async fn put_blob(&self, key: &[u8], data: &[u8]) -> crate::Result<()> {
+    pub(crate) async fn put_blob(&self, key: &[u8], data: &[u8]) -> trc::Result<()> {
         const N_CHUNKS: usize = (1 << 5) - 1;
         let last_chunk = std::cmp::max(
             (data.len() / MAX_VALUE_SIZE)
@@ -124,7 +103,7 @@ impl FdbStore {
                 },
             1,
         ) - 1;
-        let mut trx = self.db.create_trx()?;
+        let mut trx = self.db.create_trx().map_err(into_error)?;
 
         for (chunk_pos, chunk_bytes) in data.chunks(MAX_VALUE_SIZE).enumerate() {
             trx.set(
@@ -136,11 +115,9 @@ impl FdbStore {
                 chunk_bytes,
             );
             if chunk_pos == last_chunk || (chunk_pos > 0 && chunk_pos % N_CHUNKS == 0) {
-                trx.commit()
-                    .await
-                    .map_err(|err| Error::from(FdbError::from(err)))?;
+                self.commit(trx, false).await?;
                 if chunk_pos < last_chunk {
-                    trx = self.db.create_trx()?;
+                    trx = self.db.create_trx().map_err(into_error)?;
                 } else {
                     break;
                 }
@@ -150,12 +127,12 @@ impl FdbStore {
         Ok(())
     }
 
-    pub(crate) async fn delete_blob(&self, key: &[u8]) -> crate::Result<bool> {
+    pub(crate) async fn delete_blob(&self, key: &[u8]) -> trc::Result<bool> {
         if key.len() < BLOB_HASH_LEN {
             return Ok(false);
         }
 
-        let trx = self.db.create_trx()?;
+        let trx = self.db.create_trx().map_err(into_error)?;
         trx.clear_range(
             &KeySerializer::new(key.len() + 3)
                 .write(SUBSPACE_BLOBS)
@@ -168,9 +145,7 @@ impl FdbStore {
                 .write(u16::MAX)
                 .finalize(),
         );
-        match trx.commit().await {
-            Ok(_) => Ok(true),
-            Err(err) => Err(FdbError::from(err).into()),
-        }
+
+        self.commit(trx, false).await
     }
 }

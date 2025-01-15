@@ -1,236 +1,174 @@
 use std::{
-    borrow::Cow,
-    collections::HashMap,
     fs,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::smtp::session::TestSession;
-use ahash::AHashMap;
-use mail_auth::{dmarc::Policy, DkimResult, DmarcResult, IprevResult, SpfResult, MX};
-use sieve::runtime::Variable;
-use smtp::{
-    config::{scripts::ConfigSieve, ConfigContext, IfBlock},
-    core::{Session, SessionAddress, SMTP},
-    inbound::AuthResult,
-    scripts::{
-        functions::html::{get_attribute, html_attr_tokens, html_img_area, html_to_tokens},
-        ScriptModification, ScriptResult,
+use ahash::{AHashMap, AHashSet};
+use common::{
+    auth::AccessToken,
+    config::spamfilter::SpamFilterAction,
+    enterprise::{
+        llm::{
+            AiApiConfig, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
+            Message,
+        },
+        SpamFilterLlmConfig,
     },
+    Core,
 };
-use store::config::ConfigStore;
-use tokio::runtime::Handle;
+use hyper::Method;
+use jmap::api::{http::ToHttpResponse, JsonResponse};
+use mail_auth::{
+    dkim::Signature, dmarc::Policy, ArcOutput, DkimOutput, DkimResult, DmarcResult, IprevOutput,
+    IprevResult, SpfOutput, SpfResult, MX,
+};
+use mail_parser::MessageParser;
+use smtp::core::{Session, SessionAddress};
+use smtp_proto::{MAIL_BODY_8BITMIME, MAIL_SMTPUTF8};
+use spam_filter::{
+    analysis::{
+        bayes::SpamFilterAnalyzeBayes, date::SpamFilterAnalyzeDate, dmarc::SpamFilterAnalyzeDmarc,
+        domain::SpamFilterAnalyzeDomain, ehlo::SpamFilterAnalyzeEhlo, from::SpamFilterAnalyzeFrom,
+        headers::SpamFilterAnalyzeHeaders, html::SpamFilterAnalyzeHtml, init::SpamFilterInit,
+        ip::SpamFilterAnalyzeIp, llm::SpamFilterAnalyzeLlm, messageid::SpamFilterAnalyzeMid,
+        mime::SpamFilterAnalyzeMime, pyzor::SpamFilterAnalyzePyzor,
+        received::SpamFilterAnalyzeReceived, recipient::SpamFilterAnalyzeRecipient,
+        replyto::SpamFilterAnalyzeReplyTo, reputation::SpamFilterAnalyzeReputation,
+        rules::SpamFilterAnalyzeRules, score::SpamFilterAnalyzeScore,
+        subject::SpamFilterAnalyzeSubject, trusted_reply::SpamFilterAnalyzeTrustedReply,
+        url::SpamFilterAnalyzeUrl,
+    },
+    modules::html::{html_to_tokens, HtmlToken},
+};
+use store::Stores;
 use utils::config::Config;
 
-use crate::smtp::{TestConfig, TestSMTP};
+use crate::{
+    http_server::{spawn_mock_http_server, HttpMessage},
+    jmap::enterprise::EnterpriseCore,
+    smtp::{session::TestSession, DnsCache, TempDir, TestSMTP},
+};
 
 const CONFIG: &str = r#"
-[sieve.trusted]
-from-name = "Sieve Daemon"
-from-addr = "sieve@foobar.org"
-return-path = ""
-hostname = "mx.foobar.org"
-no-capability-check = true
+[spam-filter.bayes.classify]
+balance = "0.0"
+learns = 10
 
-[sieve.trusted.limits]
-redirects = 3
-out-messages = 5
-received-headers = 50
-cpu = 500000
-nested-includes = 5
-duplicate-expiry = "7d"
+[spam-filter.bayes.auto-learn.threshold]
+ham = "-0.5"
+spam = "6.0"
 
-[sieve.trusted.default]
-#directory = "%{DEFAULT_DIRECTORY}%"
+[spam-filter.score]
+spam = "5.0"
+
+[spam-filter.llm]
+enable = true
+model = "dummy"
+prompt = "You are an AI assistant specialized in analyzing email content to detect unsolicited, commercial, or harmful messages. Format your response as follows, separated by commas: Category,Confidence,Explanation
+Here's the email to analyze, please provide your analysis based on the above instructions, ensuring your response is in the specified comma-separated format."
+separator = ","
+categories = ["Unsolicited", "Commercial", "Harmful", "Legitimate"]
+confidence = ["High", "Medium", "Low"]
+
+[spam-filter.llm.index]
+category = 0
+confidence = 1
+explanation = 2
+
+[spam-filter.reputation]
+enable = true
+
+[session.rcpt]
+relay = true
+
+[storage]
+data = "spamdb"
+lookup = "spamdb"
+blob = "spamdb"
+fts = "spamdb"
+directory = "spamdb"
+
+[directory."spamdb"]
+type = "internal"
 store = "spamdb"
 
 [store."spamdb"]
-type = "sqlite"
-path = "%PATH%/test_antispam.db"
+type = "rocksdb"
+path = "{PATH}/test_antispam.db"
 
 #[store."redis"]
 #type = "redis"
 #url = "redis://127.0.0.1"
 
-[store."default/domains"]
-type = "memory"
-format = "list"
-values = ["local-domain.org"]
+[enterprise.ai.dummy]
+url = "https://127.0.0.1:9090/v1/chat/completions"
+type = "chat"
+model = "gpt-dummy"
+allow-invalid-certs = true
 
-[store."spam/free-domains"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["gmail.com", "googlemail.com", "yahoomail.com", "*.freemail.org"]
-
-[store."spam/disposable-domains"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["guerrillamail.com", "*.disposable.org"]
-
-[store."spam/redirectors"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["bit.ly", "redirect.io", "redirect.me", "redirect.org",
- "redirect.com", "redirect.net", "t.ly", "tinyurl.com"]
-
-[store."spam/dmarc-allow"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["dmarc-allow.org"]
-
-[store."spam/spf-dkim-allow"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["spf-dkim-allow.org"]
-
-[store."spam/domains-allow"]
-type = "memory"
-format = "glob"
-values = []
-
-[store."spam/mime-types"]
-type = "memory"
-format = "map"
-comment = '#'
-values = ["html text/html|BAD", 
-          "pdf application/pdf|NZ", 
-          "txt text/plain|message/disposition-notification|text/rfc822-headers", 
-          "zip AR", 
-          "js BAD|NZ", 
-          "hta BAD|NZ"]
-
-[store."spam/trap-address"]
-type = "memory"
-format = "glob"
-comment = '#'
-values = ["spamtrap@*"]
-
-[store."spam/scores"]
-type = "memory"
-format = "map"
-values = "file://%CFG_PATH%/maps/scores.map"
-
-[resolver]
-public-suffix = "file://%LIST_PATH%/public-suffix.dat"
-
-[sieve.trusted.scripts]
+[spam-filter.list]
+"file-extensions" = { "html" = "text/html|BAD", 
+                "pdf" = "application/pdf|NZ", 
+                "txt" = "text/plain|message/disposition-notification|text/rfc822-headers", 
+                "zip" = "AR", 
+                "js" = "BAD|NZ", 
+                "hta" = "BAD|NZ" }
+[lookup]
+"url-redirectors" = {"bit.ly", "redirect.io", "redirect.me", "redirect.org", "redirect.com", "redirect.net", "t.ly", "tinyurl.com"}
+"spam-traps" = {"spamtrap@*"}
+"trusted-domains" = {"stalw.art"}
+"freemail-providers" = {"gmail.com", "googlemail.com", "yahoomail.com", "outlook.com", "*freemail.org"}
+"disposable-providers" = {"guerrillamail.com", "*disposable.org"}
+"surbl-hashbl" = {"bit.ly", "drive.google.com", "lnkiy.in"}
 "#;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn antispam() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::builder()
-                    .parse(
-                        "smtp=debug,imap=debug,jmap=debug,store=debug,utils=debug,directory=debug",
-                    )
-                    .unwrap(),
-            )
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Prepare config
-    let tests = [
-        "html",
-        "subject",
-        "bounce",
-        "received",
-        "messageid",
-        "date",
-        "from",
-        "replyto",
-        "recipient",
-        "mime",
-        "headers",
-        "url",
-        "dmarc",
-        "ip",
-        "helo",
-        "rbl",
-        "replies_out",
-        "replies_in",
-        "spamtrap",
-        "bayes_classify",
-        "reputation",
-        "pyzor",
-    ];
-    let mut core = SMTP::test();
-    let qr = core.init_test_queue("smtp_antispam_test");
-    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf()
-        .join("resources")
-        .join("config")
-        .join("spamfilter");
-    let mut config = CONFIG
-        .replace("%PATH%", qr._temp_dir.temp_dir.as_path().to_str().unwrap())
-        .replace(
-            "%LIST_PATH%",
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("smtp")
-                .join("lists")
-                .to_str()
-                .unwrap(),
-        )
-        .replace("%CFG_PATH%", base_path.as_path().to_str().unwrap());
-    let base_path = base_path.join("scripts");
-    let script_config = fs::read_to_string(base_path.join("config.sieve"))
-        .unwrap()
-        .replace(
-            "AUTOLEARN_SPAM_HAM_BALANCE\" \"0.9",
-            "AUTOLEARN_SPAM_HAM_BALANCE\" \"0.0",
-        );
-    let script_prelude = fs::read_to_string(base_path.join("prelude.sieve")).unwrap();
-    let mut all_scripts = script_config.clone() + "\n" + script_prelude.as_str();
-    for test_name in tests {
-        let mut script = fs::read_to_string(base_path.join(format!("{test_name}.sieve"))).unwrap();
-        if !["reputation", "replies_out", "pyzor"].contains(&test_name) {
-            all_scripts = all_scripts + "\n" + script.as_str();
+    let tmp_dir = TempDir::new("smtp_antispam_test", true);
+    let mut config = CONFIG.replace("{PATH}", tmp_dir.temp_dir.as_path().to_str().unwrap());
+    let base_path = PathBuf::from(
+        std::env::var("SPAM_RULES_DIR")
+            .unwrap_or_else(|_| "/Users/me/code/spam-filter".to_string()),
+    );
+    for section in ["rules", "lists"] {
+        for entry in fs::read_dir(base_path.join(section)).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_file() {
+                let file_name = path.file_name().unwrap().to_str().unwrap();
+                if file_name.ends_with(".toml")
+                    && ((section == "rules" && file_name != "llm.toml")
+                        || (section == "lists" && file_name == "scores.toml"))
+                {
+                    let contents = fs::read_to_string(&path).unwrap();
+                    config.push_str("\n\n");
+                    config.push_str(&contents);
+                }
+            }
         }
-
-        if test_name == "reputation" {
-            script = "let \"score\" \"env.score\";\n\n".to_string()
-                + script.as_str()
-                + concat!(
-                    "\n\nif eval \"score != env.final_score\" ",
-                    "{let \"t.INVALID_SCORE\" \"score\";}\n"
-                );
-        } else if test_name == "bayes_classify" {
-            script = script.replace("200", "10");
-        }
-
-        config.push_str(&format!(
-            "{test_name} = '''{script_config}\n{script_prelude}\n{script}\n'''\n"
-        ));
     }
-    for test_name in ["composites", "scores", "epilogue"] {
-        all_scripts = all_scripts
-            + "\n"
-            + fs::read_to_string(base_path.join(format!("{test_name}.sieve")))
-                .unwrap()
-                .as_str();
-    }
-
-    config.push_str(&format!("combined = '''{all_scripts}\n'''\n"));
 
     // Parse config
-    let config = Config::new(&config).unwrap();
-    let mut ctx = ConfigContext::new(&[]);
-    ctx.stores = config.parse_stores().await.unwrap();
-    core.sieve = config.parse_sieve(&mut ctx).unwrap();
-    let config = &mut core.session.config;
-    config.rcpt.relay = IfBlock::new(true);
+    let mut config = Config::new(&config).unwrap();
+    config.resolve_all_macros().await;
+    let stores = Stores::parse_all(&mut config, false).await;
+    let mut core = Core::parse(&mut config, stores, Default::default())
+        .await
+        .enable_enterprise();
+    let ai_apis = AHashMap::from_iter([(
+        "dummy".to_string(),
+        AiApiConfig::parse(&mut config, "dummy").unwrap().into(),
+    )]);
+    core.enterprise.as_mut().unwrap().spam_filter_llm =
+        SpamFilterLlmConfig::parse(&mut config, &ai_apis);
+    crate::AssertConfig::assert_no_errors(config);
+    let server = TestSMTP::from_core(core).server;
 
     // Add mock DNS entries
     for (domain, ip) in [
@@ -253,19 +191,24 @@ async fn antispam() {
             "127.0.1.3",
         ),
         (
-            "94c57fe69a113e875f772bdea55bf2c3.hashbl.surbl.org",
+            "ba76e47680ba70a0cbff8d6c92139683.hashbl.surbl.org",
             "127.0.0.16",
         ),
         (
-            "64aca53deb83db2ba30a59604ada2d80.hashbl.surbl.org",
+            "0ac5b387a1c6d8461a78bbf7b172a2a1.hashbl.surbl.org",
             "127.0.0.64",
         ),
         (
-            "02159eed92622b2fb8c83c659f269007.hashbl.surbl.org",
+            "637d6717761b5de0c84108c894bb68f2.hashbl.surbl.org",
             "127.0.0.8",
         ),
     ] {
-        core.resolvers.dns.ipv4_add(
+        server.ipv4_add(
+            domain,
+            vec![ip.parse().unwrap()],
+            Instant::now() + Duration::from_secs(100),
+        );
+        server.dnsbl_add(
             domain,
             vec![ip.parse().unwrap()],
             Instant::now() + Duration::from_secs(100),
@@ -277,7 +220,7 @@ async fn antispam() {
         "gmail.com",
         "custom.disposable.org",
     ] {
-        core.resolvers.dns.mx_add(
+        server.mx_add(
             mx,
             vec![MX {
                 exchanges: vec!["127.0.0.1".parse().unwrap()],
@@ -287,21 +230,69 @@ async fn antispam() {
         );
     }
 
-    let core = Arc::new(core);
+    // Spawn mock OpenAI server
+    let _tx = spawn_mock_http_server(Arc::new(|req: HttpMessage| {
+        assert_eq!(req.uri.path(), "/v1/chat/completions");
+        assert_eq!(req.method, Method::POST);
+        let req =
+            serde_json::from_slice::<ChatCompletionRequest>(req.body.as_ref().unwrap()).unwrap();
+        assert_eq!(req.model, "gpt-dummy");
+        let message = &req.messages[0].content;
+        assert!(message.contains("You are an AI assistant specialized in analyzing email"));
+
+        JsonResponse::new(&ChatCompletionResponse {
+            created: 0,
+            object: String::new(),
+            id: String::new(),
+            model: req.model,
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                finish_reason: "stop".to_string(),
+                message: Message {
+                    role: "assistant".to_string(),
+                    content: message.split_once("Subject: ").unwrap().1.to_string(),
+                },
+            }],
+        })
+        .into_http_response()
+    }))
+    .await;
 
     // Run tests
     let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
         .join("smtp")
         .join("antispam");
-    let span = tracing::info_span!("sieve_antispam");
-    for &test_name in tests.iter().chain(&["combined"]) {
+    for test_name in [
+        "combined",
+        "ip",
+        "helo",
+        "received",
+        "messageid",
+        "date",
+        "from",
+        "subject",
+        "replyto",
+        "recipient",
+        "headers",
+        "url",
+        "html",
+        "mime",
+        "bounce",
+        "dmarc",
+        "rbl",
+        "replies_out",
+        "replies_in",
+        "spamtrap",
+        "bayes_classify",
+        "reputation",
+        "pyzor",
+        "llm",
+    ] {
         /*if test_name != "combined" {
             continue;
         }*/
         println!("===== {test_name} =====");
-        let script = ctx.scripts.remove(test_name).unwrap();
-
         let contents = fs::read_to_string(base_path.join(format!("{test_name}.test"))).unwrap();
         let mut lines = contents.lines();
         let mut has_more = true;
@@ -309,12 +300,21 @@ async fn antispam() {
         while has_more {
             let mut message = String::new();
             let mut in_params = true;
-            let mut variables: HashMap<String, Variable> = HashMap::new();
-            let mut expected_variables = AHashMap::new();
-            let mut expected_headers = AHashMap::new();
 
             // Build session
-            let mut session = Session::test(core.clone());
+            let mut session = Session::test(server.clone());
+            let mut arc_result = None;
+            let mut dkim_result = None;
+            let mut dkim_signatures = vec![];
+            let mut dmarc_result = None;
+            let mut dmarc_policy = None;
+            let mut expected_tags = AHashSet::new();
+            let mut expect_headers = String::new();
+            let mut score_set = 0.0;
+            let mut score_final = 0.0;
+            let mut body_params = 0;
+            let mut is_tls = false;
+
             for line in lines.by_ref() {
                 if in_params {
                     if line.is_empty() {
@@ -325,41 +325,56 @@ async fn antispam() {
                     let value = value.trim();
                     match param {
                         "remote_ip" => {
+                            session.data.remote_ip_str = value.to_string();
                             session.data.remote_ip = value.parse().unwrap();
                         }
                         "helo_domain" => {
                             session.data.helo_domain = value.to_string();
                         }
                         "authenticated_as" => {
-                            session.data.authenticated_as = value.to_string();
+                            session.data.authenticated_as = Some(Arc::new(AccessToken {
+                                name: value.to_string(),
+                                ..Default::default()
+                            }));
                         }
                         "spf.result" | "spf_ehlo.result" => {
-                            variables.insert(
-                                param.to_string(),
-                                SpfResult::from_str(value).as_str().to_string().into(),
-                            );
+                            session.data.spf_mail_from =
+                                Some(SpfOutput::default().with_result(SpfResult::from_str(value)));
                         }
                         "iprev.result" => {
-                            variables.insert(
-                                param.to_string(),
-                                IprevResult::from_str(value).as_str().to_string().into(),
-                            );
+                            session
+                                .data
+                                .iprev
+                                .get_or_insert(IprevOutput {
+                                    result: IprevResult::None,
+                                    ptr: None,
+                                })
+                                .result = IprevResult::from_str(value);
                         }
-                        "dkim.result" | "arc.result" => {
-                            variables.insert(
-                                param.to_string(),
-                                DkimResult::from_str(value).as_str().to_string().into(),
-                            );
+                        "dkim.result" => {
+                            dkim_result = match DkimResult::from_str(value) {
+                                DkimResult::Pass => DkimOutput::pass(),
+                                DkimResult::Neutral(error) => DkimOutput::neutral(error),
+                                DkimResult::Fail(error) => DkimOutput::fail(error),
+                                DkimResult::PermError(error) => DkimOutput::perm_err(error),
+                                DkimResult::TempError(error) => DkimOutput::temp_err(error),
+                                DkimResult::None => unreachable!(),
+                            }
+                            .into();
+                        }
+                        "arc.result" => {
+                            arc_result = ArcOutput::default()
+                                .with_result(DkimResult::from_str(value))
+                                .into();
                         }
                         "dkim.domains" => {
-                            variables.insert(
-                                param.to_string(),
-                                value
-                                    .split_ascii_whitespace()
-                                    .map(|s| Variable::from(s.to_string()))
-                                    .collect::<Vec<_>>()
-                                    .into(),
-                            );
+                            dkim_signatures = value
+                                .split_ascii_whitespace()
+                                .map(|s| Signature {
+                                    d: s.to_lowercase(),
+                                    ..Default::default()
+                                })
+                                .collect();
                         }
                         "envelope_from" => {
                             session.data.mail_from = Some(SessionAddress::new(value.to_string()));
@@ -371,50 +386,48 @@ async fn antispam() {
                                 .push(SessionAddress::new(value.to_string()));
                         }
                         "iprev.ptr" => {
-                            variables.insert(param.to_string(), value.to_string().into());
+                            session
+                                .data
+                                .iprev
+                                .get_or_insert(IprevOutput {
+                                    result: IprevResult::None,
+                                    ptr: None,
+                                })
+                                .ptr = Some(Arc::new(vec![value.to_string()]));
                         }
                         "dmarc.result" => {
-                            variables.insert(
-                                param.to_string(),
-                                DmarcResult::from_str(value).as_str().to_string().into(),
-                            );
+                            dmarc_result = DmarcResult::from_str(value).into();
                         }
                         "dmarc.policy" => {
-                            variables.insert(
-                                param.to_string(),
-                                Policy::from_str(value).as_str().to_string().into(),
-                            );
+                            dmarc_policy = Policy::from_str(value).into();
                         }
                         "expect" => {
-                            expected_variables.extend(value.split_ascii_whitespace().map(|v| {
-                                v.split_once('=')
-                                    .map(|(k, v)| {
-                                        (
-                                            k.to_lowercase(),
-                                            if v.contains('.') {
-                                                Variable::Float(v.parse().unwrap())
-                                            } else {
-                                                Variable::Integer(v.parse().unwrap())
-                                            },
-                                        )
-                                    })
-                                    .unwrap_or((v.to_lowercase(), Variable::Integer(1)))
-                            }));
+                            expected_tags
+                                .extend(value.split_ascii_whitespace().map(|v| v.to_uppercase()));
                         }
                         "expect_header" => {
-                            if let Some((header, value)) = value.split_once(' ') {
-                                expected_headers
-                                    .insert(header.to_string(), value.trim().to_string());
-                            } else {
-                                expected_headers.insert(value.to_string(), String::new());
+                            let value = value.trim();
+                            if !value.is_empty() {
+                                if !expect_headers.is_empty() {
+                                    expect_headers.push(' ');
+                                }
+                                expect_headers.push_str(value);
                             }
                         }
-                        "score" | "final_score" => {
-                            variables
-                                .insert(param.to_string(), value.parse::<f64>().unwrap().into());
+                        "score" => {
+                            score_set = value.parse::<f64>().unwrap();
                         }
-                        _ if param.starts_with("param.") | param.starts_with("tls.") => {
-                            variables.insert(param.to_string(), value.to_string().into());
+                        "final_score" => {
+                            score_final = value.parse::<f64>().unwrap();
+                        }
+                        "param.smtputf8" => {
+                            body_params |= MAIL_SMTPUTF8;
+                        }
+                        "param.8bitmime" => {
+                            body_params |= MAIL_BODY_8BITMIME;
+                        }
+                        "tls.version" => {
+                            is_tls = true;
                         }
                         _ => panic!("Invalid parameter {param:?}"),
                     }
@@ -433,299 +446,200 @@ async fn antispam() {
                 panic!("No message found");
             }
 
-            // Build script params
-            let mut expected = expected_variables.keys().collect::<Vec<_>>();
-            expected.sort_unstable_by(|a, b| b.cmp(a));
-            println!("Testing tags {:?}", expected);
-            let mut params = session
-                .build_script_parameters("data")
-                .with_expected_variables(expected_variables)
-                .with_message(Arc::new(message.into_bytes()));
-            for (name, value) in variables {
-                params = params.set_variable(name, value);
+            if body_params != 0 {
+                session
+                    .data
+                    .mail_from
+                    .get_or_insert_with(|| SessionAddress::new("".to_string()))
+                    .flags = body_params;
             }
 
-            // Run script
-            let handle = Handle::current();
-            let span = span.clone();
-            let core_ = core.clone();
-            let script = script.clone();
-            match core
-                .spawn_worker(move || core_.run_script_blocking(script, params, handle, span))
-                .await
-                .unwrap()
-            {
-                ScriptResult::Accept { modifications } => {
-                    if modifications.len() != expected_headers.len() {
-                        panic!(
-                            "Expected {:?} headers, got {:?}",
-                            expected_headers, modifications
-                        );
-                    }
-                    for modification in modifications {
-                        if let ScriptModification::AddHeader { name, value } = modification {
-                            if let Some(expected_value) = expected_headers.remove(name.as_str()) {
-                                if !expected_value.is_empty()
-                                    && !value.starts_with(expected_value.as_str())
-                                {
-                                    panic!(
-                                        "Expected header {:?} to be {:?}, got {:?}",
-                                        name, expected_value, value
-                                    );
+            // Build input
+            let mut dkim_domains = vec![];
+            if let Some(dkim_result) = dkim_result {
+                if dkim_signatures.is_empty() {
+                    dkim_signatures.push(Signature {
+                        d: "unknown.org".to_string(),
+                        ..Default::default()
+                    });
+                }
+
+                for signature in &dkim_signatures {
+                    dkim_domains.push(dkim_result.clone().with_signature(signature));
+                }
+            }
+            let parsed_message = MessageParser::new().parse(&message).unwrap();
+
+            // Combined tests
+            if test_name == "combined" {
+                match session
+                    .spam_classify(
+                        &parsed_message,
+                        &dkim_domains,
+                        arc_result.as_ref(),
+                        dmarc_result.as_ref(),
+                        dmarc_policy.as_ref(),
+                    )
+                    .await
+                {
+                    SpamFilterAction::Allow(header) => {
+                        let mut last_ch = 'x';
+                        let mut result = String::with_capacity(header.len());
+                        for ch in header.chars() {
+                            if !ch.is_whitespace() {
+                                if last_ch.is_whitespace() {
+                                    result.push(' ');
                                 }
-                            } else {
-                                panic!("Unexpected header {:?}", name);
+                                result.push(ch);
                             }
-                        } else {
-                            panic!("Unexpected modification {:?}", modification);
+                            last_ch = ch;
                         }
+                        assert_eq!(result, expect_headers);
+                    }
+                    other => panic!("Unexpected action {other:?}"),
+                }
+                continue;
+            }
+
+            // Initialize filter
+            let mut spam_input = session.build_spam_input(
+                &parsed_message,
+                &dkim_domains,
+                arc_result.as_ref(),
+                dmarc_result.as_ref(),
+                dmarc_policy.as_ref(),
+            );
+            spam_input.is_tls = is_tls;
+            let mut spam_ctx = server.spam_filter_init(spam_input);
+            match test_name {
+                "html" => {
+                    server.spam_filter_analyze_html(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                }
+                "subject" => {
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| t.starts_with("X_HDR_"));
+                    server.spam_filter_analyze_subject(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "received" => {
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| t.starts_with("X_HDR_"));
+                    server.spam_filter_analyze_received(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "messageid" => {
+                    server.spam_filter_analyze_message_id(&mut spam_ctx).await;
+                }
+                "date" => {
+                    server.spam_filter_analyze_date(&mut spam_ctx).await;
+                }
+                "from" => {
+                    server.spam_filter_analyze_from(&mut spam_ctx).await;
+                    server.spam_filter_analyze_domain(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                }
+                "replyto" => {
+                    server.spam_filter_analyze_reply_to(&mut spam_ctx).await;
+                    server.spam_filter_analyze_domain(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                }
+                "recipient" => {
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| t.starts_with("X_HDR_"));
+                    server.spam_filter_analyze_recipient(&mut spam_ctx).await;
+                    server.spam_filter_analyze_domain(&mut spam_ctx).await;
+                    server.spam_filter_analyze_subject(&mut spam_ctx).await;
+                    server.spam_filter_analyze_url(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "mime" => {
+                    server.spam_filter_analyze_mime(&mut spam_ctx).await;
+                }
+                "headers" => {
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "url" => {
+                    server.spam_filter_analyze_url(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                }
+                "dmarc" => {
+                    server.spam_filter_analyze_dmarc(&mut spam_ctx).await;
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "ip" => {
+                    server.spam_filter_analyze_ip(&mut spam_ctx).await;
+                }
+                "helo" => {
+                    server.spam_filter_analyze_ehlo(&mut spam_ctx).await;
+                }
+                "bounce" => {
+                    server.spam_filter_analyze_mime(&mut spam_ctx).await;
+                    server.spam_filter_analyze_headers(&mut spam_ctx).await;
+                    server.spam_filter_analyze_rules(&mut spam_ctx).await;
+                    spam_ctx.result.tags.retain(|t| !t.starts_with("X_HDR_"));
+                }
+                "rbl" => {
+                    server.spam_filter_analyze_url(&mut spam_ctx).await;
+                    server.spam_filter_analyze_ip(&mut spam_ctx).await;
+                    server.spam_filter_analyze_domain(&mut spam_ctx).await;
+                }
+                "replies_out" => {
+                    server.spam_filter_analyze_reply_out(&mut spam_ctx).await;
+                }
+                "replies_in" => {
+                    server.spam_filter_analyze_reply_in(&mut spam_ctx).await;
+                }
+                "spamtrap" => {
+                    server.spam_filter_analyze_spam_trap(&mut spam_ctx).await;
+                    server.spam_filter_finalize(&mut spam_ctx).await;
+                }
+                "bayes_classify" => {
+                    server
+                        .spam_filter_analyze_bayes_classify(&mut spam_ctx)
+                        .await;
+                }
+                "reputation" => {
+                    spam_ctx.result.score = score_set;
+                    server.spam_filter_analyze_reputation(&mut spam_ctx).await;
+                    assert_eq!(spam_ctx.result.score, score_final);
+                }
+                "pyzor" => {
+                    server.spam_filter_analyze_pyzor(&mut spam_ctx).await;
+                }
+                "llm" => {
+                    server.spam_filter_analyze_llm(&mut spam_ctx).await;
+                }
+                _ => panic!("Invalid test {test_name:?}"),
+            }
+
+            // Compare tags
+            if spam_ctx.result.tags != expected_tags {
+                for tag in &spam_ctx.result.tags {
+                    if !expected_tags.contains(tag) {
+                        println!("Unexpected tag: {tag:?}");
                     }
                 }
-                ScriptResult::Reject(message) => panic!("{}", message),
-                ScriptResult::Replace {
-                    message,
-                    modifications,
-                } => println!(
-                    "Replace: {} with modifications {:?}",
-                    String::from_utf8_lossy(&message),
-                    modifications
-                ),
-                ScriptResult::Discard => println!("Discard"),
+
+                for tag in &expected_tags {
+                    if !spam_ctx.result.tags.contains(tag) {
+                        println!("Missing tag: {tag:?}");
+                    }
+                }
+
+                panic!("Tags mismatch, expected {expected_tags:?}");
+            } else {
+                println!("Tags matched: {expected_tags:?}");
             }
         }
     }
-}
-
-#[test]
-fn html_tokens() {
-    for (input, expected) in [
-        (
-            "<html>hello<br/>world<br/></html>",
-            vec![
-                Variable::from("<html".to_string()),
-                Variable::from("_hello".to_string()),
-                Variable::from("<br/".to_string()),
-                Variable::from("_world".to_string()),
-                Variable::from("<br/".to_string()),
-                Variable::from("</html".to_string()),
-            ],
-        ),
-        (
-            "<html>using &lt;><br/></html>",
-            vec![
-                Variable::from("<html".to_string()),
-                Variable::from("_using <>".to_string()),
-                Variable::from("<br/".to_string()),
-                Variable::from("</html".to_string()),
-            ],
-        ),
-        (
-            "test <not br/>tag<br />",
-            vec![
-                Variable::from("_test".to_string()),
-                Variable::from("<not br/".to_string()),
-                Variable::from("_ tag".to_string()),
-                Variable::from("<br /".to_string()),
-            ],
-        ),
-        (
-            "<>< ><tag\n/>>hello    world< br \n />",
-            vec![
-                Variable::from("<".to_string()),
-                Variable::from("<".to_string()),
-                Variable::from("<tag /".to_string()),
-                Variable::from("_>hello world".to_string()),
-                Variable::from("<br /".to_string()),
-            ],
-        ),
-        (
-            concat!(
-                "<head><title>ignore head</title><not head>xyz</not head></head>",
-                "<h1>&lt;body&gt;</h1>"
-            ),
-            vec![
-                Variable::from("<head".to_string()),
-                Variable::from("<title".to_string()),
-                Variable::from("_ignore head".to_string()),
-                Variable::from("</title".to_string()),
-                Variable::from("<not head".to_string()),
-                Variable::from("_xyz".to_string()),
-                Variable::from("</not head".to_string()),
-                Variable::from("</head".to_string()),
-                Variable::from("<h1".to_string()),
-                Variable::from("_<body>".to_string()),
-                Variable::from("</h1".to_string()),
-            ],
-        ),
-        (
-            concat!(
-                "<p>what is &heartsuit;?</p><p>&#x000DF;&Abreve;&#914;&gamma; ",
-                "don&apos;t hurt me.</p>"
-            ),
-            vec![
-                Variable::from("<p".to_string()),
-                Variable::from("_what is ♥?".to_string()),
-                Variable::from("</p".to_string()),
-                Variable::from("<p".to_string()),
-                Variable::from("_ßĂΒγ don't hurt me.".to_string()),
-                Variable::from("</p".to_string()),
-            ],
-        ),
-        (
-            concat!(
-                "<!--[if mso]><style type=\"text/css\">body, table, td, a, p, ",
-                "span, ul, li {font-family: Arial, sans-serif!important;}</style><![endif]-->",
-                "this is <!-- <> < < < < ignore  > -> here -->the actual<!--> text"
-            ),
-            vec![
-                Variable::from(
-                    concat!(
-                        "<!--[if mso]><style type=\"text/css\">body, table, ",
-                        "td, a, p, span, ul, li {font-family: Arial, sans-serif!",
-                        "important;}</style><![endif]--"
-                    )
-                    .to_string(),
-                ),
-                Variable::from("_this is".to_string()),
-                Variable::from("<!-- <> < < < < ignore  > -> here --".to_string()),
-                Variable::from("_ the actual".to_string()),
-                Variable::from("<!--".to_string()),
-                Variable::from("_ text".to_string()),
-            ],
-        ),
-        (
-            "   < p >  hello < / p > < p > world < / p >   !!! < br > ",
-            vec![
-                Variable::from("<p ".to_string()),
-                Variable::from("_hello".to_string()),
-                Variable::from("</p ".to_string()),
-                Variable::from("<p ".to_string()),
-                Variable::from("_ world".to_string()),
-                Variable::from("</p ".to_string()),
-                Variable::from("_ !!!".to_string()),
-                Variable::from("<br ".to_string()),
-            ],
-        ),
-        (
-            " <p>please unsubscribe <a href=#>here</a>.</p> ",
-            vec![
-                Variable::from("<p".to_string()),
-                Variable::from("_please unsubscribe".to_string()),
-                Variable::from("<a href=#".to_string()),
-                Variable::from("_ here".to_string()),
-                Variable::from("</a".to_string()),
-                Variable::from("_.".to_string()),
-                Variable::from("</p".to_string()),
-            ],
-        ),
-    ] {
-        assert_eq!(html_to_tokens(input), expected, "Failed for '{:?}'", input);
-    }
-
-    for (input, expected) in [
-        (
-            concat!(
-                "<a href=\"a\">text</a>",
-                "<a href =\"b\">text</a>",
-                "<a href= \"c\">text</a>",
-                "<a href = \"d\">text</a>",
-                "<  a href = \"e\" >text</a>",
-                "<a hrefer = \"ignore\" >text</a>",
-                "< anchor href = \"x\">text</a>",
-            ),
-            vec![
-                Variable::from("a".to_string()),
-                Variable::from("b".to_string()),
-                Variable::from("c".to_string()),
-                Variable::from("d".to_string()),
-                Variable::from("e".to_string()),
-            ],
-        ),
-        (
-            concat!(
-                "<a href=a>text</a>",
-                "<a href =b>text</a>",
-                "<a href= c>text</a>",
-                "<a href = d>text</a>",
-                "< a href  =  e >text</a>",
-                "<a hrefer = ignore>text</a>",
-                "<anchor href=x>text</a>",
-            ),
-            vec![
-                Variable::from("a".to_string()),
-                Variable::from("b".to_string()),
-                Variable::from("c".to_string()),
-                Variable::from("d".to_string()),
-                Variable::from("e".to_string()),
-            ],
-        ),
-        (
-            concat!(
-                "<!-- <a href=a>text</a>",
-                "<a href =b>text</a>",
-                "<a href= c>--text</a>-->",
-                "<a href = \"hello world\">text</a>",
-                "< a href  =  test ignore>text</a>",
-                "< a href  =  fudge href ignore>text</a>",
-                "<a href=foobar> a href = \"unknown\" </a>",
-            ),
-            vec![
-                Variable::from("hello world".to_string()),
-                Variable::from("test".to_string()),
-                Variable::from("fudge".to_string()),
-                Variable::from("foobar".to_string()),
-            ],
-        ),
-    ] {
-        assert_eq!(
-            html_attr_tokens(input, "a", vec![Cow::from("href")]),
-            expected,
-            "Failed for '{:?}'",
-            input
-        );
-    }
-
-    for (tag, attr_name, expected) in [
-        ("<img width=200 height=400", "width", "200"),
-        ("<img width=200 height=400", "height", "400"),
-        ("<img width = 200 height = 400", "width", "200"),
-        ("<img width = 200 height = 400", "height", "400"),
-        ("<img width =200 height =400", "width", "200"),
-        ("<img width =200 height =400", "height", "400"),
-        ("<img width= 200 height= 400", "width", "200"),
-        ("<img width= 200 height= 400", "height", "400"),
-        ("<img width=\"200\" height=\"400\"", "width", "200"),
-        ("<img width=\"200\" height=\"400\"", "height", "400"),
-        ("<img width = \"200\" height = \"400\"", "width", "200"),
-        ("<img width = \"200\" height = \"400\"", "height", "400"),
-        (
-            "<img width=\" 200 % \" height=\" 400 % \"",
-            "width",
-            " 200 % ",
-        ),
-        (
-            "<img width=\" 200 % \" height=\" 400 % \"",
-            "height",
-            " 400 % ",
-        ),
-    ] {
-        assert_eq!(
-            get_attribute(tag, attr_name).unwrap_or_default(),
-            expected,
-            "failed for {tag:?}, {attr_name:?}"
-        );
-    }
-
-    assert_eq!(
-        html_img_area(&html_to_tokens(concat!(
-            "<img width=200 height=400 />",
-            "20",
-            "30",
-            "<img width=10% height=\" 20% \"/>",
-            "<img width=\"50\" height   =   \"60\">"
-        ))),
-        92600
-    );
 }
 
 trait ParseConfigValue: Sized {
@@ -795,5 +709,467 @@ impl ParseConfigValue for Policy {
             "none" => Policy::None,
             _ => panic!("Invalid DMARC policy"),
         }
+    }
+}
+
+#[test]
+fn html_tokens() {
+    for (input, expected) in [
+        (
+            concat!("<html>hello<br/>world<br/></html>"),
+            vec![
+                HtmlToken::StartTag {
+                    name: 1819112552,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "hello".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+                HtmlToken::Text {
+                    text: "world".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+                HtmlToken::EndTag { name: 1819112552 },
+            ],
+        ),
+        (
+            concat!("<html>using &lt;><br/></html>"),
+            vec![
+                HtmlToken::StartTag {
+                    name: 1819112552,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "using <>".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+                HtmlToken::EndTag { name: 1819112552 },
+            ],
+        ),
+        (
+            concat!("test <not br/>tag<br />"),
+            vec![
+                HtmlToken::Text {
+                    text: "test".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 7630702,
+                    attributes: vec![(29282, None)],
+                    is_self_closing: true,
+                },
+                HtmlToken::Text {
+                    text: " tag".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+            ],
+        ),
+        (
+            concat!("<>< ><tag\n/>>hello    world< br \n />"),
+            vec![
+                HtmlToken::StartTag {
+                    name: 6775156,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+                HtmlToken::Text {
+                    text: ">hello world".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: true,
+                },
+            ],
+        ),
+        (
+            concat!(
+                "<head><title>ignore head</title><not hea",
+                "d>xyz</not head></head><h1>&lt;body&gt;<",
+                "/h1>"
+            ),
+            vec![
+                HtmlToken::StartTag {
+                    name: 1684104552,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::StartTag {
+                    name: 435611265396,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "ignore head".to_string(),
+                },
+                HtmlToken::EndTag { name: 435611265396 },
+                HtmlToken::StartTag {
+                    name: 7630702,
+                    attributes: vec![(1684104552, None)],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "xyz".to_string(),
+                },
+                HtmlToken::EndTag { name: 7630702 },
+                HtmlToken::EndTag { name: 1684104552 },
+                HtmlToken::StartTag {
+                    name: 12648,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "<body>".to_string(),
+                },
+                HtmlToken::EndTag { name: 12648 },
+            ],
+        ),
+        (
+            concat!(
+                "<p>what is &heartsuit;?</p><p>&#x000DF;&",
+                "Abreve;&#914;&gamma; don&apos;t hurt me.",
+                "</p>"
+            ),
+            vec![
+                HtmlToken::StartTag {
+                    name: 112,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "what is ♥?".to_string(),
+                },
+                HtmlToken::EndTag { name: 112 },
+                HtmlToken::StartTag {
+                    name: 112,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "ßĂΒγ don't hurt me.".to_string(),
+                },
+                HtmlToken::EndTag { name: 112 },
+            ],
+        ),
+        (
+            concat!(
+                "<!--[if mso]><style type=\"text/css\">body",
+                ", table, td, a, p, span, ul, li {font-fa",
+                "mily: Arial, sans-serif!important;}</sty",
+                "le><![endif]-->this is <!-- <> < < < < i",
+                "gnore  > -> here -->the actual<!--> text"
+            ),
+            vec![
+                HtmlToken::Comment {
+                    text: concat!(
+                        "!--[if mso]><style type=\"text/css\">body, ",
+                        "table, td, a, p, span, ul, li {font-family: ",
+                        "Arial, sans-serif!important;}</style><![endif]--"
+                    )
+                    .to_string(),
+                },
+                HtmlToken::Text {
+                    text: "this is".to_string(),
+                },
+                HtmlToken::Comment {
+                    text: "!-- <> < < < < ignore  > -> here --".to_string(),
+                },
+                HtmlToken::Text {
+                    text: " the actual".to_string(),
+                },
+                HtmlToken::Comment {
+                    text: "!--".to_string(),
+                },
+                HtmlToken::Text {
+                    text: " text".to_string(),
+                },
+            ],
+        ),
+        (
+            concat!(
+                "   < p >  hello < / p > < p > world < / ",
+                "p >   !!! < br > "
+            ),
+            vec![
+                HtmlToken::StartTag {
+                    name: 112,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "hello".to_string(),
+                },
+                HtmlToken::EndTag { name: 112 },
+                HtmlToken::StartTag {
+                    name: 112,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: " world".to_string(),
+                },
+                HtmlToken::EndTag { name: 112 },
+                HtmlToken::Text {
+                    text: " !!!".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 29282,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+            ],
+        ),
+        (
+            concat!(" <p>please unsubscribe <a href=#>here</a", ">.</p> "),
+            vec![
+                HtmlToken::StartTag {
+                    name: 112,
+                    attributes: vec![],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "please unsubscribe".to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("#".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: " here".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::Text {
+                    text: ".".to_string(),
+                },
+                HtmlToken::EndTag { name: 112 },
+            ],
+        ),
+        (
+            concat!(
+                "<a href=\"a\">text</a><a href =\"b\">text</a",
+                "><a href= \"c\">text</a><a href = \"d\">text",
+                "</a><  a href = \"e\" >text</a><a hrefer =",
+                " \"ignore\" >text</a>< anchor href = \"x\">t",
+                "ext</a>"
+            ),
+            vec![
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("a".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("b".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("c".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("d".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("e".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(125779835187816, Some("ignore".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 125822818283105,
+                    attributes: vec![(1717924456, Some("x".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+            ],
+        ),
+        (
+            concat!(
+                "<a href=a>text</a><a href =b>text</a><a ",
+                "href= c>text</a><a href = d>text</a>< a ",
+                "href  =  e >text</a><a hrefer = ignore>t",
+                "ext</a><anchor href=x>text</a>"
+            ),
+            vec![
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("a".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("b".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("c".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("d".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("e".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(125779835187816, Some("ignore".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 125822818283105,
+                    attributes: vec![(1717924456, Some("x".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+            ],
+        ),
+        (
+            concat!(
+                "<!-- <a href=a>text</a><a href =b>text</",
+                "a><a href= c>--text</a>--><a href = \"hel",
+                "lo world\">text</a>< a href  =  test igno",
+                "re>text</a>< a href  =  fudge href ignor",
+                "e>text</a><a href=foobar> a href = \"unkn",
+                "own\" </a>"
+            ),
+            vec![
+                HtmlToken::Comment {
+                    text: "!-- <a href=a>text</a><a href =b>text</a><a href= c>--text</a>--"
+                        .to_string(),
+                },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("hello world".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![
+                        (1717924456, Some("test".to_string())),
+                        (111542170183529, None),
+                    ],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![
+                        (1717924456, Some("fudge".to_string())),
+                        (1717924456, None),
+                        (111542170183529, None),
+                    ],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "text".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+                HtmlToken::StartTag {
+                    name: 97,
+                    attributes: vec![(1717924456, Some("foobar".to_string()))],
+                    is_self_closing: false,
+                },
+                HtmlToken::Text {
+                    text: "a href = \"unknown\"".to_string(),
+                },
+                HtmlToken::EndTag { name: 97 },
+            ],
+        ),
+    ] {
+        assert_eq!(expected, html_to_tokens(input), "failed for {input:?}");
     }
 }

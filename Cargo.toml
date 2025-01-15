@@ -8,19 +8,22 @@ members = [
     "crates/imap-proto",
     "crates/smtp",
     "crates/managesieve",
+    "crates/pop3",
+    "crates/spam-filter",
     "crates/nlp",
     "crates/store",
     "crates/directory",
     "crates/utils",
+    "crates/common",
+    "crates/trc",
     "crates/cli",
-    "crates/install",
     "tests",
 ]
 
 [profile.dev]
 opt-level = 0
 debug = 1
-codegen-units = 4
+#codegen-units = 4
 lto = false
 incremental = true
 panic = 'unwind'

@@ -1,33 +1,16 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use core::cache::CachedDirectory;
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 
 use ahash::AHashMap;
 use backend::{
     imap::{ImapDirectory, ImapError},
-    internal::PrincipalField,
+    internal::{PrincipalField, PrincipalValue},
     ldap::LdapDirectory,
     memory::MemoryDirectory,
     smtp::SmtpDirectory,
@@ -36,85 +19,269 @@ use backend::{
 use deadpool::managed::PoolError;
 use ldap3::LdapError;
 use mail_send::Credentials;
+use proc_macros::EnumMethods;
 use store::Store;
-use utils::{config::DynValue, listener::blocked::BlockedIps};
+use trc::ipc::bitset::Bitset;
 
 pub mod backend;
 pub mod core;
 
 pub struct Directory {
     pub store: DirectoryInner,
-    pub catch_all: AddressMapping,
-    pub subaddressing: AddressMapping,
     pub cache: Option<CachedDirectory>,
-    pub blocked_ips: Arc<BlockedIps>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Principal<T> {
-    #[serde(default, skip)]
-    pub id: u32,
-    #[serde(rename = "type")]
-    pub typ: Type,
-    #[serde(default)]
-    pub quota: u32,
-    pub name: String,
-    #[serde(default)]
-    pub secrets: Vec<String>,
-    #[serde(default)]
-    pub emails: Vec<String>,
-    #[serde(default)]
-    #[serde(rename = "memberOf")]
-    pub member_of: Vec<T>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Principal {
+    pub(crate) id: u32,
+    pub(crate) typ: Type,
+
+    pub(crate) fields: AHashMap<PrincipalField, PrincipalValue>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Type {
-    #[serde(rename = "individual")]
     #[default]
     Individual = 0,
-    #[serde(rename = "group")]
     Group = 1,
-    #[serde(rename = "resource")]
     Resource = 2,
-    #[serde(rename = "location")]
     Location = 3,
-    #[serde(rename = "superuser")]
-    Superuser = 4,
-    #[serde(rename = "list")]
     List = 5,
-    #[serde(rename = "other")]
     Other = 6,
+    Domain = 7,
+    Tenant = 8,
+    Role = 9,
+    ApiKey = 10,
+    OauthClient = 11,
 }
 
-#[derive(Debug)]
-pub enum DirectoryError {
-    Ldap(LdapError),
-    Store(store::Error),
-    Imap(ImapError),
-    Smtp(mail_send::Error),
-    Pool(String),
-    Management(ManagementError),
-    TimedOut,
-    Unsupported,
+pub const MAX_TYPE_ID: usize = 11;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, EnumMethods,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum Permission {
+    // WARNING: add new ids at the end (TODO: use static ids)
+
+    // Admin
+    Impersonate,
+    UnlimitedRequests,
+    UnlimitedUploads,
+    DeleteSystemFolders,
+    MessageQueueList,
+    MessageQueueGet,
+    MessageQueueUpdate,
+    MessageQueueDelete,
+    OutgoingReportList,
+    OutgoingReportGet,
+    OutgoingReportDelete,
+    IncomingReportList,
+    IncomingReportGet,
+    IncomingReportDelete,
+    SettingsList,
+    SettingsUpdate,
+    SettingsDelete,
+    SettingsReload,
+    IndividualList,
+    IndividualGet,
+    IndividualUpdate,
+    IndividualDelete,
+    IndividualCreate,
+    GroupList,
+    GroupGet,
+    GroupUpdate,
+    GroupDelete,
+    GroupCreate,
+    DomainList,
+    DomainGet,
+    DomainCreate,
+    DomainUpdate,
+    DomainDelete,
+    TenantList,
+    TenantGet,
+    TenantCreate,
+    TenantUpdate,
+    TenantDelete,
+    MailingListList,
+    MailingListGet,
+    MailingListCreate,
+    MailingListUpdate,
+    MailingListDelete,
+    RoleList,
+    RoleGet,
+    RoleCreate,
+    RoleUpdate,
+    RoleDelete,
+    PrincipalList,
+    PrincipalGet,
+    PrincipalCreate,
+    PrincipalUpdate,
+    PrincipalDelete,
+    BlobFetch,
+    PurgeBlobStore,
+    PurgeDataStore,
+    PurgeInMemoryStore,
+    PurgeAccount,
+    FtsReindex,
+    Undelete,
+    DkimSignatureCreate,
+    DkimSignatureGet,
+    SpamFilterUpdate,
+    WebadminUpdate,
+    LogsView,
+    SpamFilterTrain,
+    Restart,
+    TracingList,
+    TracingGet,
+    TracingLive,
+    MetricsList,
+    MetricsLive,
+
+    // Generic
+    Authenticate,
+    AuthenticateOauth,
+    EmailSend,
+    EmailReceive,
+
+    // Account Management
+    ManageEncryption,
+    ManagePasswords,
+
+    // JMAP
+    JmapEmailGet,
+    JmapMailboxGet,
+    JmapThreadGet,
+    JmapIdentityGet,
+    JmapEmailSubmissionGet,
+    JmapPushSubscriptionGet,
+    JmapSieveScriptGet,
+    JmapVacationResponseGet,
+    JmapPrincipalGet,
+    JmapQuotaGet,
+    JmapBlobGet,
+    JmapEmailSet,
+    JmapMailboxSet,
+    JmapIdentitySet,
+    JmapEmailSubmissionSet,
+    JmapPushSubscriptionSet,
+    JmapSieveScriptSet,
+    JmapVacationResponseSet,
+    JmapEmailChanges,
+    JmapMailboxChanges,
+    JmapThreadChanges,
+    JmapIdentityChanges,
+    JmapEmailSubmissionChanges,
+    JmapQuotaChanges,
+    JmapEmailCopy,
+    JmapBlobCopy,
+    JmapEmailImport,
+    JmapEmailParse,
+    JmapEmailQueryChanges,
+    JmapMailboxQueryChanges,
+    JmapEmailSubmissionQueryChanges,
+    JmapSieveScriptQueryChanges,
+    JmapPrincipalQueryChanges,
+    JmapQuotaQueryChanges,
+    JmapEmailQuery,
+    JmapMailboxQuery,
+    JmapEmailSubmissionQuery,
+    JmapSieveScriptQuery,
+    JmapPrincipalQuery,
+    JmapQuotaQuery,
+    JmapSearchSnippet,
+    JmapSieveScriptValidate,
+    JmapBlobLookup,
+    JmapBlobUpload,
+    JmapEcho,
+
+    // IMAP
+    ImapAuthenticate,
+    ImapAclGet,
+    ImapAclSet,
+    ImapMyRights,
+    ImapListRights,
+    ImapAppend,
+    ImapCapability,
+    ImapId,
+    ImapCopy,
+    ImapMove,
+    ImapCreate,
+    ImapDelete,
+    ImapEnable,
+    ImapExpunge,
+    ImapFetch,
+    ImapIdle,
+    ImapList,
+    ImapLsub,
+    ImapNamespace,
+    ImapRename,
+    ImapSearch,
+    ImapSort,
+    ImapSelect,
+    ImapExamine,
+    ImapStatus,
+    ImapStore,
+    ImapSubscribe,
+    ImapThread,
+
+    // POP3
+    Pop3Authenticate,
+    Pop3List,
+    Pop3Uidl,
+    Pop3Stat,
+    Pop3Retr,
+    Pop3Dele,
+
+    // ManageSieve
+    SieveAuthenticate,
+    SieveListScripts,
+    SieveSetActive,
+    SieveGetScript,
+    SievePutScript,
+    SieveDeleteScript,
+    SieveRenameScript,
+    SieveCheckScript,
+    SieveHaveSpace,
+
+    // API keys
+    ApiKeyList,
+    ApiKeyGet,
+    ApiKeyCreate,
+    ApiKeyUpdate,
+    ApiKeyDelete,
+
+    // OAuth clients
+    OauthClientList,
+    OauthClientGet,
+    OauthClientCreate,
+    OauthClientUpdate,
+    OauthClientDelete,
+
+    // OAuth client registration
+    OauthClientRegistration,
+    OauthClientOverride,
+
+    AiModelInteract,
+    Troubleshoot,
+    SpamFilterClassify,
+    // WARNING: add new ids at the end (TODO: use static ids)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum ManagementError {
-    MissingField(PrincipalField),
-    AlreadyExists {
-        field: PrincipalField,
-        value: String,
-    },
-    NotFound(String),
-}
+pub const PERMISSIONS_BITSET_SIZE: usize = Permission::COUNT.div_ceil(std::mem::size_of::<usize>());
+pub type Permissions = Bitset<PERMISSIONS_BITSET_SIZE>;
+
+pub const ROLE_ADMIN: u32 = u32::MAX;
+pub const ROLE_TENANT_ADMIN: u32 = u32::MAX - 1;
+pub const ROLE_USER: u32 = u32::MAX - 2;
 
 pub enum DirectoryInner {
     Internal(Store),
     Ldap(LdapDirectory),
     Sql(SqlDirectory),
+    #[cfg(feature = "enterprise")]
+    OpenId(backend::oidc::OpenIdDirectory),
     Imap(ImapDirectory),
     Smtp(SmtpDirectory),
     Memory(MemoryDirectory),
@@ -126,23 +293,12 @@ pub enum QueryBy<'x> {
     Credentials(&'x Credentials<String>),
 }
 
-pub enum AuthResult<T> {
-    Success(T),
-    Failure,
-    Banned,
-}
-
-impl<T: serde::Serialize + serde::de::DeserializeOwned> Principal<T> {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn has_name(&self) -> bool {
-        !self.name.is_empty()
-    }
-
-    pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+impl Default for Directory {
+    fn default() -> Self {
+        Self {
+            store: DirectoryInner::Internal(Store::None),
+            cache: None,
+        }
     }
 }
 
@@ -152,212 +308,71 @@ impl Debug for Directory {
     }
 }
 
-impl Type {
-    pub fn to_jmap(&self) -> &'static str {
-        match self {
-            Self::Individual | Self::Superuser => "individual",
-            Self::Group => "group",
-            Self::Resource => "resource",
-            Self::Location => "location",
-            Self::Other => "other",
-            Self::List => "list",
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub enum AddressMapping {
-    Enable,
-    Custom {
-        regex: regex::Regex,
-        mapping: DynValue<String>,
-    },
-    #[default]
-    Disable,
-}
-
 #[derive(Default, Clone, Debug)]
 pub struct Directories {
     pub directories: AHashMap<String, Arc<Directory>>,
-    pub lookups: AHashMap<String, Lookup>,
 }
 
-#[derive(Clone, Debug)]
-pub enum Lookup {
-    DomainExists(Arc<Directory>),
-    EmailExists(Arc<Directory>),
+trait IntoError {
+    fn into_error(self) -> trc::Error;
 }
 
-pub type Result<T> = std::result::Result<T, DirectoryError>;
-
-impl From<PoolError<LdapError>> for DirectoryError {
-    fn from(error: PoolError<LdapError>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("ldap"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
-}
-
-impl From<PoolError<ImapError>> for DirectoryError {
-    fn from(error: PoolError<ImapError>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("imap"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
-}
-
-impl From<PoolError<mail_send::Error>> for DirectoryError {
-    fn from(error: PoolError<mail_send::Error>) -> Self {
-        match error {
-            PoolError::Backend(error) => error.into(),
-            PoolError::Timeout(_) => DirectoryError::timeout("smtp"),
-            error => DirectoryError::Pool(error.to_string()),
-        }
-    }
-}
-
-impl From<LdapError> for DirectoryError {
-    fn from(error: LdapError) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "ldap",
-            reason = %error,
-            "LDAP directory error"
-        );
-
-        DirectoryError::Ldap(error)
-    }
-}
-
-impl From<store::Error> for DirectoryError {
-    fn from(error: store::Error) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "store",
-            reason = %error,
-            "Directory error"
-        );
-
-        DirectoryError::Store(error)
-    }
-}
-
-impl From<ImapError> for DirectoryError {
-    fn from(error: ImapError) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "imap",
-            reason = %error,
-            "IMAP directory error"
-        );
-
-        DirectoryError::Imap(error)
-    }
-}
-
-impl From<mail_send::Error> for DirectoryError {
-    fn from(error: mail_send::Error) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = "smtp",
-            reason = %error,
-            "SMTP directory error"
-        );
-
-        DirectoryError::Smtp(error)
-    }
-}
-
-impl DirectoryError {
-    pub fn unsupported(protocol: &str, method: &str) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = protocol,
-            method = method,
-            "Method not supported by directory"
-        );
-        DirectoryError::Unsupported
-    }
-
-    pub fn timeout(protocol: &str) -> Self {
-        tracing::warn!(
-            context = "directory",
-            event = "error",
-            protocol = protocol,
-            "Directory timed out"
-        );
-        DirectoryError::TimedOut
-    }
-}
-
-impl AddressMapping {
-    pub fn to_subaddress<'x, 'y: 'x>(&'x self, address: &'y str) -> Cow<'x, str> {
+impl IntoError for PoolError<LdapError> {
+    fn into_error(self) -> trc::Error {
         match self {
-            AddressMapping::Enable => {
-                if let Some((local_part, domain_part)) = address.rsplit_once('@') {
-                    if let Some((local_part, _)) = local_part.split_once('+') {
-                        return format!("{}@{}", local_part, domain_part).into();
-                    }
-                }
-            }
-            AddressMapping::Custom { regex, mapping } => {
-                let mut regex_capture = Vec::new();
-                for captures in regex.captures_iter(address) {
-                    for capture in captures.iter() {
-                        regex_capture.push(capture.map_or("", |m| m.as_str()).to_string());
-                    }
-                }
-
-                if !regex_capture.is_empty() {
-                    return mapping.apply(regex_capture, &());
-                }
-            }
-            AddressMapping::Disable => (),
-        }
-
-        address.into()
-    }
-
-    pub fn to_catch_all<'x, 'y: 'x>(&'x self, address: &'y str) -> Option<Cow<'x, str>> {
-        match self {
-            AddressMapping::Enable => address
-                .rsplit_once('@')
-                .map(|(_, domain_part)| format!("@{}", domain_part))
-                .map(Cow::Owned),
-            AddressMapping::Custom { regex, mapping } => {
-                let mut regex_capture = Vec::new();
-                for captures in regex.captures_iter(address) {
-                    for capture in captures.iter() {
-                        regex_capture.push(capture.map_or("", |m| m.as_str()).to_string());
-                    }
-                }
-                if !regex_capture.is_empty() {
-                    Some(mapping.apply(regex_capture, &()))
-                } else {
-                    None
-                }
-            }
-            AddressMapping::Disable => None,
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
         }
     }
 }
 
-impl PartialEq for DirectoryError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Store(l0), Self::Store(r0)) => l0 == r0,
-            (Self::Pool(l0), Self::Pool(r0)) => l0 == r0,
-            (Self::Management(l0), Self::Management(r0)) => l0 == r0,
-            _ => false,
+impl IntoError for PoolError<ImapError> {
+    fn into_error(self) -> trc::Error {
+        match self {
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
+        }
+    }
+}
+
+impl IntoError for PoolError<mail_send::Error> {
+    fn into_error(self) -> trc::Error {
+        match self {
+            PoolError::Backend(error) => error.into_error(),
+            PoolError::Timeout(_) => trc::StoreEvent::PoolError
+                .into_err()
+                .details("Connection timed out"),
+            err => trc::StoreEvent::PoolError.reason(err),
+        }
+    }
+}
+
+impl IntoError for ImapError {
+    fn into_error(self) -> trc::Error {
+        trc::ImapEvent::Error.into_err().reason(self)
+    }
+}
+
+impl IntoError for mail_send::Error {
+    fn into_error(self) -> trc::Error {
+        trc::SmtpEvent::Error.into_err().reason(self)
+    }
+}
+
+impl IntoError for LdapError {
+    fn into_error(self) -> trc::Error {
+        if let LdapError::LdapResult { result } = &self {
+            trc::StoreEvent::LdapError
+                .ctx(trc::Key::Code, result.rc)
+                .reason(self)
+        } else {
+            trc::StoreEvent::LdapError.reason(self)
         }
     }
 }

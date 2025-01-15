@@ -1,34 +1,14 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of the Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use std::sync::Arc;
-
-use utils::config::{cron::SimpleCron, Config};
+use utils::config::{cron::SimpleCron, utils::ParseValue, Config};
 
 use crate::{
-    backend::{fs::FsStore, memory::MemoryStore},
-    write::purge::{PurgeSchedule, PurgeStore},
-    LookupStore, QueryStore, Store, Stores,
+    backend::fs::FsStore, BlobStore, CompressionAlgo, InMemoryStore, PurgeSchedule, PurgeStore,
+    Store, Stores,
 };
 
 #[cfg(feature = "s3")]
@@ -55,223 +35,373 @@ use crate::backend::elastic::ElasticSearchStore;
 #[cfg(feature = "redis")]
 use crate::backend::redis::RedisStore;
 
-#[allow(async_fn_in_trait)]
-pub trait ConfigStore {
-    async fn parse_stores(&self) -> utils::config::Result<Stores>;
-    async fn parse_purge_schedules(
-        &self,
-        stores: &Stores,
-        store: Option<&str>,
-        blob_store: Option<&str>,
-    ) -> utils::config::Result<Vec<PurgeSchedule>>;
+#[cfg(feature = "azure")]
+use crate::backend::azure::AzureStore;
+
+#[cfg(feature = "enterprise")]
+enum CompositeStore {
+    #[cfg(any(feature = "postgres", feature = "mysql"))]
+    SQLReadReplica(String),
+    ShardedBlob(String),
+    ShardedInMemory(String),
 }
 
-impl ConfigStore for Config {
-    #[allow(unused_variables)]
-    #[allow(unreachable_code)]
-    async fn parse_stores(&self) -> utils::config::Result<Stores> {
-        let mut config = Stores::default();
+impl Stores {
+    pub async fn parse_all(config: &mut Config, is_reload: bool) -> Self {
+        let mut stores = Self::parse(config).await;
+        stores.parse_in_memory(config, is_reload).await;
+        stores
+    }
 
-        for id in self.sub_keys("store", ".type") {
+    pub async fn parse(config: &mut Config) -> Self {
+        let mut stores = Self::default();
+        stores.parse_stores(config).await;
+        stores
+    }
+
+    pub async fn parse_stores(&mut self, config: &mut Config) {
+        let is_reload = !self.stores.is_empty();
+        #[cfg(feature = "enterprise")]
+        let mut composite_stores = Vec::new();
+        let store_ids = config
+            .sub_keys("store", ".type")
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+
+        for store_id in store_ids {
+            let id = store_id.as_str();
             // Parse store
-            if self.property_or_static::<bool>(("store", id, "disable"), "false")? {
-                tracing::debug!("Skipping disabled store {id:?}.");
-                continue;
+            #[cfg(feature = "test_mode")]
+            {
+                if config
+                    .property_or_default::<bool>(("store", id, "disable"), "false")
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
             }
-            let protocol = self
-                .value_require(("store", id, "type"))?
-                .to_ascii_lowercase();
+            let protocol = if let Some(protocol) = config.value_require(("store", id, "type")) {
+                protocol.to_ascii_lowercase()
+            } else {
+                continue;
+            };
             let prefix = ("store", id);
-            let store_id = id.to_string();
+            let compression_algo = config
+                .property_or_default::<CompressionAlgo>(("store", id, "compression"), "none")
+                .unwrap_or(CompressionAlgo::None);
 
-            let lookup_store: Store = match protocol.as_str() {
+            match protocol.as_str() {
                 #[cfg(feature = "rocks")]
                 "rocksdb" => {
-                    let db: Store = RocksDbStore::open(self, prefix).await?.into();
-                    config.stores.insert(store_id.clone(), db.clone());
-                    config
-                        .fts_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config
-                        .blob_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config.lookup_stores.insert(store_id, db.into());
-                    continue;
+                    // Avoid opening the same store twice
+                    if is_reload
+                        && self
+                            .stores
+                            .values()
+                            .any(|store| matches!(store, Store::RocksDb(_)))
+                    {
+                        continue;
+                    }
+
+                    if let Some(db) = RocksDbStore::open(config, prefix).await.map(Store::from) {
+                        self.stores.insert(store_id.clone(), db.clone());
+                        self.fts_stores.insert(store_id.clone(), db.clone().into());
+                        self.blob_stores.insert(
+                            store_id.clone(),
+                            BlobStore::from(db.clone()).with_compression(compression_algo),
+                        );
+                        self.in_memory_stores.insert(store_id, db.into());
+                    }
                 }
                 #[cfg(feature = "foundation")]
                 "foundationdb" => {
-                    let db: Store = FdbStore::open(self, prefix).await?.into();
-                    config.stores.insert(store_id.clone(), db.clone());
-                    config
-                        .fts_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config
-                        .blob_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config.lookup_stores.insert(store_id, db.into());
-                    continue;
+                    // Avoid opening the same store twice
+                    if is_reload
+                        && self
+                            .stores
+                            .values()
+                            .any(|store| matches!(store, Store::FoundationDb(_)))
+                    {
+                        continue;
+                    }
+
+                    if let Some(db) = FdbStore::open(config, prefix).await.map(Store::from) {
+                        self.stores.insert(store_id.clone(), db.clone());
+                        self.fts_stores.insert(store_id.clone(), db.clone().into());
+                        self.blob_stores.insert(
+                            store_id.clone(),
+                            BlobStore::from(db.clone()).with_compression(compression_algo),
+                        );
+                        self.in_memory_stores.insert(store_id, db.into());
+                    }
                 }
                 #[cfg(feature = "postgres")]
                 "postgresql" => {
-                    let db: Store = PostgresStore::open(self, prefix).await?.into();
-                    config.stores.insert(store_id.clone(), db.clone());
-                    config
-                        .fts_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config
-                        .blob_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    db
+                    if let Some(db) =
+                        PostgresStore::open(config, prefix, config.is_active_store(id))
+                            .await
+                            .map(Store::from)
+                    {
+                        self.stores.insert(store_id.clone(), db.clone());
+                        self.fts_stores.insert(store_id.clone(), db.clone().into());
+                        self.blob_stores.insert(
+                            store_id.clone(),
+                            BlobStore::from(db.clone()).with_compression(compression_algo),
+                        );
+                        self.in_memory_stores.insert(store_id.clone(), db.into());
+                    }
                 }
                 #[cfg(feature = "mysql")]
                 "mysql" => {
-                    let db: Store = MysqlStore::open(self, prefix).await?.into();
-                    config.stores.insert(store_id.clone(), db.clone());
-                    config
-                        .fts_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config
-                        .blob_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    db
+                    if let Some(db) = MysqlStore::open(config, prefix, config.is_active_store(id))
+                        .await
+                        .map(Store::from)
+                    {
+                        self.stores.insert(store_id.clone(), db.clone());
+                        self.fts_stores.insert(store_id.clone(), db.clone().into());
+                        self.blob_stores.insert(
+                            store_id.clone(),
+                            BlobStore::from(db.clone()).with_compression(compression_algo),
+                        );
+                        self.in_memory_stores.insert(store_id.clone(), db.into());
+                    }
                 }
                 #[cfg(feature = "sqlite")]
                 "sqlite" => {
-                    let db: Store = SqliteStore::open(self, prefix).await?.into();
-                    config.stores.insert(store_id.clone(), db.clone());
-                    config
-                        .fts_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    config
-                        .blob_stores
-                        .insert(store_id.clone(), db.clone().into());
-                    db
+                    // Avoid opening the same store twice
+                    if is_reload
+                        && self
+                            .stores
+                            .values()
+                            .any(|store| matches!(store, Store::SQLite(_)))
+                    {
+                        continue;
+                    }
+
+                    if let Some(db) = SqliteStore::open(config, prefix).map(Store::from) {
+                        self.stores.insert(store_id.clone(), db.clone());
+                        self.fts_stores.insert(store_id.clone(), db.clone().into());
+                        self.blob_stores.insert(
+                            store_id.clone(),
+                            BlobStore::from(db.clone()).with_compression(compression_algo),
+                        );
+                        self.in_memory_stores.insert(store_id.clone(), db.into());
+                    }
                 }
                 "fs" => {
-                    config
-                        .blob_stores
-                        .insert(store_id, FsStore::open(self, prefix).await?.into());
-                    continue;
+                    if let Some(db) = FsStore::open(config, prefix).await.map(BlobStore::from) {
+                        self.blob_stores
+                            .insert(store_id, db.with_compression(compression_algo));
+                    }
                 }
                 #[cfg(feature = "s3")]
                 "s3" => {
-                    config
-                        .blob_stores
-                        .insert(store_id, S3Store::open(self, prefix).await?.into());
-                    continue;
+                    if let Some(db) = S3Store::open(config, prefix).await.map(BlobStore::from) {
+                        self.blob_stores
+                            .insert(store_id, db.with_compression(compression_algo));
+                    }
                 }
                 #[cfg(feature = "elastic")]
                 "elasticsearch" => {
-                    config.fts_stores.insert(
-                        store_id,
-                        ElasticSearchStore::open(self, prefix).await?.into(),
-                    );
-                    continue;
+                    if let Some(db) = ElasticSearchStore::open(config, prefix)
+                        .await
+                        .map(crate::FtsStore::from)
+                    {
+                        self.fts_stores.insert(store_id, db);
+                    }
                 }
                 #[cfg(feature = "redis")]
                 "redis" => {
-                    config
-                        .lookup_stores
-                        .insert(store_id, RedisStore::open(self, prefix).await?.into());
-                    continue;
+                    if let Some(db) = RedisStore::open(config, prefix)
+                        .await
+                        .map(InMemoryStore::from)
+                    {
+                        self.in_memory_stores.insert(store_id, db);
+                    }
                 }
-                "memory" => {
-                    config
-                        .lookup_stores
-                        .insert(store_id, MemoryStore::open(self, prefix).await?.into());
-                    continue;
+                #[cfg(feature = "enterprise")]
+                "sql-read-replica" => {
+                    #[cfg(any(feature = "postgres", feature = "mysql"))]
+                    composite_stores.push(CompositeStore::SQLReadReplica(store_id));
                 }
-
+                #[cfg(feature = "enterprise")]
+                "distributed-blob" | "sharded-blob" => {
+                    composite_stores.push(CompositeStore::ShardedBlob(store_id));
+                }
+                #[cfg(feature = "enterprise")]
+                "sharded-in-memory" => {
+                    composite_stores.push(CompositeStore::ShardedInMemory(store_id));
+                }
+                #[cfg(feature = "azure")]
+                "azure" => {
+                    if let Some(db) = AzureStore::open(config, prefix).await.map(BlobStore::from) {
+                        self.blob_stores
+                            .insert(store_id, db.with_compression(compression_algo));
+                    }
+                }
                 unknown => {
-                    tracing::debug!("Unknown directory type: {unknown:?}");
-                    continue;
-                }
-            };
-
-            // Add queries as lookup stores
-            let lookup_store: LookupStore = lookup_store.into();
-            for lookup_id in self.sub_keys(("store", id, "query"), "") {
-                config.lookup_stores.insert(
-                    format!("{store_id}/{lookup_id}"),
-                    LookupStore::Query(Arc::new(QueryStore {
-                        store: lookup_store.clone(),
-                        query: self.property_require(("store", id, "query", lookup_id))?,
-                    })),
-                );
-            }
-            config.lookup_stores.insert(store_id, lookup_store.clone());
-
-            // Run init queries on database
-            for (_, query) in self.values(("store", id, "init.execute")) {
-                if let Err(err) = lookup_store.query::<usize>(query, Vec::new()).await {
-                    tracing::warn!("Failed to initialize store {id:?}: {err}");
+                    config.new_parse_warning(
+                        ("store", id, "type"),
+                        format!("Unknown directory type: {unknown:?}"),
+                    );
                 }
             }
         }
 
-        Ok(config)
+        #[cfg(feature = "enterprise")]
+        for composite_store in composite_stores {
+            match composite_store {
+                #[cfg(any(feature = "postgres", feature = "mysql"))]
+                CompositeStore::SQLReadReplica(id) => {
+                    let prefix = ("store", id.as_str());
+                    if let Some(db) = crate::backend::composite::read_replica::SQLReadReplica::open(
+                        config,
+                        prefix,
+                        self,
+                        config.is_active_store(&id),
+                    )
+                    .await
+                    {
+                        let db = Store::SQLReadReplica(db.into());
+                        self.stores.insert(id.to_string(), db.clone());
+                        self.fts_stores.insert(id.to_string(), db.clone().into());
+                        self.blob_stores.insert(
+                            id.to_string(),
+                            BlobStore::from(db.clone()).with_compression(
+                                config
+                                    .property_or_default::<CompressionAlgo>(
+                                        ("store", id.as_str(), "compression"),
+                                        "none",
+                                    )
+                                    .unwrap_or(CompressionAlgo::None),
+                            ),
+                        );
+                        self.in_memory_stores.insert(id, db.into());
+                    }
+                }
+                CompositeStore::ShardedBlob(id) => {
+                    let prefix = ("store", id.as_str());
+                    if let Some(db) = crate::backend::composite::sharded_blob::ShardedBlob::open(
+                        config, prefix, self,
+                    ) {
+                        let store = BlobStore {
+                            backend: crate::BlobBackend::Sharded(db.into()),
+                            compression: config
+                                .property_or_default::<CompressionAlgo>(
+                                    ("store", id.as_str(), "compression"),
+                                    "none",
+                                )
+                                .unwrap_or(CompressionAlgo::None),
+                        };
+                        self.blob_stores.insert(id, store);
+                    }
+                }
+                CompositeStore::ShardedInMemory(id) => {
+                    let prefix = ("store", id.as_str());
+                    if let Some(db) =
+                        crate::backend::composite::sharded_lookup::ShardedInMemory::open(
+                            config, prefix, self,
+                        )
+                    {
+                        self.in_memory_stores
+                            .insert(id, InMemoryStore::Sharded(db.into()));
+                    }
+                }
+            }
+        }
     }
 
-    async fn parse_purge_schedules(
-        &self,
-        stores: &Stores,
-        store_id: Option<&str>,
-        blob_store_id: Option<&str>,
-    ) -> utils::config::Result<Vec<PurgeSchedule>> {
-        let mut schedules = Vec::new();
+    pub async fn parse_in_memory(&mut self, config: &mut Config, is_reload: bool) {
+        // Parse memory stores
+        self.parse_static_stores(config, is_reload);
 
-        if let Some(store) = store_id.and_then(|store_id| stores.stores.get(store_id)) {
-            let store_id = store_id.unwrap();
-            if let Some(cron) =
-                self.property::<SimpleCron>(("store", store_id, "purge.frequency"))?
+        // Parse http stores
+        self.parse_http_stores(config, is_reload);
+
+        // Parse purge schedules
+        if let Some(store) = config
+            .value("storage.data")
+            .and_then(|store_id| self.stores.get(store_id))
+        {
+            let store_id = config.value("storage.data").unwrap().to_string();
+            self.purge_schedules.push(PurgeSchedule {
+                cron: config
+                    .property_or_default::<SimpleCron>(
+                        ("store", store_id.as_str(), "purge.frequency"),
+                        "0 3 *",
+                    )
+                    .unwrap_or_else(|| SimpleCron::parse_value("0 3 *").unwrap()),
+                store_id,
+                store: PurgeStore::Data(store.clone()),
+            });
+
+            if let Some(blob_store) = config
+                .value("storage.blob")
+                .and_then(|blob_store_id| self.blob_stores.get(blob_store_id))
             {
-                schedules.push(PurgeSchedule {
-                    cron,
-                    store_id: store_id.to_string(),
-                    store: PurgeStore::Bitmaps(store.clone()),
+                let store_id = config.value("storage.blob").unwrap().to_string();
+                self.purge_schedules.push(PurgeSchedule {
+                    cron: config
+                        .property_or_default::<SimpleCron>(
+                            ("store", store_id.as_str(), "purge.frequency"),
+                            "0 4 *",
+                        )
+                        .unwrap_or_else(|| SimpleCron::parse_value("0 4 *").unwrap()),
+                    store_id,
+                    store: PurgeStore::Blobs {
+                        store: store.clone(),
+                        blob_store: blob_store.clone(),
+                    },
                 });
             }
-
-            if let Some(blob_store) =
-                blob_store_id.and_then(|blob_store_id| stores.blob_stores.get(blob_store_id))
-            {
-                let blob_store_id = blob_store_id.unwrap();
-                if let Some(cron) =
-                    self.property::<SimpleCron>(("store", blob_store_id, "purge.frequency"))?
-                {
-                    schedules.push(PurgeSchedule {
-                        cron,
-                        store_id: blob_store_id.to_string(),
-                        store: PurgeStore::Blobs {
-                            store: store.clone(),
-                            blob_store: blob_store.clone(),
-                        },
-                    });
-                }
-            }
         }
-
-        for (store_id, store) in &stores.lookup_stores {
-            if let Some(cron) =
-                self.property::<SimpleCron>(("store", store_id.as_str(), "purge.frequency"))?
+        for (store_id, store) in &self.in_memory_stores {
+            if matches!(store, InMemoryStore::Store(_))
+                && config.is_active_in_memory_store(store_id)
             {
-                schedules.push(PurgeSchedule {
-                    cron,
+                self.purge_schedules.push(PurgeSchedule {
+                    cron: config
+                        .property_or_default::<SimpleCron>(
+                            ("store", store_id.as_str(), "purge.frequency"),
+                            "0 5 *",
+                        )
+                        .unwrap_or_else(|| SimpleCron::parse_value("0 5 *").unwrap()),
                     store_id: store_id.clone(),
                     store: PurgeStore::Lookup(store.clone()),
                 });
             }
         }
-
-        Ok(schedules)
     }
 }
 
-impl From<crate::Error> for String {
-    fn from(err: crate::Error) -> Self {
-        match err {
-            crate::Error::InternalError(err) => err,
-            crate::Error::AssertValueFailed => unimplemented!(),
+#[allow(dead_code)]
+trait IsActiveStore {
+    fn is_active_store(&self, id: &str) -> bool;
+    fn is_active_in_memory_store(&self, id: &str) -> bool;
+}
+
+impl IsActiveStore for Config {
+    fn is_active_store(&self, id: &str) -> bool {
+        for key in [
+            "storage.data",
+            "storage.blob",
+            "storage.lookup",
+            "storage.fts",
+            "tracing.history.store",
+            "metrics.history.store",
+        ] {
+            if let Some(store_id) = self.value(key) {
+                if store_id == id {
+                    return true;
+                }
+            }
         }
+
+        false
+    }
+
+    fn is_active_in_memory_store(&self, id: &str) -> bool {
+        self.value("storage.lookup")
+            .is_some_and(|store_id| store_id == id)
     }
 }

@@ -1,40 +1,36 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
-use directory::core::config::ConfigDirectory;
-use store::{Store, Stores};
-use utils::config::{Config, Servers};
+use common::Core;
 
-use crate::smtp::{
-    session::{TestSession, VerifyResponse},
-    ParseTestConfig, TestConfig,
-};
-use smtp::{
-    config::{ConfigContext, IfBlock, MaybeDynValue},
-    core::{Session, SMTP},
+use store::Stores;
+use utils::config::Config;
+
+use smtp::core::Session;
+
+use crate::{
+    smtp::{
+        session::{TestSession, VerifyResponse},
+        TempDir, TestSMTP,
+    },
+    AssertConfig,
 };
 
-const DIRECTORY: &str = r#"
+const CONFIG: &str = r#"
+[storage]
+data = "rocksdb"
+lookup = "rocksdb"
+blob = "rocksdb"
+fts = "rocksdb"
+directory = "local"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "{TMP}/data.db"
+
 [directory."local"]
 type = "memory"
 
@@ -59,34 +55,31 @@ secret = "p4ssw0rd"
 email = "bill@foobar.org"
 email-list = ["sales@foobar.org"]
 
+[session.rcpt]
+directory = "'local'"
+
+[session.extensions]
+vrfy = [{if = "remote_ip = '10.0.0.1'", then = true},
+        {else = false}]
+expn = [{if = "remote_ip = '10.0.0.1'", then = true},
+        {else = false}]
+
 "#;
 
 #[tokio::test]
 async fn vrfy_expn() {
-    let mut core = SMTP::test();
-    let ctx = ConfigContext::new(&[]);
+    // Enable logging
+    crate::enable_logging();
 
-    let directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    let config = &mut core.session.config.rcpt;
-    config.directory = IfBlock::new(Some(MaybeDynValue::Static(
-        directory.directories.get("local").unwrap().clone(),
-    )));
+    let tmp_dir = TempDir::new("smtp_vrfy_test", true);
+    let mut config = Config::new(tmp_dir.update_config(CONFIG)).unwrap();
+    let stores = Stores::parse_all(&mut config, false).await;
+    let core = Core::parse(&mut config, stores, Default::default()).await;
+    config.assert_no_errors();
 
-    let config = &mut core.session.config.extensions;
-    config.vrfy = r"[{if = 'remote-ip', eq = '10.0.0.1', then = true},
-    {else = false}]"
-        .parse_if(&ctx);
-    config.expn = r"[{if = 'remote-ip', eq = '10.0.0.1', then = true},
-    {else = false}]"
-        .parse_if(&ctx);
-
-    // EHLO should not avertise VRFY/EXPN to 10.0.0.2
-    let mut session = Session::test(core);
-    session.data.remote_ip = "10.0.0.2".parse().unwrap();
+    // EHLO should not advertise VRFY/EXPN to 10.0.0.2
+    let mut session = Session::test(TestSMTP::from_core(core).server);
+    session.data.remote_ip_str = "10.0.0.2".to_string();
     session.eval_session_params().await;
     session
         .ehlo("mx.foobar.org")
@@ -97,7 +90,7 @@ async fn vrfy_expn() {
     session.cmd("EXPN sales@foobar.org", "252 2.5.1").await;
 
     // EHLO should advertise VRFY/EXPN for 10.0.0.1
-    session.data.remote_ip = "10.0.0.1".parse().unwrap();
+    session.data.remote_ip_str = "10.0.0.1".to_string();
     session.eval_session_params().await;
     session
         .ehlo("mx.foobar.org")

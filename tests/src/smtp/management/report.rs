@@ -1,30 +1,18 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::sync::Arc;
 
 use ahash::{AHashMap, HashSet};
-use directory::core::config::ConfigDirectory;
+use common::{
+    config::{server::ServerProtocol, smtp::report::AggregateFrequency},
+    ipc::{DmarcEvent, PolicyType, TlsEvent},
+};
+
+use jmap::api::management::queue::Report;
 use mail_auth::{
     common::parse::TxtRecordParser,
     dmarc::Dmarc,
@@ -34,23 +22,18 @@ use mail_auth::{
         ActionDisposition, DmarcResult, Record,
     },
 };
-use store::{Store, Stores};
-use tokio::sync::mpsc;
-use utils::config::{Config, ServerProtocol, Servers};
+use reqwest::Method;
 
-use crate::smtp::{
-    make_temp_dir, management::send_manage_request, outbound::start_test_server, TestConfig,
+use crate::{
+    jmap::ManagementApi,
+    smtp::{management::queue::List, TestSMTP},
 };
-use smtp::{
-    config::{AggregateFrequency, IfBlock},
-    core::{management::Report, SMTP},
-    reporting::{
-        scheduler::{Scheduler, SpawnReport},
-        DmarcEvent, TlsEvent,
-    },
-};
+use smtp::reporting::{scheduler::SpawnReport, SmtpReporting};
 
-const DIRECTORY: &str = r#"
+const CONFIG: &str = r#"
+[storage]
+directory = "local"
+
 [directory."local"]
 type = "memory"
 
@@ -59,39 +42,32 @@ name = "admin"
 type = "admin"
 description = "Superuser"
 secret = "secret"
-member-of = ["superusers"]
+class = "admin"
 
+[session.rcpt]
+relay = true
+
+[report.dmarc.aggregate]
+max-size = 1024
+
+[report.tls.aggregate]
+max-size = 1024
 "#;
 
 #[tokio::test]
 #[serial_test::serial]
 async fn manage_reports() {
-    /*tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
-            .finish(),
-    )
-    .unwrap();*/
+    // Enable logging
+    crate::enable_logging();
 
     // Start reporting service
-    let mut core = SMTP::test();
-    let temp_dir = make_temp_dir("smtp_report_management_test", true);
-    let config = &mut core.report.config;
-    config.path = IfBlock::new(temp_dir.temp_dir.clone());
-    config.hash = IfBlock::new(16);
-    config.dmarc_aggregate.max_size = IfBlock::new(1024);
-    config.tls.max_size = IfBlock::new(1024);
-    let directory = Config::new(DIRECTORY)
-        .unwrap()
-        .parse_directory(&Stores::default(), &Servers::default(), Store::default())
-        .await
-        .unwrap();
-    core.queue.config.directory = directory.directories.get("local").unwrap().clone();
-    let (report_tx, report_rx) = mpsc::channel(1024);
-    core.report.tx = report_tx;
-    let core = Arc::new(core);
-    report_rx.spawn(core.clone(), Scheduler::default());
-    let _rx_manage = start_test_server(core.clone(), &[ServerProtocol::Http]);
+    let local = TestSMTP::new("smtp_manage_reports", CONFIG).await;
+    let _rx = local.start(&[ServerProtocol::Http]).await;
+    let core = local.build_smtp();
+    local
+        .report_receiver
+        .report_rx
+        .spawn(local.server.inner.clone());
 
     // Send test reporting events
     core.schedule_report(DmarcEvent {
@@ -128,7 +104,7 @@ async fn manage_reports() {
     .await;
     core.schedule_report(TlsEvent {
         domain: "foobar.org".to_string(),
-        policy: smtp::reporting::PolicyType::None,
+        policy: PolicyType::None,
         failure: None,
         tls_record: Arc::new(TlsRpt::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.org").unwrap()),
         interval: AggregateFrequency::Daily,
@@ -136,7 +112,7 @@ async fn manage_reports() {
     .await;
     core.schedule_report(TlsEvent {
         domain: "foobar.net".to_string(),
-        policy: smtp::reporting::PolicyType::Sts(None),
+        policy: PolicyType::Sts(None),
         failure: FailureDetails::new(ResultType::StsPolicyInvalid).into(),
         tls_record: Arc::new(TlsRpt::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.net").unwrap()),
         interval: AggregateFrequency::Weekly,
@@ -144,26 +120,43 @@ async fn manage_reports() {
     .await;
 
     // List reports
-    let ids = send_manage_request::<Vec<String>>("/admin/report/list")
+    let api = ManagementApi::default();
+    let ids = api
+        .request::<List<String>>(Method::GET, "/api/queue/reports")
         .await
         .unwrap()
-        .unwrap_data();
+        .unwrap_data()
+        .items;
     assert_eq!(ids.len(), 4);
     let mut id_map = AHashMap::new();
     let mut id_map_rev = AHashMap::new();
-    for (report, id) in get_reports(&ids).await.into_iter().zip(ids) {
+    for (report, id) in api.get_reports(&ids).await.into_iter().zip(ids) {
         let mut parts = id.split('!');
         let report = report.unwrap();
         let mut id_num = if parts.next().unwrap() == "t" {
-            assert_eq!(report.type_, "tls");
+            assert!(matches!(report, Report::Tls { .. }));
             2
         } else {
-            assert_eq!(report.type_, "dmarc");
+            assert!(matches!(report, Report::Dmarc { .. }));
             0
         };
-        assert_eq!(parts.next().unwrap(), report.domain);
-        let diff = report.range_to.to_timestamp() - report.range_from.to_timestamp();
-        if report.domain == "foobar.org" {
+        let (domain, range_to, range_from) = match report {
+            Report::Dmarc {
+                domain,
+                range_to,
+                range_from,
+                ..
+            } => (domain, range_to, range_from),
+            Report::Tls {
+                domain,
+                range_to,
+                range_from,
+                ..
+            } => (domain, range_to, range_from),
+        };
+        assert_eq!(parts.next().unwrap(), domain);
+        let diff = range_to.to_timestamp() - range_from.to_timestamp();
+        if domain == "foobar.org" {
             assert_eq!(diff, 86400);
         } else {
             assert_eq!(diff, 7 * 86400);
@@ -175,18 +168,20 @@ async fn manage_reports() {
 
     // Test list search
     for (query, expected_ids) in [
-        ("/admin/report/list?type=dmarc", vec!["a", "b"]),
-        ("/admin/report/list?type=tls", vec!["c", "d"]),
-        ("/admin/report/list?domain=foobar.org", vec!["a", "c"]),
-        ("/admin/report/list?domain=foobar.net", vec!["b", "d"]),
-        ("/admin/report/list?domain=foobar.org&type=dmarc", vec!["a"]),
-        ("/admin/report/list?domain=foobar.net&type=tls", vec!["d"]),
+        ("/api/queue/reports?type=dmarc", vec!["a", "b"]),
+        ("/api/queue/reports?type=tls", vec!["c", "d"]),
+        ("/api/queue/reports?domain=foobar.org", vec!["a", "c"]),
+        ("/api/queue/reports?domain=foobar.net", vec!["b", "d"]),
+        ("/api/queue/reports?domain=foobar.org&type=dmarc", vec!["a"]),
+        ("/api/queue/reports?domain=foobar.net&type=tls", vec!["d"]),
     ] {
         let expected_ids = HashSet::from_iter(expected_ids.into_iter().map(|s| s.to_string()));
-        let ids = send_manage_request::<Vec<String>>(query)
+        let ids = api
+            .request::<List<String>>(Method::GET, query)
             .await
             .unwrap()
             .unwrap_data()
+            .items
             .into_iter()
             .map(|id| id_map_rev.get(&id).unwrap().clone())
             .collect::<HashSet<_>>();
@@ -195,43 +190,70 @@ async fn manage_reports() {
 
     // Cancel reports
     for id in ["a", "b"] {
-        assert_eq!(
-            send_manage_request::<Vec<bool>>(&format!(
-                "/admin/report/cancel?id={}",
-                id_map.get(id).unwrap(),
-            ))
+        assert!(
+            api.request::<bool>(
+                Method::DELETE,
+                &format!("/api/queue/reports/{}", id_map.get(id).unwrap(),)
+            )
             .await
             .unwrap()
             .unwrap_data(),
-            vec![true],
             "failed for {id}"
         );
     }
     assert_eq!(
-        send_manage_request::<Vec<String>>("/admin/report/list")
+        api.request::<List<String>>(Method::GET, "/api/queue/reports")
             .await
             .unwrap()
             .unwrap_data()
+            .items
             .len(),
         2
     );
-    let mut ids = get_reports(&[
-        id_map.get("a").unwrap().clone(),
-        id_map.get("b").unwrap().clone(),
-        id_map.get("c").unwrap().clone(),
-        id_map.get("d").unwrap().clone(),
-    ])
-    .await
-    .into_iter();
+    let mut ids = api
+        .get_reports(&[
+            id_map.get("a").unwrap().clone(),
+            id_map.get("b").unwrap().clone(),
+            id_map.get("c").unwrap().clone(),
+            id_map.get("d").unwrap().clone(),
+        ])
+        .await
+        .into_iter();
     assert!(ids.next().unwrap().is_none());
     assert!(ids.next().unwrap().is_none());
     assert!(ids.next().unwrap().is_some());
     assert!(ids.next().unwrap().is_some());
-}
 
-async fn get_reports(ids: &[String]) -> Vec<Option<Report>> {
-    send_manage_request(&format!("/admin/report/status?id={}", ids.join(",")))
+    // Cancel all reports
+    assert!(api
+        .request::<bool>(Method::DELETE, "/api/queue/reports")
         .await
         .unwrap()
-        .unwrap_data()
+        .unwrap_data());
+    assert_eq!(
+        api.request::<List<String>>(Method::GET, "/api/queue/reports")
+            .await
+            .unwrap()
+            .unwrap_data()
+            .items
+            .len(),
+        0
+    );
+}
+
+impl ManagementApi {
+    async fn get_reports(&self, ids: &[String]) -> Vec<Option<Report>> {
+        let mut results = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let report = self
+                .request::<Report>(Method::GET, &format!("/api/queue/reports/{id}",))
+                .await
+                .unwrap()
+                .try_unwrap_data();
+            results.push(report);
+        }
+
+        results
+    }
 }

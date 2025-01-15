@@ -1,30 +1,15 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::Duration;
 
-use directory::backend::internal::manage::ManageDirectory;
-use jmap::mailbox::{INBOX_ID, JUNK_ID};
+use jmap::{
+    mailbox::{INBOX_ID, JUNK_ID},
+    JmapMethods,
+};
 use jmap_proto::types::{collection::Collection, id::Id, property::Property};
 
 use tokio::{
@@ -32,7 +17,10 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::jmap::{assert_is_empty, mailbox::destroy_all_mailboxes};
+use crate::{
+    directory::internal::TestInternalDirectory,
+    jmap::{assert_is_empty, mailbox::destroy_all_mailboxes},
+};
 
 use super::JMAPTest;
 
@@ -41,63 +29,59 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Create a domain name and a test account
     let server = params.server.clone();
-    params
-        .directory
-        .create_test_user_with_email("jdoe@example.com", "12345", "John Doe")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("jane@example.com", "abcdef", "Jane Smith")
-        .await;
-    params
-        .directory
-        .create_test_user_with_email("bill@example.com", "098765", "Bill Foobar")
-        .await;
-    let account_id_1 = Id::from(
-        server
-            .store
-            .get_or_create_account_id("jdoe@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    let account_id_2 = Id::from(
-        server
-            .store
-            .get_or_create_account_id("jane@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    let account_id_3 = Id::from(
-        server
-            .store
-            .get_or_create_account_id("bill@example.com")
-            .await
-            .unwrap(),
-    )
-    .to_string();
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "john.doe@example.com", "alias")
-        .await;
+    let mut account_id_1 = String::new();
+    let mut account_id_2 = String::new();
+    let mut account_id_3 = String::new();
+
+    for (id, email, password, name, aliases) in [
+        (
+            &mut account_id_1,
+            "jdoe@example.com",
+            "12345",
+            "John Doe",
+            Some(&["jdoe@example.com", "john.doe@example.com"][..]),
+        ),
+        (
+            &mut account_id_2,
+            "jane@example.com",
+            "abcdef",
+            "Jane Smith",
+            None,
+        ),
+        (
+            &mut account_id_3,
+            "bill@example.com",
+            "098765",
+            "Bill Foobar",
+            None,
+        ),
+    ] {
+        *id = Id::from(
+            server
+                .core
+                .storage
+                .data
+                .create_test_user(email, password, name, aliases.unwrap_or(&[email][..]))
+                .await,
+        )
+        .to_string();
+    }
 
     // Create a mailing list
-    params
-        .directory
-        .link_test_address("jdoe@example.com", "members@example.com", "list")
-        .await;
-    params
-        .directory
-        .link_test_address("jane@example.com", "members@example.com", "list")
-        .await;
-    params
-        .directory
-        .link_test_address("bill@example.com", "members@example.com", "list")
+    server
+        .core
+        .storage
+        .data
+        .create_test_list(
+            "members@example.com",
+            "Mailing List",
+            &["jdoe@example.com", "jane@example.com", "bill@example.com"],
+        )
         .await;
 
     // Delivering to individuals
     let mut lmtp = SmtpConnection::connect().await;
+    params.webhook.clear();
 
     lmtp.ingest(
         "bill@example.com",
@@ -235,8 +219,11 @@ pub async fn test(params: &mut JMAPTest) {
 
     // Removing members from the mailing list and chunked ingest
     params
-        .directory
-        .remove_test_alias("jdoe@example.com", "members@example.com")
+        .server
+        .core
+        .storage
+        .data
+        .remove_from_group("jdoe@example.com", "members@example.com")
         .await;
     lmtp.ingest_chunked(
         "bill@example.com",
@@ -314,6 +301,14 @@ pub async fn test(params: &mut JMAPTest) {
         destroy_all_mailboxes(params).await;
     }
     assert_is_empty(server).await;
+
+    // Check webhook events
+    params.webhook.assert_contains(&[
+        "message-ingest.",
+        "delivery.dsn",
+        "\"from\": \"bill@example.com\"",
+        "\"john.doe@example.com\"",
+    ]);
 }
 
 pub struct SmtpConnection {
@@ -487,6 +482,7 @@ impl SmtpConnection {
         //let c = println!("-> {:?}", text);
         self.writer.write_all(text.as_bytes()).await.unwrap();
         self.writer.write_all(b"\r\n").await.unwrap();
+        self.writer.flush().await.unwrap();
     }
 
     pub async fn send_raw(&mut self, text: &str) {
@@ -497,7 +493,7 @@ impl SmtpConnection {
 
 pub trait AssertResult: Sized {
     fn assert_contains(self, text: &str) -> Self;
-    fn assert_count(self, text: &str, occurences: usize) -> Self;
+    fn assert_count(self, text: &str, occurrences: usize) -> Self;
     fn assert_equals(self, text: &str) -> Self;
 }
 
@@ -511,12 +507,12 @@ impl AssertResult for Vec<String> {
         panic!("Expected response to contain {:?}, got {:?}", text, self);
     }
 
-    fn assert_count(self, text: &str, occurences: usize) -> Self {
+    fn assert_count(self, text: &str, occurrences: usize) -> Self {
         assert_eq!(
             self.iter().filter(|l| l.contains(text)).count(),
-            occurences,
+            occurrences,
             "Expected {} occurrences of {:?}, found {}.",
-            occurences,
+            occurrences,
             text,
             self.iter().filter(|l| l.contains(text)).count()
         );

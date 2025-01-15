@@ -1,31 +1,15 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{
+    auth::{AccessToken, ResourceToken},
+    Server,
+};
 use jmap_proto::{
-    error::{
-        method::MethodError,
-        set::{SetError, SetErrorType},
-    },
+    error::set::{SetError, SetErrorType},
     method::set::{SetRequest, SetResponse},
     object::{
         index::{IndexAs, IndexProperty, ObjectIndexBuilder},
@@ -53,11 +37,16 @@ use store::{
     BlobClass,
 };
 
-use crate::{auth::AccessToken, JMAP};
+use crate::{
+    api::http::HttpSessionData,
+    blob::{download::BlobDownload, upload::BlobUpload},
+    changes::write::ChangeLog,
+    JmapMethods,
+};
+use std::future::Future;
 
-struct SetContext<'x> {
-    account_id: u32,
-    account_quota: i64,
+pub struct SetContext<'x> {
+    resource_token: ResourceToken,
     access_token: &'x AccessToken,
     response: SetResponse,
 }
@@ -73,20 +62,51 @@ pub static SCHEMA: &[IndexProperty] = &[
     IndexProperty::new(Property::IsActive).index_as(IndexAs::Integer),
 ];
 
-impl JMAP {
-    pub async fn sieve_script_set(
+pub trait SieveScriptSet: Sync + Send {
+    fn sieve_script_set(
+        &self,
+        request: SetRequest<SetArguments>,
+        access_token: &AccessToken,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<SetResponse>> + Send;
+
+    fn sieve_script_delete(
+        &self,
+        resource_token: &ResourceToken,
+        document_id: u32,
+        fail_if_active: bool,
+    ) -> impl Future<Output = trc::Result<bool>> + Send;
+
+    #[allow(clippy::type_complexity)]
+    fn sieve_set_item(
+        &self,
+        changes_: Object<SetValue>,
+        update: Option<(u32, HashedValue<Object<Value>>)>,
+        ctx: &SetContext,
+        session_id: u64,
+    ) -> impl Future<Output = trc::Result<Result<(ObjectIndexBuilder, Option<Vec<u8>>), SetError>>> + Send;
+
+    fn sieve_activate_script(
+        &self,
+        account_id: u32,
+        activate_id: Option<u32>,
+    ) -> impl Future<Output = trc::Result<Vec<(u32, bool)>>> + Send;
+}
+
+impl SieveScriptSet for Server {
+    async fn sieve_script_set(
         &self,
         mut request: SetRequest<SetArguments>,
         access_token: &AccessToken,
-    ) -> Result<SetResponse, MethodError> {
+        session: &HttpSessionData,
+    ) -> trc::Result<SetResponse> {
         let account_id = request.account_id.document_id();
         let mut sieve_ids = self
             .get_document_ids(account_id, Collection::SieveScript)
             .await?
             .unwrap_or_default();
         let mut ctx = SetContext {
-            account_id,
-            account_quota: self.get_quota(access_token, account_id).await?,
+            resource_token: self.get_resource_token(access_token, account_id).await?,
             access_token,
             response: self
                 .prepare_set_response(&request, Collection::SieveScript)
@@ -97,31 +117,24 @@ impl JMAP {
         // Process creates
         let mut changes = ChangeLogBuilder::new();
         for (id, object) in request.unwrap_create() {
-            if sieve_ids.len() as usize <= self.config.sieve_max_scripts {
-                match self.sieve_set_item(object, None, &ctx).await? {
+            if sieve_ids.len() as usize <= self.core.jmap.sieve_max_scripts {
+                match self
+                    .sieve_set_item(object, None, &ctx, session.session_id)
+                    .await?
+                {
                     Ok((mut builder, Some(blob))) => {
-                        // Obtain document id
-                        let document_id = self
-                            .assign_document_id(account_id, Collection::SieveScript)
-                            .await?;
-
                         // Store blob
                         let blob_id = builder.changes_mut().unwrap().blob_id_mut().unwrap();
                         blob_id.hash = self.put_blob(account_id, &blob, false).await?.hash;
-                        blob_id.class = BlobClass::Linked {
-                            account_id,
-                            collection: Collection::SieveScript.into(),
-                            document_id,
-                        };
                         let script_size = blob_id.section.as_ref().unwrap().size;
-                        let blob_id = blob_id.clone();
+                        let mut blob_id = blob_id.clone();
 
                         // Write record
                         let mut batch = BatchBuilder::new();
                         batch
                             .with_account_id(account_id)
                             .with_collection(Collection::SieveScript)
-                            .create_document(document_id)
+                            .create_document()
                             .add(DirectoryClass::UsedQuota(account_id), script_size as i64)
                             .set(
                                 BlobOp::Link {
@@ -130,11 +143,25 @@ impl JMAP {
                                 Vec::new(),
                             )
                             .custom(builder);
+
+                        // Increment tenant quota
+                        #[cfg(feature = "enterprise")]
+                        if self.core.is_enterprise_edition() {
+                            if let Some(tenant) = ctx.resource_token.tenant {
+                                batch.add(DirectoryClass::UsedQuota(tenant.id), script_size as i64);
+                            }
+                        }
+
+                        let document_id = self.write_batch_expect_id(batch).await?;
                         sieve_ids.insert(document_id);
-                        self.write_batch(batch).await?;
                         changes.log_insert(Collection::SieveScript, document_id);
 
                         // Add result with updated blobId
+                        blob_id.class = BlobClass::Linked {
+                            account_id,
+                            collection: Collection::SieveScript.into(),
+                            document_id,
+                        };
                         ctx.response.created.insert(
                             id,
                             Object::with_capacity(1)
@@ -148,9 +175,13 @@ impl JMAP {
                     _ => unreachable!(),
                 }
             } else {
-                ctx.response.not_created.append(id, SetError::new(SetErrorType::OverQuota).with_description(
-                    "There are too many sieve scripts, please delete some before adding a new one.",
-                ));
+                ctx.response.not_created.append(
+                    id,
+                    SetError::new(SetErrorType::OverQuota).with_description(concat!(
+                        "There are too many sieve scripts, ",
+                        "please delete some before adding a new one."
+                    )),
+                );
             }
         }
 
@@ -179,19 +210,20 @@ impl JMAP {
                     .inner
                     .blob_id()
                     .ok_or_else(|| {
-                        tracing::warn!(
-                            event = "error",
-                            context = "sieve_set",
-                            account_id = account_id,
-                            document_id = document_id,
-                            "Sieve does not contain a blobId."
-                        );
-                        MethodError::ServerPartialFail
+                        trc::StoreEvent::NotFound
+                            .into_err()
+                            .caused_by(trc::location!())
+                            .document_id(document_id)
                     })?
                     .clone();
 
                 match self
-                    .sieve_set_item(object, (document_id, sieve).into(), &ctx)
+                    .sieve_set_item(
+                        object,
+                        (document_id, sieve).into(),
+                        &ctx,
+                        session.session_id,
+                    )
                     .await?
                 {
                     Ok((mut builder, blob)) => {
@@ -206,11 +238,6 @@ impl JMAP {
                             // Store blob
                             let blob_id = builder.changes_mut().unwrap().blob_id_mut().unwrap();
                             blob_id.hash = self.put_blob(account_id, &blob, false).await?.hash;
-                            blob_id.class = BlobClass::Linked {
-                                account_id,
-                                collection: Collection::SieveScript.into(),
-                                document_id,
-                            };
                             let script_size = blob_id.section.as_ref().unwrap().size as i64;
                             let prev_script_size =
                                 prev_blob_id.section.as_ref().unwrap().size as i64;
@@ -224,6 +251,17 @@ impl JMAP {
                             };
                             if update_quota != 0 {
                                 batch.add(DirectoryClass::UsedQuota(account_id), update_quota);
+
+                                // Update tenant quota
+                                #[cfg(feature = "enterprise")]
+                                if self.core.is_enterprise_edition() {
+                                    if let Some(tenant) = ctx.resource_token.tenant {
+                                        batch.add(
+                                            DirectoryClass::UsedQuota(tenant.id),
+                                            update_quota,
+                                        );
+                                    }
+                                }
                             }
 
                             // Update blobId
@@ -248,22 +286,16 @@ impl JMAP {
 
                         if !batch.is_empty() {
                             changes.log_update(Collection::SieveScript, document_id);
-                            match self.store.write(batch.build()).await {
+                            match self.core.storage.data.write(batch.build()).await {
                                 Ok(_) => (),
-                                Err(store::Error::AssertValueFailed) => {
+                                Err(err) if err.is_assertion_failure() => {
                                     ctx.response.not_updated.append(id, SetError::forbidden().with_description(
                                         "Another process modified this sieve, please try again.",
                                     ));
                                     continue 'update;
                                 }
                                 Err(err) => {
-                                    tracing::error!(
-                                        event = "error",
-                                        context = "sieve_set",
-                                        account_id = account_id,
-                                        error = ?err,
-                                        "Failed to update sieve script(s).");
-                                    return Err(MethodError::ServerPartialFail);
+                                    return Err(err.caused_by(trc::location!()));
                                 }
                             }
                         }
@@ -291,7 +323,7 @@ impl JMAP {
             let document_id = id.document_id();
             if sieve_ids.contains(document_id) {
                 if self
-                    .sieve_script_delete(account_id, document_id, true)
+                    .sieve_script_delete(&ctx.resource_token, document_id, true)
                     .await?
                 {
                     changes.log_delete(Collection::SieveScript, document_id);
@@ -351,13 +383,14 @@ impl JMAP {
         Ok(ctx.response)
     }
 
-    pub async fn sieve_script_delete(
+    async fn sieve_script_delete(
         &self,
-        account_id: u32,
+        resource_token: &ResourceToken,
         document_id: u32,
         fail_if_active: bool,
-    ) -> Result<bool, MethodError> {
+    ) -> trc::Result<bool> {
         // Fetch record
+        let account_id = resource_token.account_id;
         let obj = self
             .get_property::<HashedValue<Object<Value>>>(
                 account_id,
@@ -367,14 +400,10 @@ impl JMAP {
             )
             .await?
             .ok_or_else(|| {
-                tracing::warn!(
-                    event = "error",
-                    context = "sieve_script_delete",
-                    account_id = account_id,
-                    document_id = document_id,
-                    "Sieve script not found."
-                );
-                MethodError::ServerPartialFail
+                trc::StoreEvent::NotFound
+                    .into_err()
+                    .caused_by(trc::location!())
+                    .document_id(document_id)
             })?;
 
         // Make sure the script is not active
@@ -390,15 +419,12 @@ impl JMAP {
         // Delete record
         let mut batch = BatchBuilder::new();
         let blob_id = obj.inner.blob_id().ok_or_else(|| {
-            tracing::warn!(
-                event = "error",
-                context = "sieve_script_delete",
-                account_id = account_id,
-                document_id = document_id,
-                "Sieve does not contain a blobId."
-            );
-            MethodError::ServerPartialFail
+            trc::StoreEvent::NotFound
+                .into_err()
+                .caused_by(trc::location!())
+                .document_id(document_id)
         })?;
+        let updated_quota = -(blob_id.section.as_ref().unwrap().size as i64);
         batch
             .with_account_id(account_id)
             .with_collection(Collection::SieveScript)
@@ -407,28 +433,36 @@ impl JMAP {
             .clear(BlobOp::Link {
                 hash: blob_id.hash.clone(),
             })
-            .add(
-                DirectoryClass::UsedQuota(account_id),
-                -(blob_id.section.as_ref().unwrap().size as i64),
-            )
+            .add(DirectoryClass::UsedQuota(account_id), updated_quota)
             .custom(ObjectIndexBuilder::new(SCHEMA).with_current(obj));
+
+        // Update tenant quota
+        #[cfg(feature = "enterprise")]
+        if self.core.is_enterprise_edition() {
+            if let Some(tenant) = resource_token.tenant {
+                batch.add(DirectoryClass::UsedQuota(tenant.id), updated_quota);
+            }
+        }
+
         self.write_batch(batch).await?;
         Ok(true)
     }
 
-    #[allow(clippy::blocks_in_if_conditions)]
+    #[allow(clippy::blocks_in_conditions)]
     async fn sieve_set_item(
         &self,
         changes_: Object<SetValue>,
         update: Option<(u32, HashedValue<Object<Value>>)>,
         ctx: &SetContext<'_>,
-    ) -> Result<Result<(ObjectIndexBuilder, Option<Vec<u8>>), SetError>, MethodError> {
+        session_id: u64,
+    ) -> trc::Result<Result<(ObjectIndexBuilder, Option<Vec<u8>>), SetError>> {
         // Vacation script cannot be modified
         if matches!(update.as_ref().and_then(|(_, obj)| obj.inner.properties.get(&Property::Name)), Some(Value::Text ( value )) if value.eq_ignore_ascii_case("vacation"))
         {
-            return Ok(Err(SetError::forbidden().with_description(
-                "The 'vacation' script cannot be modified, use VacationResponse/set instead.",
-            )));
+            return Ok(Err(SetError::forbidden().with_description(concat!(
+                "The 'vacation' script cannot be modified, ",
+                "use VacationResponse/set instead."
+            ))));
         }
 
         // Parse properties
@@ -443,7 +477,7 @@ impl JMAP {
             };
             let value = match (&property, value) {
                 (Property::Name, MaybePatchValue::Value(Value::Text(value))) => {
-                    if value.len() > self.config.sieve_max_script_name {
+                    if value.len() > self.core.jmap.sieve_max_script_name {
                         return Ok(Err(SetError::invalid_properties()
                             .with_property(property)
                             .with_description("Script name is too long.")));
@@ -463,7 +497,7 @@ impl JMAP {
                     {
                         if let Some(id) = self
                             .filter(
-                                ctx.account_id,
+                                ctx.resource_token.account_id,
                                 Collection::SieveScript,
                                 vec![Filter::eq(Property::Name, &value)],
                             )
@@ -520,22 +554,35 @@ impl JMAP {
 
         let blob_update = if let Some(blob_id) = blob_id {
             if update.as_ref().map_or(true, |(document_id, _)| {
-                !matches!(blob_id.class, BlobClass::Linked { account_id, collection, document_id: d } if account_id == ctx.account_id && collection == u8::from(Collection::SieveScript) && *document_id == d)
+                !matches!(blob_id.class, BlobClass::Linked { account_id, collection, document_id: d } if account_id == ctx.resource_token.account_id && collection == u8::from(Collection::SieveScript) && *document_id == d)
             }) {
                 // Check access
                 if let Some(mut bytes) = self.blob_download(&blob_id, ctx.access_token).await? {
                     // Check quota
-                    if ctx.account_quota > 0
-                        && bytes.len() as i64 + self.get_used_quota(ctx.account_id).await?
-                            > ctx.account_quota
+                    match self
+                        .has_available_quota(&ctx.resource_token, bytes.len() as u64)
+                        .await
                     {
-                        return Ok(Err(SetError::over_quota()));
+                        Ok(_) => (),
+                        Err(err) => {
+                            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
+                                || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota))
+                            {
+                                trc::error!(err.account_id(ctx.resource_token.account_id).span_id(session_id));
+                                return Ok(Err(SetError::over_quota()));
+                            } else {
+                                return Err(err);
+                            }
+                        }
                     }
 
                     // Compile script
-                    match self.sieve_compiler.compile(&bytes) {
+                    match self.core.sieve.untrusted_compiler.compile(&bytes) {
                         Ok(script) => {
-                            changes.set(Property::BlobId, BlobId::default().with_section_size(bytes.len()));
+                            changes.set(
+                                Property::BlobId,
+                                BlobId::default().with_section_size(bytes.len()),
+                            );
                             bytes.extend(bincode::serialize(&script).unwrap_or_default());
                             bytes.into()
                         }
@@ -574,11 +621,11 @@ impl JMAP {
             .map(|obj| (obj, blob_update)))
     }
 
-    pub async fn sieve_activate_script(
+    async fn sieve_activate_script(
         &self,
         account_id: u32,
         mut activate_id: Option<u32>,
-    ) -> Result<Vec<(u32, bool)>, MethodError> {
+    ) -> trc::Result<Vec<(u32, bool)>> {
         let mut changed_ids = Vec::new();
         // Find the currently active script
         let mut active_ids = self
@@ -591,7 +638,7 @@ impl JMAP {
             .results;
 
         // Check if script is already active
-        if activate_id.map_or(false, |id| active_ids.remove(id)) {
+        if activate_id.is_some_and(|id| active_ids.remove(id)) {
             if active_ids.is_empty() {
                 return Ok(changed_ids);
             } else {
@@ -654,19 +701,13 @@ impl JMAP {
 
         // Write changes
         if !changed_ids.is_empty() {
-            match self.store.write(batch.build()).await {
+            match self.core.storage.data.write(batch.build()).await {
                 Ok(_) => (),
-                Err(store::Error::AssertValueFailed) => {
+                Err(err) if err.is_assertion_failure() => {
                     return Ok(vec![]);
                 }
                 Err(err) => {
-                    tracing::error!(
-                        event = "error",
-                        context = "sieve_activate_script",
-                        account_id = account_id,
-                        error = ?err,
-                        "Failed to activate sieve script(s).");
-                    return Err(MethodError::ServerPartialFail);
+                    return Err(err.caused_by(trc::location!()));
                 }
             }
         }

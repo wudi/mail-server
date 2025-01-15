@@ -1,61 +1,75 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
 use std::time::{Duration, Instant};
 
-use mail_auth::{IpLookupStrategy, MX};
+use common::{
+    config::smtp::{
+        report::AggregateFrequency,
+        resolver::{Mode, MxPattern, Policy},
+    },
+    Core,
+};
+use mail_auth::MX;
 
-use ::smtp::{config::IfBlock, core::SMTP, outbound::NextHop};
+use ::smtp::outbound::NextHop;
 use mail_parser::DateTime;
 use smtp::{
-    config::AggregateFrequency,
     outbound::{
-        lookup::ToNextHop,
-        mta_sts::{Mode, MxPattern, Policy},
+        lookup::{DnsLookup, ToNextHop},
+        mta_sts::parse::ParsePolicy,
     },
     queue::RecipientDomain,
+    reporting::AggregateTimestamp,
 };
+use utils::config::Config;
 
-use crate::smtp::TestConfig;
+use crate::smtp::{DnsCache, TestSMTP};
+
+const CONFIG_V4: &str = r#"
+[queue.outbound.source-ip]
+v4 = "['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']"
+v6 = "['a:b::1', 'a:b::2', 'a:b::3', 'a:b::4']"
+
+[queue.outbound]
+ip-strategy = "ipv4_then_ipv6"
+
+"#;
+
+const CONFIG_V6: &str = r#"
+[queue.outbound.source-ip]
+v4 = "['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']"
+v6 = "['a:b::1', 'a:b::2', 'a:b::3', 'a:b::4']"
+
+[queue.outbound]
+ip-strategy = "ipv6_then_ipv4"
+
+"#;
 
 #[tokio::test]
 async fn lookup_ip() {
-    let ipv6 = vec![
+    // Enable logging
+    crate::enable_logging();
+
+    let ipv6 = [
         "a:b::1".parse().unwrap(),
         "a:b::2".parse().unwrap(),
         "a:b::3".parse().unwrap(),
         "a:b::4".parse().unwrap(),
     ];
-    let ipv4 = vec![
+    let ipv4 = [
         "10.0.0.1".parse().unwrap(),
         "10.0.0.2".parse().unwrap(),
         "10.0.0.3".parse().unwrap(),
         "10.0.0.4".parse().unwrap(),
     ];
-    let mut core = SMTP::test();
-    core.queue.config.source_ip.ipv4 = IfBlock::new(ipv4.clone());
-    core.queue.config.source_ip.ipv6 = IfBlock::new(ipv6.clone());
-    core.resolvers.dns.ipv4_add(
+    let mut config = Config::new(CONFIG_V4).unwrap();
+    let test =
+        TestSMTP::from_core(Core::parse(&mut config, Default::default(), Default::default()).await);
+    test.server.ipv4_add(
         "mx.foobar.org",
         vec![
             "172.168.0.100".parse().unwrap(),
@@ -63,19 +77,20 @@ async fn lookup_ip() {
         ],
         Instant::now() + Duration::from_secs(10),
     );
-    core.resolvers.dns.ipv6_add(
+    test.server.ipv6_add(
         "mx.foobar.org",
         vec!["e:f::a".parse().unwrap(), "e:f::b".parse().unwrap()],
         Instant::now() + Duration::from_secs(10),
     );
 
     // Ipv4 strategy
-    core.queue.config.ip_strategy = IfBlock::new(IpLookupStrategy::Ipv4thenIpv6);
-    let resolve_result = core
+    let resolve_result = test
+        .server
         .resolve_host(
             &NextHop::MX("mx.foobar.org"),
             &RecipientDomain::new("envelope"),
             2,
+            0,
         )
         .await
         .unwrap();
@@ -88,12 +103,29 @@ async fn lookup_ip() {
         .contains(&"172.168.0.100".parse().unwrap()));
 
     // Ipv6 strategy
-    core.queue.config.ip_strategy = IfBlock::new(IpLookupStrategy::Ipv6thenIpv4);
-    let resolve_result = core
+    let mut config = Config::new(CONFIG_V6).unwrap();
+    let test =
+        TestSMTP::from_core(Core::parse(&mut config, Default::default(), Default::default()).await);
+    test.server.ipv4_add(
+        "mx.foobar.org",
+        vec![
+            "172.168.0.100".parse().unwrap(),
+            "172.168.0.101".parse().unwrap(),
+        ],
+        Instant::now() + Duration::from_secs(10),
+    );
+    test.server.ipv6_add(
+        "mx.foobar.org",
+        vec!["e:f::a".parse().unwrap(), "e:f::b".parse().unwrap()],
+        Instant::now() + Duration::from_secs(10),
+    );
+    let resolve_result = test
+        .server
         .resolve_host(
             &NextHop::MX("mx.foobar.org"),
             &RecipientDomain::new("envelope"),
             2,
+            0,
         )
         .await
         .unwrap();

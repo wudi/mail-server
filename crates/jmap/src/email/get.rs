@@ -1,28 +1,11 @@
 /*
- * Copyright (c) 2023 Stalwart Labs Ltd.
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
  *
- * This file is part of Stalwart Mail Server.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- * in the LICENSE file at the top-level directory of this distribution.
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can be released from the requirements of the AGPLv3 license by
- * purchasing a commercial license. Please contact licensing@stalw.art
- * for more details.
-*/
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
 
+use common::{auth::AccessToken, Server};
 use jmap_proto::{
-    error::method::MethodError,
     method::get::{GetRequest, GetResponse},
     object::{email::GetArguments, Object},
     types::{
@@ -37,23 +20,37 @@ use jmap_proto::{
     },
 };
 use mail_parser::HeaderName;
-use store::BlobClass;
+use store::{write::Bincode, BlobClass};
+use trc::{AddContext, StoreEvent};
 
-use crate::{auth::AccessToken, email::headers::HeaderToValue, mailbox::UidMailbox, Bincode, JMAP};
+use crate::{
+    auth::acl::AclMethods, blob::download::BlobDownload, changes::state::StateManager,
+    email::headers::HeaderToValue, mailbox::UidMailbox, JmapMethods,
+};
+use std::future::Future;
 
 use super::{
     body::{ToBodyPart, TruncateBody},
+    cache::ThreadCache,
     headers::IntoForm,
     metadata::{MessageMetadata, MetadataPartType},
 };
 
-impl JMAP {
-    pub async fn email_get(
+pub trait EmailGet: Sync + Send {
+    fn email_get(
+        &self,
+        request: GetRequest<GetArguments>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<GetResponse>> + Send;
+}
+
+impl EmailGet for Server {
+    async fn email_get(
         &self,
         mut request: GetRequest<GetArguments>,
         access_token: &AccessToken,
-    ) -> Result<GetResponse, MethodError> {
-        let ids = request.unwrap_ids(self.config.get_max_objects)?;
+    ) -> trc::Result<GetResponse> {
+        let ids = request.unwrap_ids(self.core.jmap.get_max_objects)?;
         let properties = request.unwrap_properties(&[
             Property::Id,
             Property::BlobId,
@@ -108,19 +105,16 @@ impl JMAP {
         } else {
             let document_ids = message_ids
                 .iter()
-                .take(self.config.get_max_objects)
+                .take(self.core.jmap.get_max_objects)
                 .collect::<Vec<_>>();
-            self.get_properties::<u32>(
-                account_id,
-                Collection::Email,
-                document_ids.iter().copied(),
-                Property::ThreadId,
-            )
-            .await?
-            .into_iter()
-            .zip(document_ids)
-            .filter_map(|(thread_id, document_id)| Id::from_parts(thread_id?, document_id).into())
-            .collect()
+            self.get_cached_thread_ids(account_id, document_ids.iter().copied())
+                .await
+                .caused_by(trc::location!())?
+                .into_iter()
+                .filter_map(|(document_id, thread_id)| {
+                    Id::from_parts(thread_id, document_id).into()
+                })
+                .collect()
         };
         let mut response = GetResponse {
             account_id: request.account_id.into(),
@@ -130,24 +124,17 @@ impl JMAP {
         };
 
         // Check if we need to fetch the raw headers or body
-        let mut needs_headers = false;
         let mut needs_body = false;
         for property in &properties {
-            match property {
-                Property::Header(_) | Property::Headers => {
-                    needs_headers = true;
-                }
+            if matches!(
+                property,
                 Property::BodyValues
-                | Property::TextBody
-                | Property::HtmlBody
-                | Property::Attachments
-                | Property::BodyStructure => {
-                    needs_body = true;
-                }
-                _ => (),
-            }
-
-            if needs_body {
+                    | Property::TextBody
+                    | Property::HtmlBody
+                    | Property::Attachments
+                    | Property::BodyStructure
+            ) {
+                needs_body = true;
                 break;
             }
         }
@@ -175,27 +162,26 @@ impl JMAP {
             };
 
             // Retrieve raw message if needed
-            let raw_message = if needs_body || needs_headers {
-                let offset = if !needs_body {
-                    metadata.contents.parts[0].offset_body as u32
-                } else {
-                    u32::MAX
-                };
-
-                if let Some(raw_message) = self.get_blob(&metadata.blob_hash, 0..offset).await? {
+            let raw_message = if needs_body {
+                if let Some(raw_message) = self.get_blob(&metadata.blob_hash, 0..usize::MAX).await?
+                {
                     raw_message
                 } else {
-                    tracing::warn!(event = "not-found",
-                        account_id = account_id,
-                        collection = ?Collection::Email,
-                        document_id = id.document_id(),
-                        blob_id = ?metadata.blob_hash,
-                        "Blob not found");
+                    trc::event!(
+                        Store(StoreEvent::NotFound),
+                        AccountId = account_id,
+                        DocumentId = id.document_id(),
+                        Collection = Collection::Email,
+                        BlobId = metadata.blob_hash.to_hex(),
+                        Details = "Blob not found.",
+                        CausedBy = trc::location!(),
+                    );
+
                     response.not_found.push(id.into());
                     continue;
                 }
             } else {
-                vec![]
+                metadata.raw_headers
             };
             let blob_id = BlobId {
                 hash: metadata.blob_hash.clone(),
@@ -232,6 +218,7 @@ impl JMAP {
                             .map(|ids| {
                                 let mut obj = Object::with_capacity(ids.len());
                                 for id in ids {
+                                    debug_assert!(id.uid != 0);
                                     obj.append(
                                         Property::_T(Id::from(id.mailbox_id).to_string()),
                                         true,
@@ -242,11 +229,15 @@ impl JMAP {
                         {
                             email.append(property.clone(), mailboxes);
                         } else {
-                            tracing::debug!(event = "not-found",
-                                            account_id = account_id,
-                                            collection = ?Collection::Email,
-                                            document_id = id.document_id(),
-                                            "Mailbox property not found");
+                            trc::event!(
+                                Store(StoreEvent::NotFound),
+                                AccountId = account_id,
+                                DocumentId = id.document_id(),
+                                Collection = Collection::Email,
+                                Details = "Mailbox property not found.",
+                                CausedBy = trc::location!(),
+                            );
+
                             response.not_found.push(id.into());
                             continue 'outer;
                         }
@@ -270,11 +261,15 @@ impl JMAP {
                         {
                             email.append(property.clone(), keywords);
                         } else {
-                            tracing::debug!(event = "not-found",
-                                account_id = account_id,
-                                collection = ?Collection::Email,
-                                document_id = id.document_id(),
-                                "Keywords property not found");
+                            trc::event!(
+                                Store(StoreEvent::NotFound),
+                                AccountId = account_id,
+                                DocumentId = id.document_id(),
+                                Collection = Collection::Email,
+                                Details = "Keywords property not found.",
+                                CausedBy = trc::location!(),
+                            );
+
                             response.not_found.push(id.into());
                             continue 'outer;
                         }
@@ -430,9 +425,9 @@ impl JMAP {
                     }
 
                     _ => {
-                        return Err(MethodError::InvalidArguments(format!(
-                            "Invalid property {property:?}"
-                        )));
+                        return Err(trc::JmapEvent::InvalidArguments
+                            .into_err()
+                            .details(format!("Invalid property {property:?}")));
                     }
                 }
             }
